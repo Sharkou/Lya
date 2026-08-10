@@ -19,11 +19,16 @@ impl OllamaClient {
 impl LlmClient for OllamaClient {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
+        let debug = std::env::var_os("LYA_OLLAMA_DEBUG").is_some();
         let body = OpenAiChatRequest {
             model: &request.model,
             messages: &request.messages,
             tools: &request.tools,
         };
+        if debug {
+            let body = serde_json::to_string(&body).map_err(LlmError::Json)?;
+            eprintln!("LYA_OLLAMA_DEBUG request: {body}");
+        }
         let response = self
             .client
             .post(url)
@@ -33,6 +38,10 @@ impl LlmClient for OllamaClient {
             .map_err(LlmError::Network)?;
         let status = response.status();
         let body = response.text().await.map_err(LlmError::Network)?;
+
+        if debug {
+            eprintln!("LYA_OLLAMA_DEBUG response: {body}");
+        }
 
         if !status.is_success() {
             return Err(LlmError::Http { status, body });
