@@ -358,7 +358,12 @@ mod tests {
             tool_call("get_current_directory", "{}"),
             final_response("The current directory was returned."),
         ]);
-        let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
+        let agent = Agent::new(
+            &client,
+            vec![Box::new(GetCurrentDirectory::new(
+                std::env::current_dir().expect("current directory should exist"),
+            ))],
+        );
 
         let answer = agent
             .run("test", "Where am I?")
@@ -384,7 +389,12 @@ mod tests {
             tool_call("unknown", "{}"),
             final_response("I cannot use that tool."),
         ]);
-        let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
+        let agent = Agent::new(
+            &client,
+            vec![Box::new(GetCurrentDirectory::new(
+                std::env::current_dir().expect("current directory should exist"),
+            ))],
+        );
 
         let answer = agent
             .run("test", "prompt")
@@ -407,7 +417,12 @@ mod tests {
             tool_call("get_current_directory", "not json"),
             final_response("The tool arguments were invalid."),
         ]);
-        let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
+        let agent = Agent::new(
+            &client,
+            vec![Box::new(GetCurrentDirectory::new(
+                std::env::current_dir().expect("current directory should exist"),
+            ))],
+        );
 
         let answer = agent
             .run("test", "prompt")
@@ -452,7 +467,13 @@ mod tests {
             tool_call("get_current_directory", "{}"),
             tool_call("get_current_directory", "{}"),
         ]);
-        let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]).with_max_tool_calls(1);
+        let agent = Agent::new(
+            &client,
+            vec![Box::new(GetCurrentDirectory::new(
+                std::env::current_dir().expect("current directory should exist"),
+            ))],
+        )
+        .with_max_tool_calls(1);
 
         let error = agent
             .run("test", "prompt")

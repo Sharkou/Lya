@@ -19,22 +19,15 @@ impl Runtime {
             return Self::new(PathBuf::from(workspace));
         }
 
-        let workspace = Self::default_workspace()?;
+        Self::from_default_workspace(Path::new(env!("CARGO_MANIFEST_DIR")))
+    }
+
+    fn from_default_workspace(project_directory: &Path) -> Result<Self, ToolError> {
+        let workspace = project_directory.join("agent").join("workspace");
         fs::create_dir_all(&workspace)
             .map_err(|error| ToolError::new(format!("could not create workspace: {error}")))?;
 
         Self::new(workspace)
-    }
-
-    fn default_workspace() -> Result<PathBuf, ToolError> {
-        let home = user_home_directory()?;
-        let documents_workspace = home.join("Documents").join("Lya");
-
-        Ok(if documents_workspace.is_dir() {
-            documents_workspace
-        } else {
-            home.join("Lya")
-        })
     }
 
     pub fn new(workspace: impl AsRef<Path>) -> Result<Self, ToolError> {
@@ -56,7 +49,7 @@ impl Runtime {
 
     pub fn tools(&self) -> Vec<Box<dyn Tool>> {
         vec![
-            Box::new(GetCurrentDirectory),
+            Box::new(GetCurrentDirectory::new(&self.workspace)),
             Box::new(ReadFile::new(&self.workspace).expect("runtime workspace is valid")),
             Box::new(WriteFile::new(&self.workspace).expect("runtime workspace is valid")),
             Box::new(RunCommand::new(&self.workspace)),
@@ -64,28 +57,12 @@ impl Runtime {
     }
 }
 
-#[cfg(windows)]
-fn user_home_directory() -> Result<PathBuf, ToolError> {
-    env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| ToolError::new("USERPROFILE must define the user home directory"))
-}
-
-#[cfg(not(windows))]
-fn user_home_directory() -> Result<PathBuf, ToolError> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| ToolError::new("HOME must define the user home directory"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         ffi::OsString,
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{Mutex, OnceLock},
     };
 
@@ -103,11 +80,6 @@ mod tests {
         fs::create_dir(&directory).expect("workspace should be created");
         directory
     }
-
-    #[cfg(windows)]
-    const HOME_VARIABLE: &str = "USERPROFILE";
-    #[cfg(not(windows))]
-    const HOME_VARIABLE: &str = "HOME";
 
     struct EnvironmentVariable {
         name: &'static str,
@@ -157,40 +129,31 @@ mod tests {
     }
 
     #[test]
-    fn uses_documents_workspace_when_it_exists() {
+    fn uses_project_workspace_without_environment_override() {
         let _lock = environment_lock()
             .lock()
             .expect("environment lock should not be poisoned");
-        let home = workspace("documents-workspace");
-        let documents_workspace = home.join("Documents").join("Lya");
-        fs::create_dir_all(&documents_workspace).expect("documents workspace should be created");
         let _workspace = EnvironmentVariable::set("LYA_WORKSPACE", None);
-        let _home = EnvironmentVariable::set(HOME_VARIABLE, Some(&home));
 
         let runtime = Runtime::from_environment().expect("runtime should be created");
 
         assert_eq!(
             runtime.workspace(),
-            documents_workspace
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("agent")
+                .join("workspace")
                 .canonicalize()
-                .expect("documents workspace should exist")
+                .expect("project workspace should exist")
         );
-        drop(_home);
-        drop(_workspace);
-        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]
     fn creates_missing_default_workspace() {
-        let _lock = environment_lock()
-            .lock()
-            .expect("environment lock should not be poisoned");
-        let home = workspace("default-workspace");
-        let default_workspace = home.join("Lya");
-        let _workspace = EnvironmentVariable::set("LYA_WORKSPACE", None);
-        let _home = EnvironmentVariable::set(HOME_VARIABLE, Some(&home));
+        let project_directory = workspace("default-workspace");
+        let default_workspace = project_directory.join("agent").join("workspace");
 
-        let runtime = Runtime::from_environment().expect("runtime should be created");
+        let runtime =
+            Runtime::from_default_workspace(&project_directory).expect("runtime should be created");
 
         assert_eq!(
             runtime.workspace(),
@@ -198,9 +161,7 @@ mod tests {
                 .canonicalize()
                 .expect("default workspace should be created")
         );
-        drop(_home);
-        drop(_workspace);
-        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(project_directory).expect("project directory should be removed");
     }
 
     #[test]
@@ -257,6 +218,18 @@ mod tests {
                         .to_string_lossy()
                         .as_ref()
                 )
+        );
+        let current_directory = runtime
+            .tools()
+            .into_iter()
+            .find(|tool| tool.definition().function.name == "get_current_directory")
+            .expect("get_current_directory should be registered")
+            .execute(serde_json::json!({}))
+            .expect("current directory should be returned");
+
+        assert_eq!(
+            current_directory["directory"],
+            serde_json::json!(workspace.canonicalize().expect("workspace should exist"))
         );
         fs::remove_dir_all(workspace).expect("workspace should be removed");
     }

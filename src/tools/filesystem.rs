@@ -1,5 +1,5 @@
 use std::{
-    env, fs, io,
+    fs, io,
     path::{Component, Path, PathBuf},
 };
 
@@ -8,13 +8,23 @@ use crate::{
     tools::{Tool, ToolError},
 };
 
-pub struct GetCurrentDirectory;
+pub struct GetCurrentDirectory {
+    workspace: PathBuf,
+}
+
+impl GetCurrentDirectory {
+    pub fn new(workspace: impl AsRef<Path>) -> Self {
+        Self {
+            workspace: workspace.as_ref().to_owned(),
+        }
+    }
+}
 
 impl Tool for GetCurrentDirectory {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             "get_current_directory",
-            "Returns Lya's current working directory.",
+            "Returns Lya's workspace directory.",
             serde_json::json!({
                 "type": "object",
                 "properties": {},
@@ -29,10 +39,7 @@ impl Tool for GetCurrentDirectory {
             _ => return Err(ToolError::new("get_current_directory accepts no arguments")),
         }
 
-        let directory = env::current_dir()
-            .map_err(|error| ToolError::new(format!("could not get current directory: {error}")))?;
-
-        Ok(serde_json::json!({"directory": directory}))
+        Ok(serde_json::json!({"directory": self.workspace}))
     }
 }
 
@@ -270,14 +277,14 @@ mod tests {
 
     #[test]
     fn returns_current_directory() {
-        let result = GetCurrentDirectory
+        let workspace = workspace();
+        let workspace = workspace.canonicalize().expect("workspace should exist");
+        let result = GetCurrentDirectory::new(&workspace)
             .execute(serde_json::json!({}))
             .expect("tool should execute");
 
-        assert_eq!(
-            result["directory"],
-            serde_json::json!(std::env::current_dir().expect("current directory should exist"))
-        );
+        assert_eq!(result["directory"], serde_json::json!(workspace));
+        fs::remove_dir_all(workspace).expect("workspace should be removed");
     }
 
     #[test]
