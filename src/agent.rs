@@ -148,7 +148,7 @@ mod tests {
         llm::{ChatMessage, ChatResponse, ToolCall, ToolCallFunction},
         tools::{
             Tool, ToolError,
-            filesystem::{GetCurrentDirectory, ReadFile},
+            filesystem::{GetCurrentDirectory, ReadFile, WriteFile},
         },
     };
 
@@ -273,6 +273,45 @@ mod tests {
         assert_eq!(
             requests[1].messages[2].content.as_deref(),
             Some(r#"{"content":"workspace content"}"#)
+        );
+        fs::remove_dir_all(workspace).expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn writes_file_and_sends_result_to_llm() {
+        let workspace = workspace();
+        let client = FakeClient::new(vec![
+            tool_call(
+                "write_file",
+                r#"{"path":"answer.txt","content":"workspace content"}"#,
+            ),
+            final_response("I wrote the file."),
+        ]);
+        let write_file = WriteFile::new(&workspace).expect("workspace should be valid");
+        let agent = Agent::new(&client, vec![Box::new(write_file)]);
+
+        let answer = agent
+            .run("test", "Write answer.txt")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "I wrote the file.");
+        assert_eq!(
+            fs::read_to_string(workspace.join("answer.txt")).expect("file should exist"),
+            "workspace content"
+        );
+        let requests = client.requests();
+        assert_eq!(requests[1].messages[1].role, "assistant");
+        assert_eq!(requests[1].messages[2].role, "tool");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                requests[1].messages[2]
+                    .content
+                    .as_deref()
+                    .expect("tool result should have content")
+            )
+            .expect("tool result should be JSON")["bytes_written"],
+            17
         );
         fs::remove_dir_all(workspace).expect("workspace should be removed");
     }

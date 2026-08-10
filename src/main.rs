@@ -6,7 +6,7 @@ use std::{env, process::ExitCode};
 
 use agent::Agent;
 use llm::ollama::OllamaClient;
-use tools::filesystem::{GetCurrentDirectory, ReadFile};
+use tools::filesystem::{GetCurrentDirectory, ReadFile, WriteFile};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -38,16 +38,27 @@ async fn main() -> ExitCode {
             }
         },
     };
-    let read_file = match ReadFile::new(workspace) {
+    let read_file = match ReadFile::new(&workspace) {
         Ok(tool) => tool,
         Err(error) => {
             eprintln!("Could not configure read_file: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let write_file = match WriteFile::new(workspace) {
+        Ok(tool) => tool,
+        Err(error) => {
+            eprintln!("Could not configure write_file: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let agent = Agent::new(
         &client,
-        vec![Box::new(GetCurrentDirectory), Box::new(read_file)],
+        vec![
+            Box::new(GetCurrentDirectory),
+            Box::new(read_file),
+            Box::new(write_file),
+        ],
     )
     .with_max_tool_calls(Agent::<OllamaClient>::DEFAULT_MAX_TOOL_CALLS);
 
