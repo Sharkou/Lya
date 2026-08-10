@@ -135,8 +135,18 @@ fn parse_qwen_parameters(body: &str) -> Option<serde_json::Map<String, serde_jso
     let mut current_value = String::new();
 
     for line in body.lines() {
-        if let Some(name) = line
-            .trim()
+        let line = line.trim();
+        if line == "</parameter>" {
+            if let Some(name) = current_name.take() {
+                parameters.insert(
+                    name,
+                    serde_json::Value::String(current_value.trim().to_owned()),
+                );
+                current_value.clear();
+            }
+        } else if line == "</function>" {
+            break;
+        } else if let Some(name) = line
             .strip_prefix("<parameter=")
             .and_then(|value| value.strip_suffix('>'))
         {
@@ -159,18 +169,41 @@ fn parse_qwen_parameters(body: &str) -> Option<serde_json::Map<String, serde_jso
         }
     }
 
-    let name = current_name?;
-    parameters.insert(
-        name,
-        serde_json::Value::String(current_value.trim().to_owned()),
-    );
-    Some(parameters)
+    if let Some(name) = current_name {
+        parameters.insert(
+            name,
+            serde_json::Value::String(current_value.trim().to_owned()),
+        );
+    }
+
+    (!parameters.is_empty()).then_some(parameters)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_response;
-    use crate::llm::LlmError;
+    use super::{normalize_qwen_tool_call, parse_response};
+    use crate::llm::{ChatMessage, LlmError};
+
+    const QWEN_WRITE_FILE_CALL: &str = "Je vais créer un fichier test.txt avec le contenu spécifié.\n\n<function=write_file>\n<parameter=path>\ntest.txt\n</parameter>\n<parameter=content>\nBonjour depuis Lya\n</parameter>\n</parameter>\n</function>\n<tool_call>";
+
+    fn assert_qwen_write_file_call(message: &ChatMessage) {
+        let tool_calls = message
+            .tool_calls
+            .as_ref()
+            .expect("tool call should be present");
+
+        assert_eq!(tool_calls[0].id, "qwen-tool-call-0");
+        assert_eq!(tool_calls[0].function.name, "write_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_calls[0].function.arguments)
+                .expect("arguments should be JSON"),
+            serde_json::json!({"path": "test.txt", "content": "Bonjour depuis Lya"})
+        );
+        assert_eq!(
+            message.content.as_deref(),
+            Some("Je vais créer un fichier test.txt avec le contenu spécifié.")
+        );
+    }
 
     #[test]
     fn parses_openai_compatible_response() {
@@ -216,6 +249,37 @@ mod tests {
             serde_json::json!({"content": "Bonjour depuis Lya", "path": "test.txt"})
         );
         assert_eq!(response.message.content, None);
+    }
+
+    #[test]
+    fn normalizes_exact_qwen_write_file_content() {
+        let mut message = ChatMessage {
+            role: "assistant".to_owned(),
+            content: Some(QWEN_WRITE_FILE_CALL.to_owned()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        normalize_qwen_tool_call(&mut message);
+
+        assert_qwen_write_file_call(&message);
+    }
+
+    #[test]
+    fn normalizes_qwen_call_after_deserializing_http_response() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": QWEN_WRITE_FILE_CALL
+                }
+            }]
+        })
+        .to_string();
+
+        let response = parse_response(&body).expect("response should normalize");
+
+        assert_qwen_write_file_call(&response.message);
     }
 
     #[test]
