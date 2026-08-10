@@ -8,22 +8,22 @@ use crate::{
 pub struct Agent<'a, Client> {
     client: &'a Client,
     tools: Vec<Box<dyn Tool>>,
-    max_tool_calls: usize,
+    max_iterations: usize,
 }
 
 impl<'a, Client: LlmClient> Agent<'a, Client> {
-    pub const DEFAULT_MAX_TOOL_CALLS: usize = 16;
+    pub const DEFAULT_MAX_ITERATIONS: usize = 20;
 
     pub fn new(client: &'a Client, tools: Vec<Box<dyn Tool>>) -> Self {
         Self {
             client,
             tools,
-            max_tool_calls: Self::DEFAULT_MAX_TOOL_CALLS,
+            max_iterations: Self::DEFAULT_MAX_ITERATIONS,
         }
     }
 
-    pub fn with_max_tool_calls(mut self, max_tool_calls: usize) -> Self {
-        self.max_tool_calls = max_tool_calls;
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = max_iterations;
         self
     }
 
@@ -35,9 +35,15 @@ impl<'a, Client: LlmClient> Agent<'a, Client> {
         let model = model.into();
         let mut messages = vec![ChatMessage::user(prompt)];
         let definitions: Vec<_> = self.tools.iter().map(|tool| tool.definition()).collect();
-        let mut tool_calls_used = 0;
+        let mut iterations = 0;
 
         loop {
+            if iterations == self.max_iterations {
+                return Err(AgentError::IterationLimitReached {
+                    limit: self.max_iterations,
+                });
+            }
+            iterations += 1;
             let response = self
                 .client
                 .chat(ChatRequest::new(
@@ -53,12 +59,6 @@ impl<'a, Client: LlmClient> Agent<'a, Client> {
                 messages.push(message.clone());
 
                 for tool_call in tool_calls {
-                    if tool_calls_used == self.max_tool_calls {
-                        return Err(AgentError::ToolCallLimitReached {
-                            limit: self.max_tool_calls,
-                        });
-                    }
-                    tool_calls_used += 1;
                     let content = self.execute_tool_call(tool_call)?;
 
                     messages.push(ChatMessage::tool_result(&tool_call.id, content));
@@ -106,7 +106,7 @@ pub enum AgentError {
     Llm(LlmError),
     SerializeToolResult(serde_json::Error),
     MissingFinalContent,
-    ToolCallLimitReached { limit: usize },
+    IterationLimitReached { limit: usize },
 }
 
 impl fmt::Display for AgentError {
@@ -117,8 +117,8 @@ impl fmt::Display for AgentError {
                 write!(formatter, "could not serialize tool result: {error}")
             }
             Self::MissingFinalContent => write!(formatter, "LLM response has no final content"),
-            Self::ToolCallLimitReached { limit } => {
-                write!(formatter, "tool call limit of {limit} reached")
+            Self::IterationLimitReached { limit } => {
+                write!(formatter, "iteration limit of {limit} reached")
             }
         }
     }
@@ -129,7 +129,7 @@ impl Error for AgentError {
         match self {
             Self::Llm(error) => Some(error),
             Self::SerializeToolResult(error) => Some(error),
-            Self::MissingFinalContent | Self::ToolCallLimitReached { .. } => None,
+            Self::MissingFinalContent | Self::IterationLimitReached { .. } => None,
         }
     }
 }
@@ -253,6 +253,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn returns_immediate_final_answer_after_one_llm_call() {
+        let client = FakeClient::new(vec![final_response("The task is complete.")]);
+        let agent = Agent::new(&client, Vec::new());
+
+        let answer = agent
+            .run("test", "Do nothing")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "The task is complete.");
+        assert_eq!(client.requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn reads_file_and_sends_content_to_llm() {
         let workspace = workspace();
         fs::write(workspace.join("answer.txt"), "workspace content")
@@ -276,6 +290,35 @@ mod tests {
             requests[1].messages[2].content.as_deref(),
             Some(r#"{"content":"workspace content"}"#)
         );
+        fs::remove_dir_all(workspace).expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn continues_after_two_successive_tool_calls() {
+        let workspace = workspace();
+        fs::write(workspace.join("answer.txt"), "workspace content")
+            .expect("file should be written");
+        let client = FakeClient::new(vec![
+            tool_call("list_directory", r#"{"path":"."}"#),
+            tool_call("read_file", r#"{"path":"answer.txt"}"#),
+            final_response("I inspected and read the file."),
+        ]);
+        let agent = Agent::new(
+            &client,
+            vec![
+                Box::new(ListDirectory::new(&workspace).expect("workspace should be valid")),
+                Box::new(ReadFile::new(&workspace).expect("workspace should be valid")),
+            ],
+        );
+
+        let answer = agent
+            .run("test", "Inspect answer.txt")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "I inspected and read the file.");
+        assert_eq!(client.requests().len(), 3);
+        assert_eq!(client.requests()[2].messages.len(), 5);
         fs::remove_dir_all(workspace).expect("workspace should be removed");
     }
 
@@ -352,6 +395,42 @@ mod tests {
                     .expect("directory should exist")
             )
         );
+        fs::remove_dir_all(workspace).expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn completes_multiple_workspace_operations() {
+        let workspace = workspace();
+        let client = FakeClient::new(vec![
+            tool_call("create_directory", r#"{"path":"project/src"}"#),
+            tool_call(
+                "write_file",
+                r#"{"path":"project/src/main.rs","content":"fn main() {}"}"#,
+            ),
+            tool_call("read_file", r#"{"path":"project/src/main.rs"}"#),
+            final_response("The project file is ready."),
+        ]);
+        let agent = Agent::new(
+            &client,
+            vec![
+                Box::new(CreateDirectory::new(&workspace).expect("workspace should be valid")),
+                Box::new(WriteFile::new(&workspace).expect("workspace should be valid")),
+                Box::new(ReadFile::new(&workspace).expect("workspace should be valid")),
+            ],
+        );
+
+        let answer = agent
+            .run("test", "Create and inspect a Rust project file")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "The project file is ready.");
+        assert_eq!(
+            fs::read_to_string(workspace.join("project/src/main.rs"))
+                .expect("project file should exist"),
+            "fn main() {}"
+        );
+        assert_eq!(client.requests().len(), 4);
         fs::remove_dir_all(workspace).expect("workspace should be removed");
     }
 
@@ -527,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stops_after_configured_tool_call_limit() {
+    async fn stops_after_configured_iteration_limit() {
         let client = FakeClient::new(vec![
             tool_call("get_current_directory", "{}"),
             tool_call("get_current_directory", "{}"),
@@ -538,17 +617,17 @@ mod tests {
                 std::env::current_dir().expect("current directory should exist"),
             ))],
         )
-        .with_max_tool_calls(1);
+        .with_max_iterations(1);
 
         let error = agent
             .run("test", "prompt")
             .await
-            .expect_err("second tool call should exceed the limit");
+            .expect_err("second LLM iteration should exceed the limit");
 
         assert!(matches!(
             error,
-            AgentError::ToolCallLimitReached { limit: 1 }
+            AgentError::IterationLimitReached { limit: 1 }
         ));
-        assert_eq!(client.requests().len(), 2);
+        assert_eq!(client.requests().len(), 1);
     }
 }

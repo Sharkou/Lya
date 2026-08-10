@@ -38,7 +38,7 @@ async fn main() -> ExitCode {
     };
     let tools = runtime.tools();
     let agent = Agent::new(&client, tools)
-        .with_max_tool_calls(Agent::<OllamaClient>::DEFAULT_MAX_TOOL_CALLS);
+        .with_max_iterations(Agent::<OllamaClient>::DEFAULT_MAX_ITERATIONS);
 
     match agent.run(model, prompt).await {
         Ok(answer) => {
