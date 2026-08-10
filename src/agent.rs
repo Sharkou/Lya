@@ -136,14 +136,25 @@ impl Error for AgentError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{
+        fs,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use crate::{
         llm::{ChatMessage, ChatResponse, ToolCall, ToolCallFunction},
-        tools::{Tool, ToolError, filesystem::GetCurrentDirectory},
+        tools::{
+            Tool, ToolError,
+            filesystem::{GetCurrentDirectory, ReadFile},
+        },
     };
 
     use super::{Agent, AgentError};
+
+    static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
     struct FailingTool;
 
@@ -227,6 +238,43 @@ mod tests {
                 tool_call_id: None,
             },
         }
+    }
+
+    fn workspace() -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "lya-agent-test-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).expect("workspace should be created");
+        directory
+    }
+
+    #[tokio::test]
+    async fn reads_file_and_sends_content_to_llm() {
+        let workspace = workspace();
+        fs::write(workspace.join("answer.txt"), "workspace content")
+            .expect("file should be written");
+        let client = FakeClient::new(vec![
+            tool_call("read_file", r#"{"path":"answer.txt"}"#),
+            final_response("I read the file."),
+        ]);
+        let read_file = ReadFile::new(&workspace).expect("workspace should be valid");
+        let agent = Agent::new(&client, vec![Box::new(read_file)]);
+
+        let answer = agent
+            .run("test", "Read answer.txt")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "I read the file.");
+        let requests = client.requests();
+        assert_eq!(requests[1].messages[1].role, "assistant");
+        assert_eq!(
+            requests[1].messages[2].content.as_deref(),
+            Some(r#"{"content":"workspace content"}"#)
+        );
+        fs::remove_dir_all(workspace).expect("workspace should be removed");
     }
 
     #[tokio::test]

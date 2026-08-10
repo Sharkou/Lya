@@ -6,7 +6,7 @@ use std::{env, process::ExitCode};
 
 use agent::Agent;
 use llm::ollama::OllamaClient;
-use tools::filesystem::GetCurrentDirectory;
+use tools::filesystem::{GetCurrentDirectory, ReadFile};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -28,8 +28,28 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)])
-        .with_max_tool_calls(Agent::<OllamaClient>::DEFAULT_MAX_TOOL_CALLS);
+    let workspace = match env::var_os("LYA_WORKSPACE") {
+        Some(workspace) => workspace.into(),
+        None => match env::current_dir() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                eprintln!("Could not determine workspace: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let read_file = match ReadFile::new(workspace) {
+        Ok(tool) => tool,
+        Err(error) => {
+            eprintln!("Could not configure read_file: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let agent = Agent::new(
+        &client,
+        vec![Box::new(GetCurrentDirectory), Box::new(read_file)],
+    )
+    .with_max_tool_calls(Agent::<OllamaClient>::DEFAULT_MAX_TOOL_CALLS);
 
     match agent.run(model, prompt).await {
         Ok(answer) => {
