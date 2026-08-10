@@ -148,6 +148,7 @@ mod tests {
         llm::{ChatMessage, ChatResponse, ToolCall, ToolCallFunction},
         tools::{
             Tool, ToolError,
+            directory::CreateDirectory,
             filesystem::{GetCurrentDirectory, ReadFile, WriteFile},
         },
     };
@@ -312,6 +313,43 @@ mod tests {
             )
             .expect("tool result should be JSON")["bytes_written"],
             17
+        );
+        fs::remove_dir_all(workspace).expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn creates_directory_and_sends_result_to_llm() {
+        let workspace = workspace();
+        let client = FakeClient::new(vec![
+            tool_call("create_directory", r#"{"path":"projects/hello-world/src"}"#),
+            final_response("I created the directory."),
+        ]);
+        let create_directory = CreateDirectory::new(&workspace).expect("workspace should be valid");
+        let agent = Agent::new(&client, vec![Box::new(create_directory)]);
+
+        let answer = agent
+            .run("test", "Create a project directory")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "I created the directory.");
+        assert!(workspace.join("projects/hello-world/src").is_dir());
+        let requests = client.requests();
+        let result: serde_json::Value = serde_json::from_str(
+            requests[1].messages[2]
+                .content
+                .as_deref()
+                .expect("tool result should have content"),
+        )
+        .expect("tool result should be JSON");
+        assert_eq!(
+            result["path"],
+            serde_json::json!(
+                workspace
+                    .join("projects/hello-world/src")
+                    .canonicalize()
+                    .expect("directory should exist")
+            )
         );
         fs::remove_dir_all(workspace).expect("workspace should be removed");
     }

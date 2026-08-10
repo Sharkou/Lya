@@ -6,6 +6,7 @@ use std::{
 use crate::tools::{
     Tool, ToolError,
     command::RunCommand,
+    directory::CreateDirectory,
     filesystem::{GetCurrentDirectory, ReadFile, WriteFile},
 };
 
@@ -52,6 +53,7 @@ impl Runtime {
             Box::new(GetCurrentDirectory::new(&self.workspace)),
             Box::new(ReadFile::new(&self.workspace).expect("runtime workspace is valid")),
             Box::new(WriteFile::new(&self.workspace).expect("runtime workspace is valid")),
+            Box::new(CreateDirectory::new(&self.workspace).expect("runtime workspace is valid")),
             Box::new(RunCommand::new(&self.workspace)),
         ]
     }
@@ -188,6 +190,15 @@ mod tests {
             .expect("file should be read");
 
         assert_eq!(result, serde_json::json!({"content": "hello Lya"}));
+        let create_directory = runtime
+            .tools()
+            .into_iter()
+            .find(|tool| tool.definition().function.name == "create_directory")
+            .expect("create_directory should be registered");
+        create_directory
+            .execute(serde_json::json!({"path": "project/src"}))
+            .expect("directory should be created");
+        assert!(workspace.join("project/src").is_dir());
         fs::write(
             workspace.join("Cargo.toml"),
             "[package]\nname = \"runtime-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",

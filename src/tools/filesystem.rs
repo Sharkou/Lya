@@ -8,6 +8,27 @@ use crate::{
     tools::{Tool, ToolError},
 };
 
+pub(crate) fn validate_relative_path(path: &str) -> Result<&Path, ToolError> {
+    let requested = Path::new(path);
+    if requested.is_absolute() || requested.has_root() {
+        return Err(ToolError::new("path must be relative to the workspace"));
+    }
+    if requested
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return Err(ToolError::new("path must be relative to the workspace"));
+    }
+    if requested
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ToolError::new("path must not contain '..'"));
+    }
+
+    Ok(requested)
+}
+
 pub struct GetCurrentDirectory {
     workspace: PathBuf,
 }
@@ -62,22 +83,7 @@ impl ReadFile {
     }
 
     fn resolve_path(&self, path: &str) -> Result<PathBuf, ToolError> {
-        let requested = Path::new(path);
-        if requested.is_absolute() || requested.has_root() {
-            return Err(ToolError::new("path must be relative to the workspace"));
-        }
-        if requested
-            .components()
-            .any(|component| matches!(component, Component::Prefix(_)))
-        {
-            return Err(ToolError::new("path must be relative to the workspace"));
-        }
-        if requested
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(ToolError::new("path must not contain '..'"));
-        }
+        let requested = validate_relative_path(path)?;
 
         let resolved = self
             .workspace
@@ -150,22 +156,7 @@ impl WriteFile {
     }
 
     fn resolve_path(&self, path: &str) -> Result<PathBuf, ToolError> {
-        let requested = Path::new(path);
-        if requested.is_absolute() || requested.has_root() {
-            return Err(ToolError::new("path must be relative to the workspace"));
-        }
-        if requested
-            .components()
-            .any(|component| matches!(component, Component::Prefix(_)))
-        {
-            return Err(ToolError::new("path must be relative to the workspace"));
-        }
-        if requested
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(ToolError::new("path must not contain '..'"));
-        }
+        let requested = validate_relative_path(path)?;
 
         let file_name = requested
             .file_name()
