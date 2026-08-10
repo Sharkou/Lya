@@ -1,3 +1,4 @@
+pub mod command;
 pub mod filesystem;
 
 use std::{error::Error, fmt};

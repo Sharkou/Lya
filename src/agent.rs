@@ -148,6 +148,7 @@ mod tests {
         llm::{ChatMessage, ChatResponse, ToolCall, ToolCallFunction},
         tools::{
             Tool, ToolError,
+            command::RunCommand,
             filesystem::{GetCurrentDirectory, ReadFile, WriteFile},
         },
     };
@@ -314,6 +315,37 @@ mod tests {
             17
         );
         fs::remove_dir_all(workspace).expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn runs_command_and_sends_result_to_llm() {
+        let client = FakeClient::new(vec![
+            tool_call("run_command", r#"{"command":"cargo --version"}"#),
+            final_response("I ran the command."),
+        ]);
+        let agent = Agent::new(&client, vec![Box::new(RunCommand::new())]);
+
+        let answer = agent
+            .run("test", "Show the Cargo version")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "I ran the command.");
+        let requests = client.requests();
+        let result: serde_json::Value = serde_json::from_str(
+            requests[1].messages[2]
+                .content
+                .as_deref()
+                .expect("tool result should have content"),
+        )
+        .expect("tool result should be JSON");
+        assert_eq!(result["exit_code"], 0);
+        assert!(
+            result["stdout"]
+                .as_str()
+                .expect("stdout should be text")
+                .contains("cargo")
+        );
     }
 
     #[tokio::test]

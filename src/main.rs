@@ -6,6 +6,7 @@ use std::{env, process::ExitCode};
 
 use agent::Agent;
 use llm::ollama::OllamaClient;
+use tools::command::RunCommand;
 use tools::filesystem::{GetCurrentDirectory, ReadFile, WriteFile};
 
 #[tokio::main]
@@ -58,6 +59,7 @@ async fn main() -> ExitCode {
             Box::new(GetCurrentDirectory),
             Box::new(read_file),
             Box::new(write_file),
+            Box::new(RunCommand::new()),
         ],
     )
     .with_max_tool_calls(Agent::<OllamaClient>::DEFAULT_MAX_TOOL_CALLS);
