@@ -22,6 +22,7 @@ impl LlmClient for OllamaClient {
         let body = OpenAiChatRequest {
             model: &request.model,
             messages: &request.messages,
+            tools: &request.tools,
         };
         let response = self
             .client
@@ -45,6 +46,7 @@ impl LlmClient for OllamaClient {
 struct OpenAiChatRequest<'a> {
     model: &'a str,
     messages: &'a [super::ChatMessage],
+    tools: &'a [super::ToolDefinition],
 }
 
 #[derive(Deserialize)]
@@ -54,12 +56,7 @@ struct OpenAiChatResponse {
 
 #[derive(Deserialize)]
 struct OpenAiChoice {
-    message: OpenAiMessage,
-}
-
-#[derive(Deserialize)]
-struct OpenAiMessage {
-    content: Option<String>,
+    message: super::ChatMessage,
 }
 
 fn parse_response(body: &str) -> Result<ChatResponse, LlmError> {
@@ -69,9 +66,13 @@ fn parse_response(body: &str) -> Result<ChatResponse, LlmError> {
         .into_iter()
         .next()
         .ok_or(LlmError::NoChoices)?;
-    let content = choice.message.content.ok_or(LlmError::MissingContent)?;
+    if choice.message.content.is_none() && choice.message.tool_calls.is_none() {
+        return Err(LlmError::MissingContent);
+    }
 
-    Ok(ChatResponse { content })
+    Ok(ChatResponse {
+        message: choice.message,
+    })
 }
 
 #[cfg(test)]
@@ -81,10 +82,27 @@ mod tests {
 
     #[test]
     fn parses_openai_compatible_response() {
-        let response = parse_response(r#"{"choices":[{"message":{"content":"Connected"}}]}"#)
-            .expect("response should deserialize");
+        let response = parse_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"Connected"}}]}"#,
+        )
+        .expect("response should deserialize");
 
-        assert_eq!(response.content, "Connected");
+        assert_eq!(response.message.content.as_deref(), Some("Connected"));
+    }
+
+    #[test]
+    fn parses_response_with_tool_call() {
+        let response = parse_response(
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_123","type":"function","function":{"name":"get_current_directory","arguments":"{}"}}]}}]}"#,
+        )
+        .expect("response should deserialize");
+
+        let tool_calls = response
+            .message
+            .tool_calls
+            .expect("tool calls should be present");
+        assert_eq!(tool_calls[0].function.name, "get_current_directory");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
     }
 
     #[test]

@@ -1,8 +1,12 @@
+mod agent;
 mod llm;
+mod tools;
 
 use std::{env, process::ExitCode};
 
-use llm::{ChatMessage, ChatRequest, LlmClient, ollama::OllamaClient};
+use agent::Agent;
+use llm::ollama::OllamaClient;
+use tools::filesystem::GetCurrentDirectory;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -17,20 +21,22 @@ async fn main() -> ExitCode {
     let base_url =
         env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11434/v1".to_owned());
     let client = OllamaClient::new(base_url);
-    let request = ChatRequest::new(
-        model,
-        vec![ChatMessage::user(
-            "Reply with a short confirmation that the Ollama connection works.",
-        )],
-    );
+    let prompt = env::args().skip(1).collect::<Vec<_>>().join(" ");
 
-    match client.chat(request).await {
-        Ok(response) => {
-            println!("{}", response.content);
+    if prompt.is_empty() {
+        eprintln!("Usage: cargo run -- <prompt>");
+        return ExitCode::FAILURE;
+    }
+
+    let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
+
+    match agent.run(model, prompt).await {
+        Ok(answer) => {
+            println!("{answer}");
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("Ollama request failed: {error}");
+            eprintln!("Agent request failed: {error}");
             ExitCode::FAILURE
         }
     }
