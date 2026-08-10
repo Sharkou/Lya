@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ChatRequest, ChatResponse, LlmClient, LlmError};
+use super::{
+    ChatMessage, ChatRequest, ChatResponse, LlmClient, LlmError, ToolCall, ToolCallFunction,
+};
 
 pub struct OllamaClient {
     client: reqwest::Client,
@@ -19,16 +21,11 @@ impl OllamaClient {
 impl LlmClient for OllamaClient {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let debug = std::env::var_os("LYA_OLLAMA_DEBUG").is_some();
         let body = OpenAiChatRequest {
             model: &request.model,
             messages: &request.messages,
             tools: &request.tools,
         };
-        if debug {
-            let body = serde_json::to_string(&body).map_err(LlmError::Json)?;
-            eprintln!("LYA_OLLAMA_DEBUG request: {body}");
-        }
         let response = self
             .client
             .post(url)
@@ -38,10 +35,6 @@ impl LlmClient for OllamaClient {
             .map_err(LlmError::Network)?;
         let status = response.status();
         let body = response.text().await.map_err(LlmError::Network)?;
-
-        if debug {
-            eprintln!("LYA_OLLAMA_DEBUG response: {body}");
-        }
 
         if !status.is_success() {
             return Err(LlmError::Http { status, body });
@@ -65,7 +58,7 @@ struct OpenAiChatResponse {
 
 #[derive(Deserialize)]
 struct OpenAiChoice {
-    message: super::ChatMessage,
+    message: ChatMessage,
 }
 
 fn parse_response(body: &str) -> Result<ChatResponse, LlmError> {
@@ -75,13 +68,103 @@ fn parse_response(body: &str) -> Result<ChatResponse, LlmError> {
         .into_iter()
         .next()
         .ok_or(LlmError::NoChoices)?;
-    if choice.message.content.is_none() && choice.message.tool_calls.is_none() {
+    let mut message = choice.message;
+    normalize_qwen_tool_call(&mut message);
+
+    if message.content.is_none() && message.tool_calls.is_none() {
         return Err(LlmError::MissingContent);
     }
 
-    Ok(ChatResponse {
-        message: choice.message,
-    })
+    Ok(ChatResponse { message })
+}
+
+fn normalize_qwen_tool_call(message: &mut ChatMessage) {
+    if message.tool_calls.is_some() {
+        return;
+    }
+    let Some(content) = &message.content else {
+        return;
+    };
+    let Some((tool_call, remaining_content)) = parse_qwen_tool_call(content) else {
+        return;
+    };
+
+    message.tool_calls = Some(vec![tool_call]);
+    message.content = (!remaining_content.is_empty()).then_some(remaining_content);
+}
+
+fn parse_qwen_tool_call(content: &str) -> Option<(ToolCall, String)> {
+    let start = content.find("<function=")?;
+    let name_start = start + "<function=".len();
+    let name_end = content[name_start..].find('>')? + name_start;
+    let name = content[name_start..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let body_start = name_end + 1;
+    let end_marker = "<tool_call>";
+    let body_end = content[body_start..].find(end_marker)? + body_start;
+    let parameters = parse_qwen_parameters(&content[body_start..body_end])?;
+    let arguments = serde_json::to_string(&parameters).ok()?;
+    let before = content[..start].trim();
+    let after = content[body_end + end_marker.len()..].trim();
+    let remaining_content = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_owned(),
+        (true, false) => after.to_owned(),
+        (false, false) => format!("{before}\n{after}"),
+    };
+
+    Some((
+        ToolCall {
+            id: "qwen-tool-call-0".to_owned(),
+            kind: "function".to_owned(),
+            function: ToolCallFunction {
+                name: name.to_owned(),
+                arguments,
+            },
+        },
+        remaining_content,
+    ))
+}
+
+fn parse_qwen_parameters(body: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut parameters = serde_json::Map::new();
+    let mut current_name = None;
+    let mut current_value = String::new();
+
+    for line in body.lines() {
+        if let Some(name) = line
+            .trim()
+            .strip_prefix("<parameter=")
+            .and_then(|value| value.strip_suffix('>'))
+        {
+            if let Some(name) = current_name.take() {
+                parameters.insert(
+                    name,
+                    serde_json::Value::String(current_value.trim().to_owned()),
+                );
+                current_value.clear();
+            }
+            if name.is_empty() {
+                return None;
+            }
+            current_name = Some(name.to_owned());
+        } else if current_name.is_some() {
+            if !current_value.is_empty() {
+                current_value.push('\n');
+            }
+            current_value.push_str(line);
+        }
+    }
+
+    let name = current_name?;
+    parameters.insert(
+        name,
+        serde_json::Value::String(current_value.trim().to_owned()),
+    );
+    Some(parameters)
 }
 
 #[cfg(test)]
@@ -112,6 +195,41 @@ mod tests {
             .expect("tool calls should be present");
         assert_eq!(tool_calls[0].function.name, "get_current_directory");
         assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn normalizes_qwen_textual_write_file_tool_call() {
+        let response = parse_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"<function=write_file>\n<parameter=path>\ntest.txt\n\n<parameter=content>\nBonjour depuis Lya\n\n<tool_call>"}}]}"#,
+        )
+        .expect("response should normalize");
+
+        let tool_calls = response
+            .message
+            .tool_calls
+            .expect("tool call should be present");
+        assert_eq!(tool_calls[0].id, "qwen-tool-call-0");
+        assert_eq!(tool_calls[0].function.name, "write_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_calls[0].function.arguments)
+                .expect("arguments should be JSON"),
+            serde_json::json!({"content": "Bonjour depuis Lya", "path": "test.txt"})
+        );
+        assert_eq!(response.message.content, None);
+    }
+
+    #[test]
+    fn preserves_content_outside_qwen_tool_call() {
+        let response = parse_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"I will write the file.\n<function=write_file>\n<parameter=path>\ntest.txt\n<parameter=content>\nHello\n<tool_call>\nDone."}}]}"#,
+        )
+        .expect("response should normalize");
+
+        assert_eq!(
+            response.message.content.as_deref(),
+            Some("I will write the file.\nDone.")
+        );
+        assert!(response.message.tool_calls.is_some());
     }
 
     #[test]
