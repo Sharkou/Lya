@@ -103,8 +103,15 @@ fn parse_qwen_tool_call(content: &str) -> Option<(ToolCall, String)> {
     }
 
     let body_start = name_end + 1;
-    let end_marker = "<tool_call>";
-    let body_end = content[body_start..].find(end_marker)? + body_start;
+    let remaining = &content[body_start..];
+    let (body_end, end_marker) = remaining
+        .find("</tool_call>")
+        .map(|index| (body_start + index, "</tool_call>"))
+        .or_else(|| {
+            remaining
+                .find("<tool_call>")
+                .map(|index| (body_start + index, "<tool_call>"))
+        })?;
     let parameters = parse_qwen_parameters(&content[body_start..body_end])?;
     let arguments = serde_json::to_string(&parameters).ok()?;
     let before = content[..start].trim();
@@ -184,7 +191,7 @@ mod tests {
     use super::{normalize_qwen_tool_call, parse_response};
     use crate::llm::{ChatMessage, LlmError};
 
-    const QWEN_WRITE_FILE_CALL: &str = "Je vais créer un fichier test.txt avec le contenu spécifié.\n\n<function=write_file>\n<parameter=path>\ntest.txt\n</parameter>\n<parameter=content>\nBonjour depuis Lya\n</parameter>\n</parameter>\n</function>\n<tool_call>";
+    const QWEN_WRITE_FILE_CALL: &str = "Je vais créer un fichier test.txt avec le contenu spécifié.\n\n<function=write_file>\n<parameter=path>\ntest.txt\n</parameter>\n<parameter=content>\nBonjour depuis Lya\n</parameter>\n</function>\n</tool_call>";
 
     fn assert_qwen_write_file_call(message: &ChatMessage) {
         let tool_calls = message
@@ -233,7 +240,7 @@ mod tests {
     #[test]
     fn normalizes_qwen_textual_write_file_tool_call() {
         let response = parse_response(
-            r#"{"choices":[{"message":{"role":"assistant","content":"<function=write_file>\n<parameter=path>\ntest.txt\n\n<parameter=content>\nBonjour depuis Lya\n\n<tool_call>"}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"<function=write_file>\n<parameter=path>\ntest.txt\n</parameter>\n<parameter=content>\nBonjour depuis Lya\n</parameter>\n</function>\n</tool_call>"}}]}"#,
         )
         .expect("response should normalize");
 
