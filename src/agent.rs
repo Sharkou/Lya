@@ -2,17 +2,29 @@ use std::{error::Error, fmt};
 
 use crate::{
     llm::{ChatMessage, ChatRequest, LlmClient, LlmError},
-    tools::{Tool, ToolError},
+    tools::Tool,
 };
 
 pub struct Agent<'a, Client> {
     client: &'a Client,
     tools: Vec<Box<dyn Tool>>,
+    max_tool_calls: usize,
 }
 
 impl<'a, Client: LlmClient> Agent<'a, Client> {
+    pub const DEFAULT_MAX_TOOL_CALLS: usize = 16;
+
     pub fn new(client: &'a Client, tools: Vec<Box<dyn Tool>>) -> Self {
-        Self { client, tools }
+        Self {
+            client,
+            tools,
+            max_tool_calls: Self::DEFAULT_MAX_TOOL_CALLS,
+        }
+    }
+
+    pub fn with_max_tool_calls(mut self, max_tool_calls: usize) -> Self {
+        self.max_tool_calls = max_tool_calls;
+        self
     }
 
     pub async fn run(
@@ -23,6 +35,7 @@ impl<'a, Client: LlmClient> Agent<'a, Client> {
         let model = model.into();
         let mut messages = vec![ChatMessage::user(prompt)];
         let definitions: Vec<_> = self.tools.iter().map(|tool| tool.definition()).collect();
+        let mut tool_calls_used = 0;
 
         loop {
             let response = self
@@ -40,24 +53,13 @@ impl<'a, Client: LlmClient> Agent<'a, Client> {
                 messages.push(message.clone());
 
                 for tool_call in tool_calls {
-                    let arguments =
-                        serde_json::from_str(&tool_call.function.arguments).map_err(|error| {
-                            AgentError::InvalidToolArguments {
-                                tool: tool_call.function.name.clone(),
-                                error,
-                            }
-                        })?;
-                    let tool = self
-                        .tools
-                        .iter()
-                        .find(|tool| tool.definition().function.name == tool_call.function.name)
-                        .ok_or_else(|| AgentError::UnknownTool(tool_call.function.name.clone()))?;
-                    let result = tool.execute(arguments).map_err(|error| AgentError::Tool {
-                        tool: tool_call.function.name.clone(),
-                        error,
-                    })?;
-                    let content =
-                        serde_json::to_string(&result).map_err(AgentError::SerializeToolResult)?;
+                    if tool_calls_used == self.max_tool_calls {
+                        return Err(AgentError::ToolCallLimitReached {
+                            limit: self.max_tool_calls,
+                        });
+                    }
+                    tool_calls_used += 1;
+                    let content = self.execute_tool_call(tool_call)?;
 
                     messages.push(ChatMessage::tool_result(&tool_call.id, content));
                 }
@@ -68,37 +70,56 @@ impl<'a, Client: LlmClient> Agent<'a, Client> {
             }
         }
     }
+
+    fn execute_tool_call(&self, tool_call: &crate::llm::ToolCall) -> Result<String, AgentError> {
+        let name = &tool_call.function.name;
+        let result = match serde_json::from_str(&tool_call.function.arguments) {
+            Err(error) => tool_error_result(name, format!("invalid JSON arguments: {error}")),
+            Ok(arguments) => match self
+                .tools
+                .iter()
+                .find(|tool| tool.definition().function.name == *name)
+            {
+                None => tool_error_result(name, "unknown tool"),
+                Some(tool) => match tool.execute(arguments) {
+                    Ok(result) => result,
+                    Err(error) => tool_error_result(name, error.to_string()),
+                },
+            },
+        };
+
+        serde_json::to_string(&result).map_err(AgentError::SerializeToolResult)
+    }
+}
+
+fn tool_error_result(tool: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "tool": tool,
+            "message": message.into()
+        }
+    })
 }
 
 #[derive(Debug)]
 pub enum AgentError {
     Llm(LlmError),
-    InvalidToolArguments {
-        tool: String,
-        error: serde_json::Error,
-    },
-    UnknownTool(String),
-    Tool {
-        tool: String,
-        error: ToolError,
-    },
     SerializeToolResult(serde_json::Error),
     MissingFinalContent,
+    ToolCallLimitReached { limit: usize },
 }
 
 impl fmt::Display for AgentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Llm(error) => write!(formatter, "LLM error: {error}"),
-            Self::InvalidToolArguments { tool, error } => {
-                write!(formatter, "invalid arguments for tool {tool}: {error}")
-            }
-            Self::UnknownTool(tool) => write!(formatter, "unknown tool requested: {tool}"),
-            Self::Tool { tool, error } => write!(formatter, "tool {tool} failed: {error}"),
             Self::SerializeToolResult(error) => {
                 write!(formatter, "could not serialize tool result: {error}")
             }
             Self::MissingFinalContent => write!(formatter, "LLM response has no final content"),
+            Self::ToolCallLimitReached { limit } => {
+                write!(formatter, "tool call limit of {limit} reached")
+            }
         }
     }
 }
@@ -107,11 +128,8 @@ impl Error for AgentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Llm(error) => Some(error),
-            Self::InvalidToolArguments { error, .. } | Self::SerializeToolResult(error) => {
-                Some(error)
-            }
-            Self::Tool { error, .. } => Some(error),
-            Self::UnknownTool(_) | Self::MissingFinalContent => None,
+            Self::SerializeToolResult(error) => Some(error),
+            Self::MissingFinalContent | Self::ToolCallLimitReached { .. } => None,
         }
     }
 }
@@ -122,10 +140,26 @@ mod tests {
 
     use crate::{
         llm::{ChatMessage, ChatResponse, ToolCall, ToolCallFunction},
-        tools::filesystem::GetCurrentDirectory,
+        tools::{Tool, ToolError, filesystem::GetCurrentDirectory},
     };
 
     use super::{Agent, AgentError};
+
+    struct FailingTool;
+
+    impl Tool for FailingTool {
+        fn definition(&self) -> crate::llm::ToolDefinition {
+            crate::llm::ToolDefinition::function(
+                "failing_tool",
+                "Always fails.",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+        }
+
+        fn execute(&self, _arguments: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::new("simulated execution failure"))
+        }
+    }
 
     struct FakeClient {
         responses: Mutex<Vec<ChatResponse>>,
@@ -218,33 +252,94 @@ mod tests {
             requests[1].messages[2].tool_call_id.as_deref(),
             Some("call_123")
         );
+        assert!(requests[1].messages[1].tool_calls.is_some());
     }
 
     #[tokio::test]
-    async fn rejects_unknown_tool() {
-        let client = FakeClient::new(vec![tool_call("unknown", "{}")]);
+    async fn reports_unknown_tool_to_llm() {
+        let client = FakeClient::new(vec![
+            tool_call("unknown", "{}"),
+            final_response("I cannot use that tool."),
+        ]);
         let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
 
-        let error = agent
+        let answer = agent
             .run("test", "prompt")
             .await
-            .expect_err("tool is unknown");
+            .expect("LLM should receive the tool error");
 
-        assert!(matches!(error, AgentError::UnknownTool(tool) if tool == "unknown"));
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_tool_arguments() {
-        let client = FakeClient::new(vec![tool_call("get_current_directory", "not json")]);
-        let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
-
-        let error = agent
-            .run("test", "prompt")
-            .await
-            .expect_err("arguments are invalid");
-
-        assert!(
-            matches!(error, AgentError::InvalidToolArguments { tool, .. } if tool == "get_current_directory")
+        assert_eq!(answer, "I cannot use that tool.");
+        let requests = client.requests();
+        assert_eq!(requests[1].messages[1].role, "assistant");
+        assert_eq!(requests[1].messages[2].role, "tool");
+        assert_eq!(
+            requests[1].messages[2].content.as_deref(),
+            Some(r#"{"error":{"message":"unknown tool","tool":"unknown"}}"#)
         );
+    }
+
+    #[tokio::test]
+    async fn reports_invalid_tool_arguments_to_llm() {
+        let client = FakeClient::new(vec![
+            tool_call("get_current_directory", "not json"),
+            final_response("The tool arguments were invalid."),
+        ]);
+        let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
+
+        let answer = agent
+            .run("test", "prompt")
+            .await
+            .expect("LLM should receive the tool error");
+
+        assert_eq!(answer, "The tool arguments were invalid.");
+        let requests = client.requests();
+        assert!(
+            requests[1].messages[2]
+                .content
+                .as_deref()
+                .expect("tool result should have content")
+                .contains("invalid JSON arguments")
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_tool_execution_error_to_llm() {
+        let client = FakeClient::new(vec![
+            tool_call("failing_tool", "{}"),
+            final_response("The tool failed."),
+        ]);
+        let agent = Agent::new(&client, vec![Box::new(FailingTool)]);
+
+        let answer = agent
+            .run("test", "prompt")
+            .await
+            .expect("LLM should receive the execution error");
+
+        assert_eq!(answer, "The tool failed.");
+        let requests = client.requests();
+        assert_eq!(
+            requests[1].messages[2].content.as_deref(),
+            Some(r#"{"error":{"message":"simulated execution failure","tool":"failing_tool"}}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_after_configured_tool_call_limit() {
+        let client = FakeClient::new(vec![
+            tool_call("get_current_directory", "{}"),
+            tool_call("get_current_directory", "{}"),
+        ]);
+        let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]).with_max_tool_calls(1);
+
+        let error = agent
+            .run("test", "prompt")
+            .await
+            .expect_err("second tool call should exceed the limit");
+
+        assert!(matches!(
+            error,
+            AgentError::ToolCallLimitReached { limit: 1 }
+        ));
+        assert_eq!(client.requests().len(), 2);
     }
 }

@@ -28,7 +28,8 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)]);
+    let agent = Agent::new(&client, vec![Box::new(GetCurrentDirectory)])
+        .with_max_tool_calls(Agent::<OllamaClient>::DEFAULT_MAX_TOOL_CALLS);
 
     match agent.run(model, prompt).await {
         Ok(answer) => {
