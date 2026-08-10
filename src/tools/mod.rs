@@ -1,6 +1,7 @@
 pub mod command;
 pub mod directory;
 pub mod filesystem;
+pub mod listing;
 
 use std::{error::Error, fmt};
 

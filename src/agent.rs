@@ -150,6 +150,7 @@ mod tests {
             Tool, ToolError,
             directory::CreateDirectory,
             filesystem::{GetCurrentDirectory, ReadFile, WriteFile},
+            listing::ListDirectory,
         },
     };
 
@@ -350,6 +351,32 @@ mod tests {
                     .canonicalize()
                     .expect("directory should exist")
             )
+        );
+        fs::remove_dir_all(workspace).expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn lists_directory_and_sends_result_to_llm() {
+        let workspace = workspace();
+        fs::write(workspace.join("answer.txt"), "workspace content")
+            .expect("file should be written");
+        let client = FakeClient::new(vec![
+            tool_call("list_directory", r#"{"path":"."}"#),
+            final_response("I listed the directory."),
+        ]);
+        let list_directory = ListDirectory::new(&workspace).expect("workspace should be valid");
+        let agent = Agent::new(&client, vec![Box::new(list_directory)]);
+
+        let answer = agent
+            .run("test", "List the workspace")
+            .await
+            .expect("agent should finish");
+
+        assert_eq!(answer, "I listed the directory.");
+        let requests = client.requests();
+        assert_eq!(
+            requests[1].messages[2].content.as_deref(),
+            Some(r#"{"entries":[{"name":"answer.txt","type":"file"}]}"#)
         );
         fs::remove_dir_all(workspace).expect("workspace should be removed");
     }

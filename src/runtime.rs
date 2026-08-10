@@ -8,6 +8,7 @@ use crate::tools::{
     command::RunCommand,
     directory::CreateDirectory,
     filesystem::{GetCurrentDirectory, ReadFile, WriteFile},
+    listing::ListDirectory,
 };
 
 pub struct Runtime {
@@ -54,6 +55,7 @@ impl Runtime {
             Box::new(ReadFile::new(&self.workspace).expect("runtime workspace is valid")),
             Box::new(WriteFile::new(&self.workspace).expect("runtime workspace is valid")),
             Box::new(CreateDirectory::new(&self.workspace).expect("runtime workspace is valid")),
+            Box::new(ListDirectory::new(&self.workspace).expect("runtime workspace is valid")),
             Box::new(RunCommand::new(&self.workspace)),
         ]
     }
@@ -199,6 +201,18 @@ mod tests {
             .execute(serde_json::json!({"path": "project/src"}))
             .expect("directory should be created");
         assert!(workspace.join("project/src").is_dir());
+        let list_directory = runtime
+            .tools()
+            .into_iter()
+            .find(|tool| tool.definition().function.name == "list_directory")
+            .expect("list_directory should be registered");
+        let result = list_directory
+            .execute(serde_json::json!({"path": "project"}))
+            .expect("directory should be listed");
+        assert_eq!(
+            result,
+            serde_json::json!({"entries": [{"name": "src", "type": "directory"}]})
+        );
         fs::write(
             workspace.join("Cargo.toml"),
             "[package]\nname = \"runtime-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
