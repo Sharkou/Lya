@@ -148,7 +148,6 @@ mod tests {
         llm::{ChatMessage, ChatResponse, ToolCall, ToolCallFunction},
         tools::{
             Tool, ToolError,
-            command::RunCommand,
             filesystem::{GetCurrentDirectory, ReadFile, WriteFile},
         },
     };
@@ -323,7 +322,12 @@ mod tests {
             tool_call("run_command", r#"{"command":"cargo --version"}"#),
             final_response("I ran the command."),
         ]);
-        let agent = Agent::new(&client, vec![Box::new(RunCommand::new())]);
+        let agent = Agent::new(
+            &client,
+            vec![Box::new(crate::tools::command::RunCommand::new(
+                std::env::current_dir().expect("current directory should exist"),
+            ))],
+        );
 
         let answer = agent
             .run("test", "Show the Cargo version")

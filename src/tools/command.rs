@@ -1,5 +1,5 @@
 use std::{
-    env,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -11,21 +11,26 @@ use crate::{
 };
 
 pub struct RunCommand {
+    current_dir: PathBuf,
     timeout: Duration,
 }
 
 impl RunCommand {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    pub fn new() -> Self {
+    pub fn new(current_dir: impl AsRef<Path>) -> Self {
         Self {
+            current_dir: current_dir.as_ref().to_owned(),
             timeout: Self::DEFAULT_TIMEOUT,
         }
     }
 
     #[cfg(test)]
-    fn with_timeout(timeout: Duration) -> Self {
-        Self { timeout }
+    fn with_timeout(current_dir: impl AsRef<Path>, timeout: Duration) -> Self {
+        Self {
+            current_dir: current_dir.as_ref().to_owned(),
+            timeout,
+        }
     }
 
     fn run(&self, command: &str) -> Result<serde_json::Value, ToolError> {
@@ -34,11 +39,9 @@ impl RunCommand {
             .next()
             .ok_or_else(|| ToolError::new("run_command requires a non-empty command"))?;
         let arguments: Vec<_> = parts.collect();
-        let current_dir = env::current_dir()
-            .map_err(|error| ToolError::new(format!("could not get current directory: {error}")))?;
         let mut child = Command::new(program)
             .args(arguments)
-            .current_dir(current_dir)
+            .current_dir(&self.current_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -81,7 +84,7 @@ impl RunCommand {
 
 impl Default for RunCommand {
     fn default() -> Self {
-        Self::new()
+        Self::new(std::env::current_dir().expect("current directory should exist"))
     }
 }
 
@@ -116,7 +119,7 @@ impl Tool for RunCommand {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{env, time::Duration};
 
     use super::RunCommand;
     use crate::tools::Tool;
@@ -133,7 +136,7 @@ mod tests {
 
     #[test]
     fn captures_successful_command_stdout() {
-        let result = RunCommand::new()
+        let result = RunCommand::new(env::current_dir().expect("current directory should exist"))
             .execute(serde_json::json!({"command": SUCCESS_COMMAND}))
             .expect("command should succeed");
 
@@ -151,7 +154,7 @@ mod tests {
 
     #[test]
     fn captures_non_zero_exit_code_and_stderr() {
-        let result = RunCommand::new()
+        let result = RunCommand::new(env::current_dir().expect("current directory should exist"))
             .execute(serde_json::json!({"command": "cargo invalid-subcommand"}))
             .expect("command should run");
 
@@ -166,7 +169,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_command() {
-        let error = RunCommand::new()
+        let error = RunCommand::new(env::current_dir().expect("current directory should exist"))
             .execute(serde_json::json!({"command": "lya-command-that-does-not-exist"}))
             .expect_err("missing command should fail");
 
@@ -175,9 +178,12 @@ mod tests {
 
     #[test]
     fn stops_timed_out_command() {
-        let error = RunCommand::with_timeout(Duration::from_millis(50))
-            .execute(serde_json::json!({"command": TIMEOUT_COMMAND}))
-            .expect_err("command should time out");
+        let error = RunCommand::with_timeout(
+            env::current_dir().expect("current directory should exist"),
+            Duration::from_millis(50),
+        )
+        .execute(serde_json::json!({"command": TIMEOUT_COMMAND}))
+        .expect_err("command should time out");
 
         assert!(error.to_string().contains("command timed out"));
     }
