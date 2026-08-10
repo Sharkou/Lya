@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -15,12 +15,26 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn from_environment() -> Result<Self, ToolError> {
-        let workspace = env::var_os("LYA_WORKSPACE")
-            .map(PathBuf::from)
-            .map_or_else(env::current_dir, Ok)
-            .map_err(|error| ToolError::new(format!("could not determine workspace: {error}")))?;
+        if let Some(workspace) = env::var_os("LYA_WORKSPACE") {
+            return Self::new(PathBuf::from(workspace));
+        }
+
+        let workspace = Self::default_workspace()?;
+        fs::create_dir_all(&workspace)
+            .map_err(|error| ToolError::new(format!("could not create workspace: {error}")))?;
 
         Self::new(workspace)
+    }
+
+    fn default_workspace() -> Result<PathBuf, ToolError> {
+        let home = user_home_directory()?;
+        let documents_workspace = home.join("Documents").join("Lya");
+
+        Ok(if documents_workspace.is_dir() {
+            documents_workspace
+        } else {
+            home.join("Lya")
+        })
     }
 
     pub fn new(workspace: impl AsRef<Path>) -> Result<Self, ToolError> {
@@ -50,9 +64,26 @@ impl Runtime {
     }
 }
 
+#[cfg(windows)]
+fn user_home_directory() -> Result<PathBuf, ToolError> {
+    env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| ToolError::new("USERPROFILE must define the user home directory"))
+}
+
+#[cfg(not(windows))]
+fn user_home_directory() -> Result<PathBuf, ToolError> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| ToolError::new("HOME must define the user home directory"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
         fs,
         path::Path,
         sync::{Mutex, OnceLock},
@@ -73,14 +104,47 @@ mod tests {
         directory
     }
 
+    #[cfg(windows)]
+    const HOME_VARIABLE: &str = "USERPROFILE";
+    #[cfg(not(windows))]
+    const HOME_VARIABLE: &str = "HOME";
+
+    struct EnvironmentVariable {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvironmentVariable {
+        fn set(name: &'static str, value: Option<&Path>) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvironmentVariable {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
     #[test]
     fn uses_workspace_from_environment() {
         let _lock = environment_lock()
             .lock()
             .expect("environment lock should not be poisoned");
         let workspace = workspace("environment");
-        let previous = std::env::var_os("LYA_WORKSPACE");
-        unsafe { std::env::set_var("LYA_WORKSPACE", &workspace) };
+        let _workspace = EnvironmentVariable::set("LYA_WORKSPACE", Some(&workspace));
 
         let runtime = Runtime::from_environment().expect("runtime should be created");
 
@@ -88,41 +152,59 @@ mod tests {
             runtime.workspace(),
             workspace.canonicalize().expect("workspace should exist")
         );
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("LYA_WORKSPACE", value),
-                None => std::env::remove_var("LYA_WORKSPACE"),
-            }
-        }
+        drop(_workspace);
         fs::remove_dir_all(workspace).expect("workspace should be removed");
     }
 
     #[test]
-    fn defaults_to_current_directory() {
+    fn uses_documents_workspace_when_it_exists() {
         let _lock = environment_lock()
             .lock()
             .expect("environment lock should not be poisoned");
-        let previous = std::env::var_os("LYA_WORKSPACE");
-        unsafe { std::env::remove_var("LYA_WORKSPACE") };
+        let home = workspace("documents-workspace");
+        let documents_workspace = home.join("Documents").join("Lya");
+        fs::create_dir_all(&documents_workspace).expect("documents workspace should be created");
+        let _workspace = EnvironmentVariable::set("LYA_WORKSPACE", None);
+        let _home = EnvironmentVariable::set(HOME_VARIABLE, Some(&home));
 
         let runtime = Runtime::from_environment().expect("runtime should be created");
 
         assert_eq!(
             runtime.workspace(),
-            std::env::current_dir()
-                .expect("current directory should exist")
+            documents_workspace
                 .canonicalize()
-                .expect("current directory should resolve")
+                .expect("documents workspace should exist")
         );
-        unsafe {
-            if let Some(value) = previous {
-                std::env::set_var("LYA_WORKSPACE", value);
-            }
-        }
+        drop(_home);
+        drop(_workspace);
+        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]
-    fn reads_and_writes_files_in_workspace() {
+    fn creates_missing_default_workspace() {
+        let _lock = environment_lock()
+            .lock()
+            .expect("environment lock should not be poisoned");
+        let home = workspace("default-workspace");
+        let default_workspace = home.join("Lya");
+        let _workspace = EnvironmentVariable::set("LYA_WORKSPACE", None);
+        let _home = EnvironmentVariable::set(HOME_VARIABLE, Some(&home));
+
+        let runtime = Runtime::from_environment().expect("runtime should be created");
+
+        assert_eq!(
+            runtime.workspace(),
+            default_workspace
+                .canonicalize()
+                .expect("default workspace should be created")
+        );
+        drop(_home);
+        drop(_workspace);
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn all_workspace_tools_use_the_runtime_workspace() {
         let workspace = workspace("filesystem");
         let runtime = Runtime::new(&workspace).expect("runtime should be created");
         let write_file = runtime
@@ -145,12 +227,6 @@ mod tests {
             .expect("file should be read");
 
         assert_eq!(result, serde_json::json!({"content": "hello Lya"}));
-        fs::remove_dir_all(workspace).expect("workspace should be removed");
-    }
-
-    #[test]
-    fn runs_commands_in_workspace() {
-        let workspace = workspace("command");
         fs::write(
             workspace.join("Cargo.toml"),
             "[package]\nname = \"runtime-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
