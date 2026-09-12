@@ -4,7 +4,7 @@
 
 The goal of Lya is to provide a simple, extensible and local-first AI agent capable of interacting with tools and external systems while keeping the architecture lightweight and understandable.
 
-Lya is designed to work with local LLMs through [Ollama](https://ollama.com/).
+Lya is designed to work with local LLMs through [Ollama](https://ollama.com/). It also provides local-only process, private-context, state, and environment-diagnostic foundations for future development orchestration.
 
 ## Goals
 
@@ -59,8 +59,22 @@ cargo build
 Run it:
 
 ```bash
-cargo run
+OLLAMA_MODEL=<model> cargo run -- <prompt>
 ```
+
+## Local Orchestration Foundations
+
+Lya resolves its private local directory from `LYA_HOME`, falling back to `~/.lya`. This directory is outside the repository and may contain a private `context.md` and the future orchestrator state file `state.json`.
+
+Check the local prerequisites without contacting an LLM or network service:
+
+```bash
+cargo run -- doctor
+```
+
+`doctor` reports the resolved `LYA_HOME`, whether `context.md` is readable, and whether `git`, `codex`, and `claude` are available on `PATH`.
+
+The Codex/Claude execution loop, automated Git operations, quota handling, and a daemon are not implemented yet.
 
 > Lya is currently under active development. APIs, architecture and features may change significantly.
 

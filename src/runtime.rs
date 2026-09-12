@@ -241,8 +241,10 @@ mod tests {
                         .expect("workspace should exist")
                         .join("Cargo.toml")
                         .to_string_lossy()
-                        .as_ref()
-                )
+                        .trim_start_matches(r"\\?\")
+                ),
+            "cargo reported project path: {}",
+            result["stdout"].as_str().expect("stdout should be text")
         );
         let current_directory = runtime
             .tools()

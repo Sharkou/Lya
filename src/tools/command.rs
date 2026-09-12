@@ -1,12 +1,11 @@
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
     llm::ToolDefinition,
+    process::ProcessSpec,
     tools::{Tool, ToolError},
 };
 
@@ -38,47 +37,29 @@ impl RunCommand {
         let program = parts
             .next()
             .ok_or_else(|| ToolError::new("run_command requires a non-empty command"))?;
-        let arguments: Vec<_> = parts.collect();
-        let mut child = Command::new(program)
-            .args(arguments)
-            .current_dir(&self.current_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| ToolError::new(format!("could not start command: {error}")))?;
-        let deadline = Instant::now() + self.timeout;
+        let mut spec = ProcessSpec::new(program);
+        spec.args = parts.map(str::to_owned).collect();
+        spec.cwd = Some(self.current_dir.clone());
+        spec.timeout = Some(self.timeout);
 
-        loop {
-            if child
-                .try_wait()
-                .map_err(|error| ToolError::new(format!("could not wait for command: {error}")))?
-                .is_some()
-            {
-                let output = child.wait_with_output().map_err(|error| {
-                    ToolError::new(format!("could not collect command output: {error}"))
-                })?;
-                return Ok(serde_json::json!({
-                    "exit_code": output.status.code(),
-                    "stdout": String::from_utf8_lossy(&output.stdout),
-                    "stderr": String::from_utf8_lossy(&output.stderr)
-                }));
-            }
+        let output = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    ToolError::new(format!("could not start command runtime: {error}"))
+                })?
+                .block_on(spec.run())
+                .map_err(|error| ToolError::new(error.to_string()))
+        })
+        .join()
+        .map_err(|_| ToolError::new("command execution thread panicked"))??;
 
-            if Instant::now() >= deadline {
-                child.kill().map_err(|error| {
-                    ToolError::new(format!("could not stop timed out command: {error}"))
-                })?;
-                child.wait().map_err(|error| {
-                    ToolError::new(format!("could not wait for timed out command: {error}"))
-                })?;
-                return Err(ToolError::new(format!(
-                    "command timed out after {} seconds",
-                    self.timeout.as_secs_f64()
-                )));
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        }
+        Ok(serde_json::json!({
+            "exit_code": output.exit_code,
+            "stdout": output.stdout,
+            "stderr": output.stderr
+        }))
     }
 }
 
@@ -92,7 +73,7 @@ impl Tool for RunCommand {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             "run_command",
-            "Runs a command with simple whitespace-separated arguments in Lya's current directory.",
+            "Runs a command with whitespace-separated arguments in Lya's current directory.",
             serde_json::json!({
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -173,7 +154,7 @@ mod tests {
             .execute(serde_json::json!({"command": "lya-command-that-does-not-exist"}))
             .expect_err("missing command should fail");
 
-        assert!(error.to_string().contains("could not start command"));
+        assert!(error.to_string().contains("could not start process"));
     }
 
     #[test]
@@ -185,6 +166,6 @@ mod tests {
         .execute(serde_json::json!({"command": TIMEOUT_COMMAND}))
         .expect_err("command should time out");
 
-        assert!(error.to_string().contains("command timed out"));
+        assert!(error.to_string().contains("process timed out"));
     }
 }

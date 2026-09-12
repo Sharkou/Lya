@@ -1,6 +1,6 @@
 pub mod ollama;
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, future::Future};
 
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +107,10 @@ pub struct ToolCallFunction {
 }
 
 pub trait LlmClient {
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError>;
+    fn chat(
+        &self,
+        request: ChatRequest,
+    ) -> impl Future<Output = Result<ChatResponse, LlmError>> + Send;
 }
 
 #[derive(Debug)]
