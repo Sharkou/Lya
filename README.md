@@ -80,7 +80,7 @@ With a Codex CLI installation authenticated through ChatGPT, test the Supervisor
 cargo run -- supervisor "Determine the next development step"
 ```
 
-The command requires `context.md`, runs `codex exec` with a strict JSON Schema, removes `OPENAI_API_KEY` from the Codex child process, and prints one of `CLAUDE`, `ACCEPT`, `HUMAN`, or `STOP` as JSON.
+The command requires `context.md`, runs `codex exec` with a strict JSON Schema, removes `OPENAI_API_KEY` from the Codex child process, and prints one of `CLAUDE`, `ACCEPT`, `HUMAN`, or `STOP` as JSON. Set `LYA_CODEX_BIN` to use a Codex executable not available on `PATH`; otherwise Lya invokes `codex`.
 
 ## Executor Development Command
 
@@ -96,7 +96,17 @@ The command accepts `--project <path>`, `--resume <session>`, `--browser`, `--ti
 
 Lya starts Claude Code with `--permission-mode auto --permission-prompts none`: Claude's safety classifier evaluates actions, while actions that would need an unanswered approval are denied. Lya never uses `--dangerously-skip-permissions`. It removes `ANTHROPIC_API_KEY` only from the Claude child process, so the CLI uses its normal Claude subscription authentication and cannot silently fall back to API-key billing.
 
-The Claude execution loop, automated Git operations, automatic quota handling, and a daemon are not implemented yet.
+## Autonomous Development Command
+
+`lya run` connects the Codex Supervisor to the Claude Executor in a single sequential development loop. It requires a readable `context.md` in `LYA_HOME` (or `~/.lya`), a valid Git repository, and a clean working tree at startup. Lya refuses dirty projects rather than mixing pre-existing changes with the autonomous job's changes.
+
+```bash
+cargo run -- run --project C:\Projects\PixelCreator --browser --max-iterations 5 "Fix the current Inspector regression"
+```
+
+The command persists each job in `LYA_HOME/state.json` and stores Codex's schema/output files under `LYA_HOME/jobs/<job-id>`. An iteration is one Codex Supervisor review and the optional Claude execution it requests. The default limit is 10 iterations. Before every post-Claude review, Lya collects read-only repository facts (`git status --short`, `git diff --stat`, changed files, `git diff`, and `HEAD`); diffs above 128 KiB are explicitly marked as truncated while retaining the full stat and file list.
+
+`CLAUDE` starts or resumes the recorded Claude session. `ACCEPT` records and prints the proposed commit title, but does not execute Git. `HUMAN` records the question and leaves the job in `WAITING_HUMAN`; `STOP` records the reason and leaves it `STOPPED`. Failures and the iteration limit leave the job `FAILED`. There is no automatic commit, push, daemon, parallel execution, or automatic job-resume command.
 
 > Lya is currently under active development. APIs, architecture and features may change significantly.
 

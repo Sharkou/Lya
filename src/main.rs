@@ -7,11 +7,14 @@ use lya::{
         doctor::DoctorReport,
         executor::{ClaudeCliExecutor, Executor, ExecutorRequest, ExecutorSession},
         home::LyaHome,
+        job::{AutonomousOrchestrator, NewJob, new_job_id},
+        state::JobStatus,
         supervisor::{
-            CodexCliSupervisor, Project, Supervisor, SupervisorRequest,
+            CodexCliSupervisor, Project, Supervisor, SupervisorDecision, SupervisorRequest,
             load_required_private_context,
         },
     },
+    process::SystemProcessRunner,
     runtime::Runtime,
 };
 
@@ -39,6 +42,9 @@ async fn main() -> ExitCode {
         .is_some_and(|argument| argument == "executor")
     {
         return run_executor(&arguments[1..]).await;
+    }
+    if arguments.first().is_some_and(|argument| argument == "run") {
+        return run_autonomous_job(&arguments[1..]).await;
     }
 
     let model = match env::var("OLLAMA_MODEL") {
@@ -77,6 +83,91 @@ async fn main() -> ExitCode {
         }
         Err(error) => {
             eprintln!("Agent request failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
+    let (project_path, browser, max_iterations, task) = match parse_run_arguments(arguments) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!(
+                "{error}\nUsage: lya run [--project <path>] [--browser] [--max-iterations <count>] <task>"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let home = match LyaHome::resolve() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("Could not resolve Lya home: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let private_context = match load_required_private_context(&home) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("Could not prepare autonomous job: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let job_id = new_job_id();
+    let project = Project {
+        name: project_name(&project_path),
+        path: project_path,
+    };
+    println!(
+        "Starting job {} for {} (maximum {} iterations).",
+        job_id,
+        project.path.display(),
+        max_iterations
+    );
+
+    let orchestrator = AutonomousOrchestrator::new(
+        CodexCliSupervisor::new_for_job(home.path(), &job_id),
+        ClaudeCliExecutor::new(),
+        SystemProcessRunner,
+        lya::orchestrator::state::StateStore::new(&home),
+    )
+    .with_max_iterations(max_iterations)
+    .with_browser(browser);
+    let result = orchestrator
+        .run(NewJob {
+            job_id: job_id.clone(),
+            project,
+            task,
+            private_context,
+        })
+        .await;
+
+    match result {
+        Ok(job) => {
+            println!("Job {} finished with status {:?}.", job.job_id, job.status);
+            match job.last_supervisor_decision {
+                Some(SupervisorDecision::Accept {
+                    commit_title,
+                    next_prompt,
+                    ..
+                }) => {
+                    println!("Commit title (not executed): {commit_title}");
+                    if let Some(next_prompt) = next_prompt {
+                        println!("Next prompt: {next_prompt}");
+                    }
+                }
+                Some(SupervisorDecision::Human { reason })
+                | Some(SupervisorDecision::Stop { reason }) => println!("{reason}"),
+                Some(SupervisorDecision::Claude { .. }) | None => {}
+            }
+            match job.status {
+                JobStatus::Accepted | JobStatus::WaitingHuman | JobStatus::Stopped => {
+                    ExitCode::SUCCESS
+                }
+                _ => ExitCode::FAILURE,
+            }
+        }
+        Err(error) => {
+            eprintln!("Job {job_id} failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -248,6 +339,53 @@ fn parse_executor_arguments(
     ))
 }
 
+fn parse_run_arguments(
+    arguments: &[String],
+) -> Result<(std::path::PathBuf, bool, u32, String), String> {
+    let mut project_path = env::current_dir().map_err(|error| error.to_string())?;
+    let mut browser = false;
+    let mut max_iterations = lya::orchestrator::job::DEFAULT_MAX_ITERATIONS;
+    let mut task = Vec::new();
+    let mut position = 0;
+
+    while position < arguments.len() {
+        match arguments[position].as_str() {
+            "--project" => {
+                position += 1;
+                project_path = arguments
+                    .get(position)
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| "--project requires a path".to_owned())?;
+            }
+            "--browser" => browser = true,
+            "--max-iterations" => {
+                position += 1;
+                max_iterations = arguments
+                    .get(position)
+                    .ok_or_else(|| "--max-iterations requires a number".to_owned())?
+                    .parse::<u32>()
+                    .map_err(|_| "--max-iterations must be an unsigned integer".to_owned())?;
+                if max_iterations == 0 {
+                    return Err("--max-iterations must be greater than zero".to_owned());
+                }
+            }
+            argument if argument.starts_with("--") => {
+                return Err(format!("unknown run option: {argument}"));
+            }
+            argument => task.push(argument.to_owned()),
+        }
+        position += 1;
+    }
+
+    if task.is_empty() {
+        return Err("a task is required".to_owned());
+    }
+    let project_path = project_path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve project path: {error}"))?;
+    Ok((project_path, browser, max_iterations, task.join(" ")))
+}
+
 fn project_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -278,7 +416,7 @@ fn run_doctor() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutorSession, parse_executor_arguments};
+    use super::{ExecutorSession, parse_executor_arguments, parse_run_arguments};
 
     #[test]
     fn parses_executor_options_and_preserves_prompt_words() {
@@ -305,5 +443,23 @@ mod tests {
         assert!(request.browser);
         assert_eq!(request.timeout.map(|timeout| timeout.as_secs()), Some(900));
         assert_eq!(max_turns, Some(4));
+    }
+
+    #[test]
+    fn parses_run_options_and_preserves_task_words() {
+        let arguments = vec![
+            "--browser".to_owned(),
+            "--max-iterations".to_owned(),
+            "5".to_owned(),
+            "Fix".to_owned(),
+            "the regression".to_owned(),
+        ];
+
+        let (_, browser, max_iterations, task) = parse_run_arguments(&arguments)
+            .expect("arguments should parse from the current project");
+
+        assert!(browser);
+        assert_eq!(max_iterations, 5);
+        assert_eq!(task, "Fix the regression");
     }
 }

@@ -10,14 +10,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::home::LyaHome;
+use super::{home::LyaHome, supervisor::SupervisorDecision};
 
 static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
-    #[serde(rename = "IDLE")]
-    Idle,
     #[serde(rename = "RUNNING")]
     Running,
     #[serde(rename = "WAITING_CLAUDE_QUOTA")]
@@ -26,6 +24,8 @@ pub enum JobStatus {
     WaitingOpenAiQuota,
     #[serde(rename = "WAITING_HUMAN")]
     WaitingHuman,
+    #[serde(rename = "ACCEPTED")]
+    Accepted,
     #[serde(rename = "FAILED")]
     Failed,
     #[serde(rename = "STOPPED")]
@@ -33,23 +33,55 @@ pub enum JobStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobPhase {
+    #[serde(rename = "SUPERVISOR")]
+    Supervisor,
+    #[serde(rename = "EXECUTOR")]
+    Executor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobState {
     pub job_id: String,
+    pub project_name: String,
+    pub project_path: PathBuf,
+    pub task: String,
     pub status: JobStatus,
-    pub iteration: u64,
-    pub current_task: Option<String>,
+    pub iteration: u32,
+    pub phase: JobPhase,
+    pub claude_session_id: Option<String>,
+    pub last_executor_report: Option<String>,
+    pub last_supervisor_decision: Option<SupervisorDecision>,
+    pub created_unix_seconds: u64,
     pub last_updated_unix_seconds: u64,
 }
 
 impl JobState {
-    pub fn new(job_id: impl Into<String>, status: JobStatus) -> Self {
+    pub fn new(
+        job_id: impl Into<String>,
+        project_name: impl Into<String>,
+        project_path: PathBuf,
+        task: impl Into<String>,
+    ) -> Self {
+        let now = current_unix_seconds();
         Self {
             job_id: job_id.into(),
-            status,
+            project_name: project_name.into(),
+            project_path,
+            task: task.into(),
+            status: JobStatus::Running,
             iteration: 0,
-            current_task: None,
-            last_updated_unix_seconds: current_unix_seconds(),
+            phase: JobPhase::Supervisor,
+            claude_session_id: None,
+            last_executor_report: None,
+            last_supervisor_decision: None,
+            created_unix_seconds: now,
+            last_updated_unix_seconds: now,
         }
+    }
+
+    pub fn touch(&mut self) {
+        self.last_updated_unix_seconds = current_unix_seconds();
     }
 }
 
@@ -175,9 +207,15 @@ mod tests {
     }
 
     fn job(job_id: &str, status: JobStatus) -> JobState {
-        let mut job = JobState::new(job_id, status);
+        let mut job = JobState::new(
+            job_id,
+            "Pixel Creator",
+            std::env::temp_dir(),
+            "validate change",
+        );
+        job.status = status;
         job.iteration = 2;
-        job.current_task = Some("validate change".to_owned());
+        job.created_unix_seconds = 120;
         job.last_updated_unix_seconds = 123;
         job
     }
