@@ -301,6 +301,32 @@ Use `--json` for machine-readable JSON Lines on stdout. In this mode stdout cont
 cargo run -- run --json --project /path/to/project "Fix a small regression and verify the result."
 ```
 
+### Interactive Control
+
+When `lya run` is attached to an interactive terminal, Lya accepts line-oriented commands while the job runs. The terminal remains a normal scrolling log; it does not enter a fullscreen TUI.
+
+```text
+/help
+/status
+/diff
+/pause
+/resume
+/stop
+/send <instruction>
+```
+
+`/status` reports the authoritative live job state, including the job and project, phase, iteration, known Claude session, publication progress, and pending pause/stop requests. `/diff` performs a read-only repository capture and prints tracked paths, untracked paths, and a concise diff stat. It never changes the repository.
+
+`/send <instruction>` queues the complete instruction in order, acknowledges it immediately, persists it in job state, and applies it at the next safe model turn. Lya includes applied instructions in both the relevant Codex review and Claude execution prompts; it never attempts to inject text into a model process already generating. Queued and applied instructions are recorded in `events.jsonl`.
+
+`/pause` records a request immediately, then enters `PAUSED` only at a safe boundary. A running Codex/Claude invocation, repository capture, or Git operation is allowed to finish its current safe operation first. While paused, `/status`, `/diff`, `/send`, `/resume`, and `/stop` remain available. `/resume` continues from that exact boundary without repeating a completed provider invocation.
+
+`/stop` prevents new Supervisor, Executor, and publication actions. If Codex or Claude is active, Lya cancels and reaps its child process through the shared process runner, then records a terminal `STOPPED` state after a best-effort repository capture. Lya does not reset working-tree changes made before the stop request. During publication, a stop is observed before each guarded stage; Lya does not begin a later stage after it has observed the request.
+
+The first `Ctrl+C` follows the same graceful stop path and prints a second-press warning. A second `Ctrl+C` force-terminates the Lya process after the cancellation signal has already been sent to active child processes.
+
+`--json` is intentionally non-interactive: it never starts a stdin command reader and stdout remains valid `JobEvent` JSONL for scripts. Redirected non-TTY runs are also non-interactive.
+
 This visibility records the exchange Lya is legitimately allowed to know: the safe review request it sends Codex, Codex's structured decision and explicit reason, the prompt Lya sends Claude, Claude's final response/report, and subsequent repository state. Hidden model chain-of-thought is not available and is never claimed or logged. The same event model is intentionally independent of terminal rendering so a later daemon or web UI can subscribe to it.
 
 Lya currently does not log an actual Codex or Claude model identifier. Both CLIs support model selection, but the structured Codex decision and Claude JSON result contracts used by Lya do not reliably report which model executed a request. Lya will add model metadata only when it is available through a documented structured provider contract.
@@ -498,6 +524,8 @@ These protections reduce accidental autonomous changes, but Lya is experimental 
 ## Current Limitations
 
 Lya currently runs jobs sequentially.
+
+Pausing and resuming works only while the current `lya` process is still running. Restart recovery after process exit is not implemented yet. Daemon/service mode, remote control, web UI, parallel jobs, and multi-project scheduling are future work.
 
 The following are not implemented yet:
 

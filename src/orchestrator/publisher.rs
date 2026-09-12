@@ -124,6 +124,10 @@ pub trait Publisher: Send + Sync {
 
 pub trait PublishProgress: Send {
     fn record(&mut self, stage: PublishStage) -> Result<(), PublishError>;
+
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Default)]
@@ -323,8 +327,14 @@ impl<R: ProcessRunner> Publisher for GitPublisher<R> {
         progress: &'a mut dyn PublishProgress,
     ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>> {
         Box::pin(async move {
+            if progress.stop_requested() {
+                return Err(PublishError::Stopped);
+            }
             progress.record(PublishStage::Verifying)?;
             self.verify_before_staging(&request).await?;
+            if progress.stop_requested() {
+                return Err(PublishError::Stopped);
+            }
             progress.record(PublishStage::Staging)?;
             self.run_git(
                 &request.project_path,
@@ -333,6 +343,9 @@ impl<R: ProcessRunner> Publisher for GitPublisher<R> {
             )
             .await?;
             self.verify_staged_state(&request).await?;
+            if progress.stop_requested() {
+                return Err(PublishError::Stopped);
+            }
             progress.record(PublishStage::Staged)?;
             let current_head = self
                 .run_git(
@@ -343,6 +356,9 @@ impl<R: ProcessRunner> Publisher for GitPublisher<R> {
                 .await?;
             if current_head.trim() != request.accepted_repository_state.head {
                 return Err(PublishError::RepositoryChangedAfterReview);
+            }
+            if progress.stop_requested() {
+                return Err(PublishError::Stopped);
             }
             progress.record(PublishStage::Committing)?;
             self.run_git(
@@ -376,6 +392,9 @@ impl<R: ProcessRunner> Publisher for GitPublisher<R> {
                 branch: self.config.branch.clone(),
                 push_status: PushStatus::Pushed,
             };
+            if progress.stop_requested() {
+                return Err(PublishError::Stopped);
+            }
             progress.record(PublishStage::Pushing)?;
             match self
                 .run_git(
@@ -421,6 +440,7 @@ pub enum PublishError {
     },
     MissingRemote(String),
     StagedStateMismatch,
+    Stopped,
     PushRejected(PublishResult),
     Repository(RepositoryError),
     Process(ProcessError),
@@ -452,6 +472,7 @@ impl fmt::Display for PublishError {
             }
             Self::MissingRemote(remote) => write!(formatter, "configured Git remote does not exist: {remote}"),
             Self::StagedStateMismatch => formatter.write_str("staged state does not match the accepted repository snapshot"),
+            Self::Stopped => formatter.write_str("publication stopped by user request"),
             Self::PushRejected(result) => write!(
                 formatter,
                 "push rejected after local commit {} to {}/{}",

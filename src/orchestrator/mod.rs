@@ -1,4 +1,5 @@
 pub mod context;
+pub mod control;
 pub mod doctor;
 pub mod events;
 pub mod executor;

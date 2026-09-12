@@ -24,6 +24,10 @@ pub struct ExecutorRequest {
     pub session: ExecutorSession,
     pub browser: bool,
     pub timeout: Option<Duration>,
+    #[serde(default)]
+    pub user_instructions: Vec<String>,
+    #[serde(skip)]
+    pub cancellation: Option<crate::process::ProcessCancellation>,
 }
 
 impl ExecutorRequest {
@@ -135,10 +139,22 @@ impl<R> ClaudeCliExecutor<R> {
         }
         spec.cwd = Some(request.project_path.clone());
         spec.env_remove.push("ANTHROPIC_API_KEY".to_owned());
-        spec.stdin = Some(request.prompt.clone());
+        spec.stdin = Some(render_executor_prompt(request));
         spec.timeout = request.timeout;
+        spec.cancellation = request.cancellation.clone();
         Ok(spec)
     }
+}
+
+fn render_executor_prompt(request: &ExecutorRequest) -> String {
+    if request.user_instructions.is_empty() {
+        return request.prompt.clone();
+    }
+    format!(
+        "{}\n\nAdditional user instructions (follow each independently):\n{}",
+        request.prompt,
+        request.user_instructions.join("\n")
+    )
 }
 
 fn claude_program_from_environment(lookup: impl Fn(&str) -> Option<OsString>) -> OsString {
@@ -344,6 +360,8 @@ mod tests {
             session: ExecutorSession::New,
             browser: false,
             timeout: None,
+            user_instructions: Vec::new(),
+            cancellation: None,
         }
     }
 

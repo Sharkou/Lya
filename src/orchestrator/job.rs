@@ -10,6 +10,7 @@ use std::{
 use crate::process::{ProcessRunner, SystemProcessRunner};
 
 use super::{
+    control::{ControlCommand, ControlReceiver},
     events::{
         EventSink, EventSinkError, JobEvent, JobEventKind, NoopEventSink, RepositorySummary,
         executor_event_kind, supervisor_event_fields,
@@ -44,6 +45,7 @@ pub struct AutonomousOrchestrator<S, E, R = SystemProcessRunner, P = (), N = Noo
     max_iterations: u32,
     max_jobs: u32,
     browser: bool,
+    control: ControlReceiver,
 }
 
 impl<S, E, R> AutonomousOrchestrator<S, E, R, (), NoopEventSink> {
@@ -58,6 +60,7 @@ impl<S, E, R> AutonomousOrchestrator<S, E, R, (), NoopEventSink> {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_jobs: DEFAULT_MAX_JOBS,
             browser: false,
+            control: ControlReceiver::disabled(),
         }
     }
 }
@@ -89,6 +92,7 @@ impl<S, E, R, P, N> AutonomousOrchestrator<S, E, R, P, N> {
             max_iterations: self.max_iterations,
             max_jobs: self.max_jobs,
             browser: self.browser,
+            control: self.control,
         }
     }
 
@@ -103,7 +107,13 @@ impl<S, E, R, P, N> AutonomousOrchestrator<S, E, R, P, N> {
             max_iterations: self.max_iterations,
             max_jobs: self.max_jobs,
             browser: self.browser,
+            control: self.control,
         }
+    }
+
+    pub fn with_control_receiver(mut self, control: ControlReceiver) -> Self {
+        self.control = control;
+        self
     }
 }
 
@@ -189,6 +199,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         let mut repository_state = initial_repository_state;
 
         loop {
+            if !self.safe_point(&mut job).await? {
+                return Ok(job);
+            }
             if job.iteration >= self.max_iterations {
                 self.fail(
                     &mut job,
@@ -212,6 +225,8 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 iteration: job.iteration,
                 executor_report: job.last_executor_report.clone(),
                 repository_state: Some(repository_state.render_for_supervisor()),
+                user_instructions: job.applied_user_instructions.clone(),
+                cancellation: Some(self.control.cancellation()),
             };
             self.emit(
                 &job,
@@ -222,6 +237,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
             let decision = match self.supervisor.decide(supervisor_request).await {
                 Ok(decision) => decision,
                 Err(error) => {
+                    if !self.safe_point(&mut job).await? {
+                        return Ok(job);
+                    }
                     if is_quota_error(&error.to_string()) {
                         self.wait_for_quota(&mut job, "OpenAI", error.to_string())?;
                         return Ok(job);
@@ -230,6 +248,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                     return Err(OrchestrationError::Supervisor(error));
                 }
             };
+            if !self.safe_point(&mut job).await? {
+                return Ok(job);
+            }
             job.last_supervisor_decision = Some(decision.clone());
             let (action, reason, prompt, commit_title, next_prompt) =
                 supervisor_event_fields(&decision);
@@ -268,7 +289,12 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                         session,
                         browser: self.browser,
                         timeout: None,
+                        user_instructions: job.applied_user_instructions.clone(),
+                        cancellation: Some(self.control.cancellation()),
                     };
+                    if !self.safe_point(&mut job).await? {
+                        return Ok(job);
+                    }
                     self.emit(
                         &job,
                         JobEventKind::ExecutorStarted {
@@ -282,6 +308,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                     let result = match self.executor.execute(executor_request).await {
                         Ok(result) => result,
                         Err(error) => {
+                            if !self.safe_point(&mut job).await? {
+                                return Ok(job);
+                            }
                             if is_quota_error(&error.to_string()) {
                                 self.wait_for_quota(&mut job, "Claude", error.to_string())?;
                                 return Ok(job);
@@ -290,6 +319,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             return Err(OrchestrationError::Executor(error));
                         }
                     };
+                    if !self.safe_point(&mut job).await? {
+                        return Ok(job);
+                    }
                     self.emit(&job, executor_event_kind(result.clone()))?;
                     if let Some(session_id) =
                         result.session_id.filter(|value| !value.trim().is_empty())
@@ -319,6 +351,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             summary: RepositorySummary::from(&repository_state),
                         },
                     )?;
+                    if !self.safe_point(&mut job).await? {
+                        return Ok(job);
+                    }
                 }
                 SupervisorDecision::Accept { commit_title, .. } => {
                     job.status = JobStatus::Accepted;
@@ -332,6 +367,10 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                                 status: "ACCEPTED".to_owned(),
                             },
                         )?;
+                        return Ok(job);
+                    }
+
+                    if !self.safe_point(&mut job).await? {
                         return Ok(job);
                     }
 
@@ -350,6 +389,7 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             job: &mut job,
                             state_store: &self.state_store,
                             event_sink: &self.event_sink,
+                            control: &self.control,
                         };
                         self.publisher
                             .publish(
@@ -365,6 +405,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                     match publish {
                         Ok(result) => {
                             job.publish_result = Some(result);
+                            if !self.safe_point(&mut job).await? {
+                                return Ok(job);
+                            }
                             let post_commit_state = match RepositoryState::collect(
                                 &self.repository_runner,
                                 &job.project_path,
@@ -414,6 +457,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             return Ok(job);
                         }
                         Err(error) => {
+                            if !self.safe_point(&mut job).await? {
+                                return Ok(job);
+                            }
                             if let PublishError::PushRejected(result) = &error {
                                 job.publish_result = Some(result.clone());
                             }
@@ -476,6 +522,12 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 _ => None,
             };
             jobs.push(job);
+            if self.control.stop_requested() {
+                return Ok(RunResult {
+                    jobs,
+                    max_jobs_reached: false,
+                });
+            }
             let Some(task) = next_prompt else {
                 return Ok(RunResult {
                     jobs,
@@ -497,6 +549,163 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         self.state_store
             .save(&state)
             .map_err(OrchestrationError::State)
+    }
+
+    async fn safe_point(&self, job: &mut JobState) -> Result<bool, OrchestrationError> {
+        for command in self.control.drain().await {
+            self.handle_control_command(job, command).await?;
+        }
+        if self.control.stop_requested() {
+            self.stop(job).await?;
+            return Ok(false);
+        }
+        if !self.control.pause_requested() {
+            return Ok(true);
+        }
+
+        job.status = JobStatus::Paused;
+        job.touch();
+        self.persist(job)?;
+        self.emit(
+            job,
+            JobEventKind::Paused {
+                reason: "safe boundary reached".to_owned(),
+            },
+        )?;
+        loop {
+            let Some(command) = self.control.next().await else {
+                self.control_stop_without_command(job)?;
+                return Ok(false);
+            };
+            self.handle_control_command(job, command).await?;
+            if self.control.stop_requested() {
+                self.stop(job).await?;
+                return Ok(false);
+            }
+            if !self.control.pause_requested() {
+                job.status = JobStatus::Running;
+                job.touch();
+                self.persist(job)?;
+                self.emit(job, JobEventKind::Resumed)?;
+                return Ok(true);
+            }
+        }
+    }
+
+    async fn handle_control_command(
+        &self,
+        job: &mut JobState,
+        command: ControlCommand,
+    ) -> Result<(), OrchestrationError> {
+        match command {
+            ControlCommand::Pause => {
+                if job.status != JobStatus::Paused {
+                    self.emit(job, JobEventKind::PauseRequested)?;
+                }
+            }
+            ControlCommand::Resume => {}
+            ControlCommand::Stop => self.emit(job, JobEventKind::StopRequested)?,
+            ControlCommand::Send(instruction) => {
+                job.pending_user_instructions.push(instruction.clone());
+                job.touch();
+                self.persist(job)?;
+                self.emit(job, JobEventKind::UserInstructionQueued { instruction })?;
+            }
+            ControlCommand::Status => self.emit(
+                job,
+                JobEventKind::StatusReported {
+                    status: job_status_label(&job.status).to_owned(),
+                    phase: job_phase_label(&job.phase).to_owned(),
+                    claude_session_id: job.claude_session_id.clone(),
+                    publish_stage: job.publish_stage.clone(),
+                    pause_requested: self.control.pause_requested(),
+                    stop_requested: self.control.stop_requested(),
+                },
+            )?,
+            ControlCommand::Diff => {
+                match RepositoryState::collect(&self.repository_runner, &job.project_path).await {
+                    Ok(state) => self.emit(
+                        job,
+                        JobEventKind::DiffReported {
+                            summary: RepositorySummary::from(&state),
+                        },
+                    )?,
+                    Err(error) => self.emit(
+                        job,
+                        JobEventKind::ControlMessage {
+                            message: format!("could not collect diff: {error}"),
+                        },
+                    )?,
+                }
+            }
+        }
+        self.apply_queued_instructions(job)
+    }
+
+    fn apply_queued_instructions(&self, job: &mut JobState) -> Result<(), OrchestrationError> {
+        while let Some(instruction) = job.pending_user_instructions.first().cloned() {
+            job.pending_user_instructions.remove(0);
+            job.applied_user_instructions.push(instruction.clone());
+            job.touch();
+            self.persist(job)?;
+            self.emit(job, JobEventKind::UserInstructionApplied { instruction })?;
+        }
+        Ok(())
+    }
+
+    async fn stop(&self, job: &mut JobState) -> Result<(), OrchestrationError> {
+        if job.status == JobStatus::Stopped {
+            return Ok(());
+        }
+        if let Ok(state) =
+            RepositoryState::collect(&self.repository_runner, &job.project_path).await
+        {
+            self.emit(
+                job,
+                JobEventKind::RepositoryCaptured {
+                    summary: RepositorySummary::from(&state),
+                },
+            )?;
+        }
+        job.status = JobStatus::Stopped;
+        job.touch();
+        self.persist(job)?;
+        self.emit(
+            job,
+            JobEventKind::Stopped {
+                reason: match &job.publish_result {
+                    Some(result) => format!(
+                        "stopped by user after publication completed at {}; repository changes were preserved",
+                        result.commit_sha
+                    ),
+                    None => "stopped by user; repository changes were preserved".to_owned(),
+                },
+            },
+        )?;
+        self.emit(
+            job,
+            JobEventKind::JobFinished {
+                status: "STOPPED".to_owned(),
+            },
+        )
+    }
+
+    fn control_stop_without_command(&self, job: &mut JobState) -> Result<(), OrchestrationError> {
+        job.status = JobStatus::Stopped;
+        job.touch();
+        self.persist(job)?;
+        self.emit(
+            job,
+            JobEventKind::Stopped {
+                reason: "interactive control channel closed while paused".to_owned(),
+            },
+        )?;
+        self.emit(
+            job,
+            JobEventKind::JobFinished {
+                status: "STOPPED".to_owned(),
+            },
+        )
     }
 
     fn emit(&self, job: &JobState, kind: JobEventKind) -> Result<(), OrchestrationError> {
@@ -599,6 +808,29 @@ fn is_quota_error(error: &str) -> bool {
     error.contains("quota") || error.contains("rate limit") || error.contains("rate_limit")
 }
 
+fn job_status_label(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Running => "RUNNING",
+        JobStatus::Paused => "PAUSED",
+        JobStatus::WaitingClaudeQuota => "WAITING_CLAUDE_QUOTA",
+        JobStatus::WaitingOpenAiQuota => "WAITING_OPENAI_QUOTA",
+        JobStatus::WaitingHuman => "WAITING_HUMAN",
+        JobStatus::Accepted => "ACCEPTED",
+        JobStatus::Publishing => "PUBLISHING",
+        JobStatus::Published => "PUBLISHED",
+        JobStatus::Failed => "FAILED",
+        JobStatus::Stopped => "STOPPED",
+    }
+}
+
+fn job_phase_label(phase: &JobPhase) -> &'static str {
+    match phase {
+        JobPhase::Supervisor => "SUPERVISOR",
+        JobPhase::Executor => "EXECUTOR",
+        JobPhase::Publisher => "PUBLISHER",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
     pub jobs: Vec<JobState>,
@@ -625,6 +857,7 @@ struct JobPublicationProgress<'a> {
     job: &'a mut JobState,
     state_store: &'a StateStore,
     event_sink: &'a dyn EventSink,
+    control: &'a ControlReceiver,
 }
 
 impl PublishProgress for JobPublicationProgress<'_> {
@@ -651,6 +884,10 @@ impl PublishProgress for JobPublicationProgress<'_> {
                 JobEventKind::PublishStageChanged { stage },
             ))
             .map_err(|error| PublishError::ProgressPersistence(error.to_string()))
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.control.stop_requested()
     }
 }
 
@@ -735,6 +972,7 @@ mod tests {
     use super::{AutonomousOrchestrator, NewJob, OrchestrationError};
     use crate::{
         orchestrator::{
+            control::{ControlCommand, ControlReceiver, ControlSender},
             events::{EventSink, JobEvent, JobEventKind, JsonlEventSink},
             executor::{Executor, ExecutorError, ExecutorRequest, ExecutorResult, ExecutorSession},
             home::LyaHome,
@@ -772,6 +1010,23 @@ mod tests {
             Err(super::EventSinkError::Write(
                 "event storage unavailable".to_owned(),
             ))
+        }
+    }
+
+    struct PauseSignalSink {
+        events: Arc<Mutex<Vec<JobEvent>>>,
+        paused: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl EventSink for PauseSignalSink {
+        fn emit(&self, event: &JobEvent) -> Result<(), super::EventSinkError> {
+            self.events.lock().expect("event lock").push(event.clone());
+            if matches!(event.kind, JobEventKind::Paused { .. })
+                && let Some(sender) = self.paused.lock().expect("paused lock").take()
+            {
+                let _ = sender.send(());
+            }
+            Ok(())
         }
     }
 
@@ -836,6 +1091,49 @@ mod tests {
                 .pop_front()
                 .expect("an executor result should be queued");
             Box::pin(async move { result })
+        }
+    }
+
+    struct BlockingExecutor {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<ExecutorResult>>>,
+        requests: Arc<Mutex<Vec<ExecutorRequest>>>,
+    }
+
+    impl Executor for BlockingExecutor {
+        fn execute(
+            &self,
+            request: ExecutorRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ExecutorResult, ExecutorError>> + Send + '_>>
+        {
+            self.requests.lock().expect("request lock").push(request);
+            let started = self.started.lock().expect("started lock").take();
+            let release = self.release.lock().expect("release lock").take();
+            Box::pin(async move {
+                if let Some(sender) = started {
+                    let _ = sender.send(());
+                }
+                Ok(release
+                    .expect("release should exist")
+                    .await
+                    .expect("result should be released"))
+            })
+        }
+    }
+
+    struct StopOnAcceptSink {
+        events: Arc<Mutex<Vec<JobEvent>>>,
+        sender: ControlSender,
+    }
+
+    impl EventSink for StopOnAcceptSink {
+        fn emit(&self, event: &JobEvent) -> Result<(), super::EventSinkError> {
+            self.events.lock().expect("event lock").push(event.clone());
+            if matches!(event.kind, JobEventKind::SupervisorFinished { ref action, .. } if action == "ACCEPT")
+            {
+                self.sender.request_stop();
+            }
+            Ok(())
         }
     }
 
@@ -1856,5 +2154,295 @@ mod tests {
         fs::remove_dir_all(work.parent().expect("work should have parent"))
             .expect("Git test directory should be removed");
         fs::remove_dir_all(state_home).expect("state home should be removed");
+    }
+
+    #[tokio::test]
+    async fn queued_instructions_preserve_order_reach_prompts_and_emit_events() {
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Implement the requested update.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Update documentation".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let supervisor_requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![Ok(claude_result(Some("session"), "Done."))]);
+        let executor_requests = executor.requests.clone();
+        let directory = home("instructions");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+        let (sender, receiver) = ControlReceiver::new();
+        sender
+            .send(ControlCommand::Send(
+                "Keep the public format stable.".to_owned(),
+            ))
+            .expect("instruction should queue");
+        sender
+            .send(ControlCommand::Send("Add tests for edge cases.".to_owned()))
+            .expect("instruction should queue");
+
+        orchestrator(supervisor, executor, &directory)
+            .with_control_receiver(receiver)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("job should complete");
+
+        let expected = vec![
+            "Keep the public format stable.".to_owned(),
+            "Add tests for edge cases.".to_owned(),
+        ];
+        assert_eq!(
+            supervisor_requests.lock().expect("requests")[0].user_instructions,
+            expected
+        );
+        assert_eq!(
+            executor_requests.lock().expect("requests")[0].user_instructions,
+            expected
+        );
+        let events = events.lock().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, JobEventKind::UserInstructionQueued { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, JobEventKind::UserInstructionApplied { .. }))
+                .count(),
+            2
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn pause_before_supervisor_waits_for_resume_without_duplicate_work() {
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "No changes".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let supervisor_requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![]);
+        let directory = home("pause-before-supervisor");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (paused_sender, paused_receiver) = tokio::sync::oneshot::channel();
+        let sink = PauseSignalSink {
+            events: events.clone(),
+            paused: Mutex::new(Some(paused_sender)),
+        };
+        let (sender, receiver) = ControlReceiver::new();
+        sender
+            .send(ControlCommand::Pause)
+            .expect("pause should queue");
+        let job = job_request();
+        let run = tokio::spawn(async move {
+            orchestrator(supervisor, executor, &directory)
+                .with_control_receiver(receiver)
+                .with_event_sink(sink)
+                .run(job)
+                .await
+        });
+
+        paused_receiver
+            .await
+            .expect("job should reach paused state");
+        assert!(supervisor_requests.lock().expect("requests").is_empty());
+        sender
+            .send(ControlCommand::Resume)
+            .expect("resume should queue");
+        let result = run
+            .await
+            .expect("job task should join")
+            .expect("job should complete");
+
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert_eq!(supervisor_requests.lock().expect("requests").len(), 1);
+        assert!(
+            events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::PauseRequested))
+        );
+        fs::remove_dir_all(home("pause-before-supervisor")).ok();
+    }
+
+    #[tokio::test]
+    async fn stop_before_work_prevents_provider_and_preserves_stopped_state() {
+        let supervisor = FakeSupervisor::new(vec![]);
+        let supervisor_requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![]);
+        let directory = home("stop-before-work");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+        let (sender, receiver) = ControlReceiver::new();
+        sender
+            .send(ControlCommand::Stop)
+            .expect("stop should queue");
+
+        let result = orchestrator(supervisor, executor, &directory)
+            .with_control_receiver(receiver)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("stopping is a normal terminal state");
+
+        assert_eq!(result.status, JobStatus::Stopped);
+        assert!(supervisor_requests.lock().expect("requests").is_empty());
+        assert!(
+            events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::StopRequested))
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn status_and_diff_commands_use_authoritative_job_and_repository_state() {
+        let supervisor = FakeSupervisor::new(vec![]);
+        let executor = FakeExecutor::new(vec![]);
+        let directory = home("status-and-diff");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+        let (sender, receiver) = ControlReceiver::new();
+        sender
+            .send(ControlCommand::Status)
+            .expect("status should queue");
+        sender
+            .send(ControlCommand::Diff)
+            .expect("diff should queue");
+        sender
+            .send(ControlCommand::Stop)
+            .expect("stop should queue");
+
+        let result = orchestrator(supervisor, executor, &directory)
+            .with_control_receiver(receiver)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("stopping is normal");
+
+        assert_eq!(result.status, JobStatus::Stopped);
+        let events = events.lock().expect("events");
+        assert!(events.iter().any(|event| matches!(event.kind, JobEventKind::StatusReported { ref status, ref phase, .. } if status == "RUNNING" && phase == "SUPERVISOR")));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::DiffReported { .. }))
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn pause_during_executor_waits_for_its_safe_boundary_then_resumes_once() {
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Implement.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Finish".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let executor_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = BlockingExecutor {
+            started: Mutex::new(Some(started_sender)),
+            release: Mutex::new(Some(release_receiver)),
+            requests: executor_requests.clone(),
+        };
+        let directory = home("pause-during-executor");
+        let run_directory = directory.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (paused_sender, paused_receiver) = tokio::sync::oneshot::channel();
+        let (sender, receiver) = ControlReceiver::new();
+        let run = tokio::spawn(async move {
+            AutonomousOrchestrator::new(
+                supervisor,
+                executor,
+                FakeGitRunner { dirty: false },
+                StateStore::new(&LyaHome::from_path(&run_directory)),
+            )
+            .with_control_receiver(receiver)
+            .with_event_sink(PauseSignalSink {
+                events,
+                paused: Mutex::new(Some(paused_sender)),
+            })
+            .run(job_request())
+            .await
+        });
+
+        started_receiver.await.expect("executor should start");
+        sender
+            .send(ControlCommand::Pause)
+            .expect("pause should queue");
+        release_sender
+            .send(claude_result(Some("session"), "Completed."))
+            .expect("executor should receive result");
+        paused_receiver
+            .await
+            .expect("pause should happen after executor");
+        assert_eq!(executor_requests.lock().expect("requests").len(), 1);
+        sender
+            .send(ControlCommand::Resume)
+            .expect("resume should queue");
+        let result = run
+            .await
+            .expect("job should join")
+            .expect("job should finish");
+
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert_eq!(executor_requests.lock().expect("requests").len(), 1);
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn stop_after_accept_before_publication_prevents_all_git_writes() {
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Do not publish".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let executor = FakeExecutor::new(vec![]);
+        let publisher = FakePublisher::new(vec![Ok(published_result("Do not publish"))]);
+        let publish_requests = publisher.requests.clone();
+        let directory = home("stop-before-publish");
+        let (sender, receiver) = ControlReceiver::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            executor,
+            FakeGitRunner { dirty: false },
+            StateStore::new(&LyaHome::from_path(&directory)),
+        )
+        .with_publisher(publisher)
+        .with_control_receiver(receiver)
+        .with_event_sink(StopOnAcceptSink { events, sender })
+        .run(job_request())
+        .await
+        .expect("stopping is terminal but not an error");
+
+        assert_eq!(result.status, JobStatus::Stopped);
+        assert!(
+            publish_requests
+                .lock()
+                .expect("publish requests")
+                .is_empty()
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
     }
 }

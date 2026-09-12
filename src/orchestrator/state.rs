@@ -23,6 +23,8 @@ static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 pub enum JobStatus {
     #[serde(rename = "RUNNING")]
     Running,
+    #[serde(rename = "PAUSED")]
+    Paused,
     #[serde(rename = "WAITING_CLAUDE_QUOTA")]
     WaitingClaudeQuota,
     #[serde(rename = "WAITING_OPENAI_QUOTA")]
@@ -66,6 +68,10 @@ pub struct JobState {
     pub accepted_repository_state: Option<RepositoryState>,
     pub publish_result: Option<PublishResult>,
     pub publish_stage: Option<PublishStage>,
+    #[serde(default)]
+    pub pending_user_instructions: Vec<String>,
+    #[serde(default)]
+    pub applied_user_instructions: Vec<String>,
     pub created_unix_seconds: u64,
     pub last_updated_unix_seconds: u64,
 }
@@ -92,6 +98,8 @@ impl JobState {
             accepted_repository_state: None,
             publish_result: None,
             publish_stage: None,
+            pending_user_instructions: Vec::new(),
+            applied_user_instructions: Vec::new(),
             created_unix_seconds: now,
             last_updated_unix_seconds: now,
         }

@@ -1,9 +1,17 @@
-use std::{env, io, path::Path, process::ExitCode};
+use std::{
+    env,
+    io::{self, IsTerminal, Write},
+    path::Path,
+    process::ExitCode,
+};
+
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use lya::{
     agent::Agent,
     llm::ollama::OllamaClient,
     orchestrator::{
+        control::{ControlCommand, ControlReceiver, parse_control_command},
         doctor::DoctorReport,
         events::{
             CompositeEventSink, HumanEventSink, HumanRenderMode, JsonEventSink, JsonlEventSink,
@@ -128,6 +136,7 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
         task: options.task,
         private_context,
     };
+    let control = start_interactive_control(&options.output);
     let event_sink = match options.output {
         RunOutput::Json => CompositeEventSink::new(vec![
             Box::new(JsonlEventSink::for_job(home.path(), &job_id)),
@@ -146,7 +155,7 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        AutonomousOrchestrator::new(
+        let orchestrator = AutonomousOrchestrator::new(
             CodexCliSupervisor::new_for_job(home.path(), &job_id),
             ClaudeCliExecutor::new(),
             SystemProcessRunner,
@@ -156,11 +165,18 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
         .with_max_jobs(options.max_jobs)
         .with_browser(options.browser)
         .with_publisher(GitPublisher::new(configuration))
-        .with_event_sink(event_sink)
-        .run_sequential(request)
-        .await
+        .with_event_sink(event_sink);
+        match control {
+            Some(control) => {
+                orchestrator
+                    .with_control_receiver(control)
+                    .run_sequential(request)
+                    .await
+            }
+            None => orchestrator.run_sequential(request).await,
+        }
     } else {
-        AutonomousOrchestrator::new(
+        let orchestrator = AutonomousOrchestrator::new(
             CodexCliSupervisor::new_for_job(home.path(), &job_id),
             ClaudeCliExecutor::new(),
             SystemProcessRunner,
@@ -169,9 +185,16 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
         .with_max_iterations(options.max_iterations)
         .with_max_jobs(options.max_jobs)
         .with_browser(options.browser)
-        .with_event_sink(event_sink)
-        .run_sequential(request)
-        .await
+        .with_event_sink(event_sink);
+        match control {
+            Some(control) => {
+                orchestrator
+                    .with_control_receiver(control)
+                    .run_sequential(request)
+                    .await
+            }
+            None => orchestrator.run_sequential(request).await,
+        }
     };
 
     match result {
@@ -236,6 +259,8 @@ async fn run_supervisor(arguments: &[String]) -> ExitCode {
         iteration: 0,
         executor_report: None,
         repository_state: None,
+        user_instructions: Vec::new(),
+        cancellation: None,
     };
     let supervisor = CodexCliSupervisor::new(home.path());
 
@@ -358,9 +383,101 @@ fn parse_executor_arguments(
             session,
             browser,
             timeout,
+            user_instructions: Vec::new(),
+            cancellation: None,
         },
         max_turns,
     ))
+}
+
+fn start_interactive_control(output: &RunOutput) -> Option<ControlReceiver> {
+    if !interactive_enabled(
+        output,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    ) {
+        return None;
+    }
+    let (sender, receiver) = ControlReceiver::new();
+    let command_sender = sender.clone();
+    tokio::spawn(async move {
+        println!("/help for commands | Ctrl+C to stop");
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            print!("> ");
+            let _ = io::stdout().flush();
+            let Ok(Some(line)) = lines.next_line().await else {
+                break;
+            };
+            if line.trim() == "/help" {
+                println!("/help  /status  /diff  /pause  /resume  /stop  /send <instruction>");
+                continue;
+            }
+            match parse_control_command(&line) {
+                Ok(Some(command)) => {
+                    let acknowledgement = match &command {
+                        ControlCommand::Pause => {
+                            "Pause requested; Lya will pause at a safe boundary."
+                        }
+                        ControlCommand::Resume => "Resume requested.",
+                        ControlCommand::Stop => {
+                            "Stop requested. Finishing the current safe shutdown..."
+                        }
+                        ControlCommand::Status => "Status requested.",
+                        ControlCommand::Diff => "Diff requested.",
+                        ControlCommand::Send(_) => "Instruction queued for the next agent turn.",
+                    };
+                    if command_sender.send(command).is_err() {
+                        break;
+                    }
+                    println!("LYA\n  {acknowledgement}");
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("{error}"),
+            }
+        }
+    });
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!(
+                "Stop requested. Finishing the current safe shutdown...\nPress Ctrl+C again to force termination."
+            );
+            request_graceful_stop(&sender);
+            if tokio::signal::ctrl_c().await.is_ok() {
+                match interrupt_action(2) {
+                    InterruptAction::ForceTerminate => std::process::exit(130),
+                    InterruptAction::GracefulStop => unreachable!(),
+                }
+            }
+        }
+    });
+    Some(receiver)
+}
+
+fn interactive_enabled(
+    output: &RunOutput,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    matches!(output, RunOutput::Human(_)) && stdin_is_terminal && stdout_is_terminal
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptAction {
+    GracefulStop,
+    ForceTerminate,
+}
+
+fn interrupt_action(press_count: u8) -> InterruptAction {
+    if press_count <= 1 {
+        InterruptAction::GracefulStop
+    } else {
+        InterruptAction::ForceTerminate
+    }
+}
+
+fn request_graceful_stop(sender: &lya::orchestrator::control::ControlSender) {
+    sender.request_stop();
 }
 
 #[derive(Debug)]
@@ -490,7 +607,11 @@ fn run_doctor() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutorSession, RunOutput, parse_executor_arguments, parse_run_arguments};
+    use super::{
+        ExecutorSession, InterruptAction, RunOutput, interactive_enabled, interrupt_action,
+        parse_executor_arguments, parse_run_arguments, request_graceful_stop,
+    };
+    use lya::orchestrator::control::{ControlCommand, ControlReceiver};
 
     #[test]
     fn parses_executor_options_and_preserves_prompt_words() {
@@ -575,5 +696,30 @@ mod tests {
         ])
         .expect_err("conflicting modes should be rejected");
         assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn json_mode_never_enables_the_interactive_stdin_reader() {
+        assert!(!interactive_enabled(&RunOutput::Json, true, true));
+        assert!(!interactive_enabled(
+            &RunOutput::Human(lya::orchestrator::events::HumanRenderMode::Normal),
+            false,
+            true
+        ));
+        assert!(interactive_enabled(
+            &RunOutput::Human(lya::orchestrator::events::HumanRenderMode::Normal),
+            true,
+            true
+        ));
+    }
+
+    #[tokio::test]
+    async fn first_interrupt_maps_to_graceful_stop_through_control_channel() {
+        let (sender, receiver) = ControlReceiver::new();
+        request_graceful_stop(&sender);
+
+        assert_eq!(interrupt_action(1), InterruptAction::GracefulStop);
+        assert_eq!(receiver.drain().await, vec![ControlCommand::Stop]);
+        assert_eq!(interrupt_action(2), InterruptAction::ForceTerminate);
     }
 }

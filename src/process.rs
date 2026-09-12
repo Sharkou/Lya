@@ -1,9 +1,69 @@
 use std::{
-    collections::BTreeMap, error::Error, ffi::OsString, fmt, future::Future, path::PathBuf,
-    pin::Pin, process::Stdio, time::Duration,
+    collections::BTreeMap,
+    error::Error,
+    ffi::OsString,
+    fmt,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::Notify,
+};
+
+#[derive(Clone, Debug)]
+pub struct ProcessCancellation {
+    cancelled: Arc<AtomicBool>,
+    notification: Arc<Notify>,
+}
+
+impl PartialEq for ProcessCancellation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+}
+
+impl Eq for ProcessCancellation {}
+
+impl ProcessCancellation {
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notification: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notification.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        let notification = self.notification.notified();
+        if !self.is_cancelled() {
+            notification.await;
+        }
+    }
+}
+
+impl Default for ProcessCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub trait ProcessRunner: Send + Sync {
     fn run(
@@ -33,6 +93,7 @@ pub struct ProcessSpec {
     pub env_remove: Vec<String>,
     pub stdin: Option<String>,
     pub timeout: Option<Duration>,
+    pub cancellation: Option<ProcessCancellation>,
 }
 
 impl ProcessSpec {
@@ -45,6 +106,7 @@ impl ProcessSpec {
             env_remove: Vec::new(),
             stdin: None,
             timeout: None,
+            cancellation: None,
         }
     }
 
@@ -74,44 +136,111 @@ impl ProcessSpec {
                 ProcessError::Start(error.to_string())
             }
         })?;
-        let stdin = child.stdin.take();
-        let input = self.stdin.clone();
-        let collect = async move {
-            let write_stdin = async move {
-                if let (Some(mut stdin), Some(input)) = (stdin, input) {
-                    stdin
-                        .write_all(input.as_bytes())
-                        .await
-                        .map_err(|error| ProcessError::Stdin(error.to_string()))?;
-                    stdin
-                        .shutdown()
-                        .await
-                        .map_err(|error| ProcessError::Stdin(error.to_string()))?;
-                }
-                Ok::<(), ProcessError>(())
-            };
-            let wait_for_output = async move {
-                child
-                    .wait_with_output()
+        let mut stdin_task = match (child.stdin.take(), self.stdin.clone()) {
+            (Some(mut stdin), Some(input)) => Some(tokio::spawn(async move {
+                stdin
+                    .write_all(input.as_bytes())
                     .await
-                    .map_err(|error| ProcessError::Wait(error.to_string()))
-            };
-
-            let (_, output) = tokio::try_join!(write_stdin, wait_for_output)?;
-            Ok(ProcessOutput {
-                exit_code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            })
+                    .map_err(|error| ProcessError::Stdin(error.to_string()))?;
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|error| ProcessError::Stdin(error.to_string()))
+            })),
+            _ => None,
         };
-
-        match self.timeout {
-            Some(timeout) => tokio::time::timeout(timeout, collect)
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let mut stderr = child.stderr.take().expect("stderr was piped");
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        let cancellation = self.cancellation.clone();
+        let status = match (self.timeout, cancellation) {
+            (Some(timeout), Some(cancellation)) => tokio::select! {
+                result = child.wait() => result.map_err(|error| ProcessError::Wait(error.to_string()))?,
+                _ = cancellation.cancelled() => return cancelled_child(&mut child, &mut stdin_task, stdout_task, stderr_task).await,
+                _ = tokio::time::sleep(timeout) => return timed_out_child(&mut child, &mut stdin_task, stdout_task, stderr_task, timeout).await,
+            },
+            (Some(timeout), None) => tokio::select! {
+                result = child.wait() => result.map_err(|error| ProcessError::Wait(error.to_string()))?,
+                _ = tokio::time::sleep(timeout) => return timed_out_child(&mut child, &mut stdin_task, stdout_task, stderr_task, timeout).await,
+            },
+            (None, Some(cancellation)) => tokio::select! {
+                result = child.wait() => result.map_err(|error| ProcessError::Wait(error.to_string()))?,
+                _ = cancellation.cancelled() => return cancelled_child(&mut child, &mut stdin_task, stdout_task, stderr_task).await,
+            },
+            (None, None) => child
+                .wait()
                 .await
-                .map_err(|_| ProcessError::Timeout(timeout))?,
-            None => collect.await,
-        }
+                .map_err(|error| ProcessError::Wait(error.to_string()))?,
+        };
+        let stdin_result = collect_stdin(&mut stdin_task).await;
+        let stdout = collect_pipe(stdout_task).await?;
+        let stderr = collect_pipe(stderr_task).await?;
+        stdin_result?;
+        Ok(ProcessOutput {
+            exit_code: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
     }
+}
+
+async fn collect_pipe(
+    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, ProcessError> {
+    task.await
+        .map_err(|error| ProcessError::Wait(error.to_string()))?
+        .map_err(|error| ProcessError::Wait(error.to_string()))
+}
+
+async fn collect_stdin(
+    task: &mut Option<tokio::task::JoinHandle<Result<(), ProcessError>>>,
+) -> Result<(), ProcessError> {
+    match task.take() {
+        Some(task) => task
+            .await
+            .map_err(|error| ProcessError::Stdin(error.to_string()))?,
+        None => Ok(()),
+    }
+}
+
+async fn cancelled_child(
+    child: &mut tokio::process::Child,
+    stdin_task: &mut Option<tokio::task::JoinHandle<Result<(), ProcessError>>>,
+    stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<ProcessOutput, ProcessError> {
+    child
+        .kill()
+        .await
+        .map_err(|error| ProcessError::Wait(error.to_string()))?;
+    let _ = collect_stdin(stdin_task).await;
+    let stdout = String::from_utf8_lossy(&collect_pipe(stdout_task).await?).into_owned();
+    let stderr = String::from_utf8_lossy(&collect_pipe(stderr_task).await?).into_owned();
+    Err(ProcessError::Cancelled { stdout, stderr })
+}
+
+async fn timed_out_child(
+    child: &mut tokio::process::Child,
+    stdin_task: &mut Option<tokio::task::JoinHandle<Result<(), ProcessError>>>,
+    stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    timeout: Duration,
+) -> Result<ProcessOutput, ProcessError> {
+    child
+        .kill()
+        .await
+        .map_err(|error| ProcessError::Wait(error.to_string()))?;
+    let _ = collect_stdin(stdin_task).await;
+    let _ = collect_pipe(stdout_task).await?;
+    let _ = collect_pipe(stderr_task).await?;
+    Err(ProcessError::Timeout(timeout))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +257,7 @@ pub enum ProcessError {
     Stdin(String),
     Wait(String),
     Timeout(Duration),
+    Cancelled { stdout: String, stderr: String },
 }
 
 impl fmt::Display for ProcessError {
@@ -149,6 +279,7 @@ impl fmt::Display for ProcessError {
                     timeout.as_secs_f64()
                 )
             }
+            Self::Cancelled { .. } => formatter.write_str("process was cancelled by the user"),
         }
     }
 }
@@ -159,7 +290,7 @@ impl Error for ProcessError {}
 mod tests {
     use std::{collections::BTreeMap, env, time::Duration};
 
-    use super::{ProcessError, ProcessSpec};
+    use super::{ProcessCancellation, ProcessError, ProcessSpec};
 
     #[cfg(unix)]
     fn spec(program: &str, args: &[&str]) -> ProcessSpec {
@@ -286,5 +417,23 @@ mod tests {
         let error = spec.run().await.expect_err("process should time out");
 
         assert!(matches!(error, ProcessError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_and_reaps_a_child_without_becoming_a_timeout() {
+        #[cfg(unix)]
+        let mut spec = spec("sleep", &["2"]);
+        #[cfg(windows)]
+        let mut spec = spec("cmd.exe", &["/C", "timeout /T 2 /NOBREAK > NUL"]);
+        let cancellation = ProcessCancellation::new();
+        cancellation.cancel();
+        spec.cancellation = Some(cancellation);
+
+        let error = spec
+            .run()
+            .await
+            .expect_err("cancelled child should not succeed");
+
+        assert!(matches!(error, ProcessError::Cancelled { .. }));
     }
 }

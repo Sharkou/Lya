@@ -100,6 +100,32 @@ pub enum JobEventKind {
     WaitingForHuman {
         reason: String,
     },
+    PauseRequested,
+    Paused {
+        reason: String,
+    },
+    Resumed,
+    StopRequested,
+    UserInstructionQueued {
+        instruction: String,
+    },
+    UserInstructionApplied {
+        instruction: String,
+    },
+    StatusReported {
+        status: String,
+        phase: String,
+        claude_session_id: Option<String>,
+        publish_stage: Option<PublishStage>,
+        pause_requested: bool,
+        stop_requested: bool,
+    },
+    DiffReported {
+        summary: RepositorySummary,
+    },
+    ControlMessage {
+        message: String,
+    },
     Stopped {
         reason: String,
     },
@@ -510,6 +536,101 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
             output.push_str(&format!("{timestamp}  {}\n", heading("WAITING FOR HUMAN")));
             output.push_str(&detail(reason));
         }
+        JobEventKind::PauseRequested => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("CONTROL")));
+            output.push_str(&detail("pause requested; waiting for a safe boundary"));
+        }
+        JobEventKind::Paused { reason } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}\n",
+                heading("JOB"),
+                style("PAUSED", "33", color)
+            ));
+            output.push_str(&detail(reason));
+        }
+        JobEventKind::Resumed => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}\n",
+                heading("JOB"),
+                style("RESUMED", "32", color)
+            ));
+        }
+        JobEventKind::StopRequested => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("CONTROL")));
+            output.push_str(&detail("stop requested; finishing safe shutdown"));
+        }
+        JobEventKind::UserInstructionQueued { instruction } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("CONTROL")));
+            output.push_str(&detail("instruction queued for the next agent turn"));
+            output.push_str(&detail(&truncate(instruction, 360)));
+        }
+        JobEventKind::UserInstructionApplied { instruction } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("CONTROL")));
+            output.push_str(&detail("instruction applied to agent prompts"));
+            if mode == HumanRenderMode::Verbose {
+                output.push_str(&full(instruction));
+            }
+        }
+        JobEventKind::StatusReported {
+            status,
+            phase,
+            claude_session_id,
+            publish_stage,
+            pause_requested,
+            stop_requested,
+        } => {
+            output.push_str(&format!("{timestamp}  {}  {status}\n", heading("STATUS")));
+            output.push_str(&detail(&format!(
+                "job: {}; project: {}",
+                event.job_id, event.project_name
+            )));
+            output.push_str(&detail(&format!(
+                "phase: {phase}; iteration: {}",
+                event.iteration.unwrap_or(0)
+            )));
+            if let Some(session_id) = claude_session_id {
+                output.push_str(&detail(&format!("Claude session: {session_id}")));
+            }
+            if let Some(stage) = publish_stage {
+                output.push_str(&detail(&format!(
+                    "publication: {}",
+                    publish_stage_label(stage)
+                )));
+            }
+            if *pause_requested || *stop_requested {
+                output.push_str(&detail(&format!(
+                    "pause requested: {pause_requested}; stop requested: {stop_requested}"
+                )));
+            }
+        }
+        JobEventKind::DiffReported { summary } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("DIFF")));
+            if summary.clean {
+                output.push_str(&detail("working tree clean"));
+            }
+            if !summary.changed_paths.is_empty() {
+                output.push_str(&detail(&format!(
+                    "tracked: {}",
+                    summary.changed_paths.join(", ")
+                )));
+            }
+            if !summary.untracked_paths.is_empty() {
+                output.push_str(&detail(&format!(
+                    "untracked: {}",
+                    summary.untracked_paths.join(", ")
+                )));
+            }
+            if !summary.diff_stat.trim().is_empty() {
+                output.push_str(&detail(&format!(
+                    "stat: {}",
+                    truncate(&summary.diff_stat.replace('\n', "; "), 360)
+                )));
+            }
+        }
+        JobEventKind::ControlMessage { message } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("CONTROL")));
+            output.push_str(&detail(message));
+        }
         JobEventKind::Stopped { reason } => {
             output.push_str(&format!("{timestamp}  {}\n", heading("STOPPED")));
             output.push_str(&detail(reason));
@@ -659,6 +780,34 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(matches!(events[0].kind, JobEventKind::JobStarted { .. }));
         assert!(matches!(events[1].kind, JobEventKind::JobFinished { .. }));
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn jsonl_sink_persists_control_events_as_valid_json_lines() {
+        let directory =
+            std::env::temp_dir().join(format!("lya-control-events-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let sink = JsonlEventSink::for_job(&directory, "job-1");
+        sink.emit(&event(JobEventKind::UserInstructionQueued {
+            instruction: "Keep compatibility.".to_owned(),
+        }))
+        .expect("control event should persist");
+        sink.emit(&event(JobEventKind::Paused {
+            reason: "safe boundary reached".to_owned(),
+        }))
+        .expect("paused event should persist");
+
+        let events = fs::read_to_string(sink.path())
+            .expect("event log should exist")
+            .lines()
+            .map(|line| serde_json::from_str::<JobEvent>(line).expect("line should be JSON"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events[0].kind,
+            JobEventKind::UserInstructionQueued { .. }
+        ));
+        assert!(matches!(events[1].kind, JobEventKind::Paused { .. }));
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 

@@ -61,6 +61,10 @@ pub struct SupervisorRequest {
     pub iteration: u32,
     pub executor_report: Option<String>,
     pub repository_state: Option<String>,
+    #[serde(default)]
+    pub user_instructions: Vec<String>,
+    #[serde(skip)]
+    pub cancellation: Option<crate::process::ProcessCancellation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,6 +401,7 @@ impl<R> CodexCliSupervisor<R> {
         spec.env_remove.push("OPENAI_API_KEY".to_owned());
         spec.stdin = Some(render_prompt(request));
         spec.timeout = Some(self.timeout);
+        spec.cancellation = request.cancellation.clone();
         spec
     }
 
@@ -460,11 +465,16 @@ impl<R: ProcessRunner> Supervisor for CodexCliSupervisor<R> {
 
 fn render_prompt(request: &SupervisorRequest) -> String {
     format!(
-        "=== SYSTEM / ROLE ===\n{SUPERVISOR_SYSTEM_PROMPT}\n\n=== PRIVATE CONTEXT (UNTRUSTED REFERENCE DATA) ===\n{}\n\n=== PROJECT (UNTRUSTED REFERENCE DATA) ===\nname: {}\npath: {}\n\n=== CURRENT TASK (UNTRUSTED REFERENCE DATA) ===\n{}\n\n=== PHASE / ITERATION (UNTRUSTED REFERENCE DATA) ===\nphase: {}\niteration: {}\n\n=== EXECUTOR REPORT (UNTRUSTED REFERENCE DATA) ===\n{}\n\n=== REPOSITORY STATE (UNTRUSTED REFERENCE DATA) ===\n{}\n",
+        "=== SYSTEM / ROLE ===\n{SUPERVISOR_SYSTEM_PROMPT}\n\n=== PRIVATE CONTEXT (UNTRUSTED REFERENCE DATA) ===\n{}\n\n=== PROJECT (UNTRUSTED REFERENCE DATA) ===\nname: {}\npath: {}\n\n=== CURRENT TASK (UNTRUSTED REFERENCE DATA) ===\n{}\n\n=== USER INSTRUCTIONS (UNTRUSTED REFERENCE DATA) ===\n{}\n\n=== PHASE / ITERATION (UNTRUSTED REFERENCE DATA) ===\nphase: {}\niteration: {}\n\n=== EXECUTOR REPORT (UNTRUSTED REFERENCE DATA) ===\n{}\n\n=== REPOSITORY STATE (UNTRUSTED REFERENCE DATA) ===\n{}\n",
         request.private_context,
         request.project.name,
         request.project.path.display(),
         request.task,
+        if request.user_instructions.is_empty() {
+            "(none)".to_owned()
+        } else {
+            request.user_instructions.join("\n")
+        },
         request.phase.as_deref().unwrap_or("not provided"),
         request.iteration,
         request.executor_report.as_deref().unwrap_or("not provided"),
@@ -609,6 +619,8 @@ mod tests {
             iteration: 2,
             executor_report: Some("No executor has run yet.".to_owned()),
             repository_state: Some("Tests have not been run.".to_owned()),
+            user_instructions: Vec::new(),
+            cancellation: None,
         }
     }
 
