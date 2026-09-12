@@ -43,6 +43,9 @@ Lya
         ├── context.md
         ├── state.json
         └── jobs/
+            └── <job-id>/
+                ├── events.jsonl
+                └── Supervisor artifacts
 ```
 
 The components are intentionally separated:
@@ -128,6 +131,20 @@ The directory currently contains data such as:
 `context.md` provides private user/project context to the Supervisor.
 
 **Important:** "private" means that this file is kept outside the project repository. Its relevant content is sent to the configured Supervisor when a request is made. Do not store credentials, API keys, passwords, or other secrets in it.
+
+### Job Event History
+
+Every autonomous job appends structured JSON Lines to:
+
+```text
+LYA_HOME/jobs/<job-id>/events.jsonl
+```
+
+Each line is an independently useful `JobEvent` with a timestamp, job and project identity, optional iteration, and event-specific data. Events cover job lifecycle, Supervisor decisions, Claude execution reports, repository summaries, waiting/failure states, and guarded publication stages. The file is appended and synced after each event; it is never rewritten as a whole.
+
+Event persistence is required for an autonomous job. If Lya cannot write or sync an event, it stops the job before the next external Supervisor, Executor, or Git action and reports the error. Existing event logs are append-only and are not parsed to decide whether Git may write, so malformed older logs cannot weaken publication verification.
+
+Event logs are local, but they may contain prompts, model final responses, file paths, repository metadata, commit titles, and other project details. Treat them as potentially sensitive. Lya never logs child-process environment variables or credentials. The private `context.md` body is intentionally omitted from the observable Supervisor-request event.
 
 ## Diagnostics
 
@@ -263,6 +280,28 @@ One iteration consists of one Supervisor review and the optional Executor invoca
 The default maximum is 10 iterations.
 
 Claude sessions are resumed across correction cycles so the Executor retains the context of its previous work.
+
+### Live Output
+
+`lya run` renders the job event stream live in a compact, human-readable form by default. It shows Supervisor decisions, the explicit prompts Lya sends to Claude, Claude's final report, concise repository summaries, waiting/failure states, and publication progress. ANSI color is used only when stdout is an interactive terminal; redirected output remains readable text.
+
+```bash
+cargo run -- run --project /path/to/project "Fix a small regression and verify the result."
+```
+
+Use `--verbose` to include the full safe Supervisor review request, explicit structured decision fields, complete Claude final response, detailed repository metadata, and publication details:
+
+```bash
+cargo run -- run --verbose --project /path/to/project "Fix a small regression and verify the result."
+```
+
+Use `--json` for machine-readable JSON Lines on stdout. In this mode stdout contains only `JobEvent` JSON objects, one per line; diagnostics are written to stderr. `--verbose` and `--json` cannot be combined.
+
+```bash
+cargo run -- run --json --project /path/to/project "Fix a small regression and verify the result."
+```
+
+This visibility records the exchange Lya is legitimately allowed to know: the safe review request it sends Codex, Codex's structured decision and explicit reason, the prompt Lya sends Claude, Claude's final response/report, and subsequent repository state. Hidden model chain-of-thought is not available and is never claimed or logged. The same event model is intentionally independent of terminal rendering so a later daemon or web UI can subscribe to it.
 
 ## Repository Review
 
@@ -485,6 +524,7 @@ The following are not implemented yet:
 * [x] Independent Git repository review
 * [x] Guarded Git commit and push
 * [x] Sequential multi-job runs
+* [x] Structured job events and live CLI output
 * [ ] Persisted job/run resume
 * [ ] Quota-aware pause and resume
 * [ ] Daemon/service mode

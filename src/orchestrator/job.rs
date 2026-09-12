@@ -10,6 +10,10 @@ use std::{
 use crate::process::{ProcessRunner, SystemProcessRunner};
 
 use super::{
+    events::{
+        EventSink, EventSinkError, JobEvent, JobEventKind, NoopEventSink, RepositorySummary,
+        executor_event_kind, supervisor_event_fields,
+    },
     executor::{Executor, ExecutorError, ExecutorRequest, ExecutorSession},
     publisher::{PublishError, PublishProgress, PublishRequest, PublishStage, Publisher},
     repository::{RepositoryError, RepositoryState},
@@ -30,18 +34,19 @@ pub struct NewJob {
     pub private_context: String,
 }
 
-pub struct AutonomousOrchestrator<S, E, R = SystemProcessRunner, P = ()> {
+pub struct AutonomousOrchestrator<S, E, R = SystemProcessRunner, P = (), N = NoopEventSink> {
     supervisor: S,
     executor: E,
     repository_runner: R,
     state_store: StateStore,
     publisher: P,
+    event_sink: N,
     max_iterations: u32,
     max_jobs: u32,
     browser: bool,
 }
 
-impl<S, E, R> AutonomousOrchestrator<S, E, R, ()> {
+impl<S, E, R> AutonomousOrchestrator<S, E, R, (), NoopEventSink> {
     pub fn new(supervisor: S, executor: E, repository_runner: R, state_store: StateStore) -> Self {
         Self {
             supervisor,
@@ -49,6 +54,7 @@ impl<S, E, R> AutonomousOrchestrator<S, E, R, ()> {
             repository_runner,
             state_store,
             publisher: (),
+            event_sink: NoopEventSink,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_jobs: DEFAULT_MAX_JOBS,
             browser: false,
@@ -56,7 +62,7 @@ impl<S, E, R> AutonomousOrchestrator<S, E, R, ()> {
     }
 }
 
-impl<S, E, R, P> AutonomousOrchestrator<S, E, R, P> {
+impl<S, E, R, P, N> AutonomousOrchestrator<S, E, R, P, N> {
     pub fn with_max_iterations(mut self, max_iterations: u32) -> Self {
         self.max_iterations = max_iterations;
         self
@@ -72,13 +78,28 @@ impl<S, E, R, P> AutonomousOrchestrator<S, E, R, P> {
         self
     }
 
-    pub fn with_publisher<Q>(self, publisher: Q) -> AutonomousOrchestrator<S, E, R, Q> {
+    pub fn with_publisher<Q>(self, publisher: Q) -> AutonomousOrchestrator<S, E, R, Q, N> {
         AutonomousOrchestrator {
             supervisor: self.supervisor,
             executor: self.executor,
             repository_runner: self.repository_runner,
             state_store: self.state_store,
             publisher,
+            event_sink: self.event_sink,
+            max_iterations: self.max_iterations,
+            max_jobs: self.max_jobs,
+            browser: self.browser,
+        }
+    }
+
+    pub fn with_event_sink<Q>(self, event_sink: Q) -> AutonomousOrchestrator<S, E, R, P, Q> {
+        AutonomousOrchestrator {
+            supervisor: self.supervisor,
+            executor: self.executor,
+            repository_runner: self.repository_runner,
+            state_store: self.state_store,
+            publisher: self.publisher,
+            event_sink,
             max_iterations: self.max_iterations,
             max_jobs: self.max_jobs,
             browser: self.browser,
@@ -86,8 +107,8 @@ impl<S, E, R, P> AutonomousOrchestrator<S, E, R, P> {
     }
 }
 
-impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
-    AutonomousOrchestrator<S, E, R, P>
+impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
+    AutonomousOrchestrator<S, E, R, P, N>
 {
     pub async fn run(&self, request: NewJob) -> Result<JobState, OrchestrationError> {
         if request.task.trim().is_empty() {
@@ -117,10 +138,30 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
         }
 
         let initial_repository_state =
-            RepositoryState::collect(&self.repository_runner, &request.project.path)
-                .await
-                .map_err(OrchestrationError::Repository)?;
+            match RepositoryState::collect(&self.repository_runner, &request.project.path).await {
+                Ok(state) => state,
+                Err(error) => {
+                    self.emit_request(
+                        &request,
+                        None,
+                        JobEventKind::Failed {
+                            error: error.to_string(),
+                        },
+                    )?;
+                    return Err(OrchestrationError::Repository(error));
+                }
+            };
         if !initial_repository_state.is_clean() {
+            self.emit_request(
+                &request,
+                None,
+                JobEventKind::Failed {
+                    error: format!(
+                        "refusing to start job because the working tree is not clean: {}",
+                        request.project.path.display()
+                    ),
+                },
+            )?;
             return Err(OrchestrationError::RepositoryDirty(
                 request.project.path.clone(),
             ));
@@ -133,11 +174,29 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
             request.task.clone(),
         );
         self.persist(&job)?;
+        self.emit(
+            &job,
+            JobEventKind::JobStarted {
+                task: request.task.clone(),
+            },
+        )?;
+        self.emit(
+            &job,
+            JobEventKind::RepositoryCaptured {
+                summary: RepositorySummary::from(&initial_repository_state),
+            },
+        )?;
         let mut repository_state = initial_repository_state;
 
         loop {
             if job.iteration >= self.max_iterations {
-                self.fail(&mut job)?;
+                self.fail(
+                    &mut job,
+                    format!(
+                        "autonomous job reached its iteration limit of {}",
+                        self.max_iterations
+                    ),
+                )?;
                 return Err(OrchestrationError::IterationLimit {
                     limit: self.max_iterations,
                 });
@@ -154,14 +213,36 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                 executor_report: job.last_executor_report.clone(),
                 repository_state: Some(repository_state.render_for_supervisor()),
             };
+            self.emit(
+                &job,
+                JobEventKind::SupervisorStarted {
+                    prompt: observable_supervisor_prompt(&supervisor_request),
+                },
+            )?;
             let decision = match self.supervisor.decide(supervisor_request).await {
                 Ok(decision) => decision,
                 Err(error) => {
-                    self.fail(&mut job)?;
+                    if is_quota_error(&error.to_string()) {
+                        self.wait_for_quota(&mut job, "OpenAI", error.to_string())?;
+                        return Ok(job);
+                    }
+                    self.fail(&mut job, error.to_string())?;
                     return Err(OrchestrationError::Supervisor(error));
                 }
             };
             job.last_supervisor_decision = Some(decision.clone());
+            let (action, reason, prompt, commit_title, next_prompt) =
+                supervisor_event_fields(&decision);
+            self.emit(
+                &job,
+                JobEventKind::SupervisorFinished {
+                    action,
+                    reason,
+                    prompt,
+                    commit_title,
+                    next_prompt,
+                },
+            )?;
 
             match decision {
                 SupervisorDecision::Claude { prompt, .. } => {
@@ -174,10 +255,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                             ExecutorSession::Resume(session_id.clone())
                         }
                         (Some(_), _) => {
-                            self.fail(&mut job)?;
-                            return Err(OrchestrationError::InvalidTransition(
-                                "supervisor requested another Claude pass, but the previous Claude result has no resumable session ID".to_owned(),
-                            ));
+                            let error = "supervisor requested another Claude pass, but the previous Claude result has no resumable session ID".to_owned();
+                            self.fail(&mut job, error.clone())?;
+                            return Err(OrchestrationError::InvalidTransition(error));
                         }
                         (None, _) => ExecutorSession::New,
                     };
@@ -189,13 +269,28 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                         browser: self.browser,
                         timeout: None,
                     };
+                    self.emit(
+                        &job,
+                        JobEventKind::ExecutorStarted {
+                            prompt: executor_request.prompt.clone(),
+                            session_id: match &executor_request.session {
+                                ExecutorSession::New => None,
+                                ExecutorSession::Resume(session_id) => Some(session_id.clone()),
+                            },
+                        },
+                    )?;
                     let result = match self.executor.execute(executor_request).await {
                         Ok(result) => result,
                         Err(error) => {
-                            self.fail(&mut job)?;
+                            if is_quota_error(&error.to_string()) {
+                                self.wait_for_quota(&mut job, "Claude", error.to_string())?;
+                                return Ok(job);
+                            }
+                            self.fail(&mut job, error.to_string())?;
                             return Err(OrchestrationError::Executor(error));
                         }
                     };
+                    self.emit(&job, executor_event_kind(result.clone()))?;
                     if let Some(session_id) =
                         result.session_id.filter(|value| !value.trim().is_empty())
                     {
@@ -214,10 +309,16 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                     {
                         Ok(state) => state,
                         Err(error) => {
-                            self.fail(&mut job)?;
+                            self.fail(&mut job, error.to_string())?;
                             return Err(OrchestrationError::Repository(error));
                         }
                     };
+                    self.emit(
+                        &job,
+                        JobEventKind::RepositoryCaptured {
+                            summary: RepositorySummary::from(&repository_state),
+                        },
+                    )?;
                 }
                 SupervisorDecision::Accept { commit_title, .. } => {
                     job.status = JobStatus::Accepted;
@@ -225,6 +326,12 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                     job.touch();
                     self.persist(&job)?;
                     if !self.publisher.is_enabled() {
+                        self.emit(
+                            &job,
+                            JobEventKind::JobFinished {
+                                status: "ACCEPTED".to_owned(),
+                            },
+                        )?;
                         return Ok(job);
                     }
 
@@ -232,10 +339,17 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                     job.phase = JobPhase::Publisher;
                     job.touch();
                     self.persist(&job)?;
+                    self.emit(
+                        &job,
+                        JobEventKind::PublishStarted {
+                            commit_title: commit_title.clone(),
+                        },
+                    )?;
                     let publish = {
                         let mut progress = JobPublicationProgress {
                             job: &mut job,
                             state_store: &self.state_store,
+                            event_sink: &self.event_sink,
                         };
                         self.publisher
                             .publish(
@@ -259,12 +373,16 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                             {
                                 Ok(state) => state,
                                 Err(error) => {
-                                    self.fail(&mut job)?;
+                                    self.fail(&mut job, error.to_string())?;
                                     return Err(OrchestrationError::Repository(error));
                                 }
                             };
                             if !post_commit_state.is_clean() {
-                                self.fail(&mut job)?;
+                                let error = format!(
+                                    "working tree is not clean after publishing: {}",
+                                    job.project_path.display()
+                                );
+                                self.fail(&mut job, error)?;
                                 return Err(OrchestrationError::PostCommitWorkingTreeDirty(
                                     job.project_path.clone(),
                                 ));
@@ -272,27 +390,62 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
                             job.status = JobStatus::Published;
                             job.touch();
                             self.persist(&job)?;
+                            self.emit(
+                                &job,
+                                JobEventKind::RepositoryCaptured {
+                                    summary: RepositorySummary::from(&post_commit_state),
+                                },
+                            )?;
+                            self.emit(
+                                &job,
+                                JobEventKind::Published {
+                                    result: job
+                                        .publish_result
+                                        .clone()
+                                        .expect("publish result was stored"),
+                                },
+                            )?;
+                            self.emit(
+                                &job,
+                                JobEventKind::JobFinished {
+                                    status: "PUBLISHED".to_owned(),
+                                },
+                            )?;
                             return Ok(job);
                         }
                         Err(error) => {
                             if let PublishError::PushRejected(result) = &error {
                                 job.publish_result = Some(result.clone());
                             }
-                            self.fail(&mut job)?;
+                            self.fail(&mut job, error.to_string())?;
                             return Err(OrchestrationError::Publish(error));
                         }
                     }
                 }
-                SupervisorDecision::Human { .. } => {
+                SupervisorDecision::Human { reason } => {
                     job.status = JobStatus::WaitingHuman;
                     job.touch();
                     self.persist(&job)?;
+                    self.emit(&job, JobEventKind::WaitingForHuman { reason })?;
+                    self.emit(
+                        &job,
+                        JobEventKind::JobFinished {
+                            status: "WAITING_HUMAN".to_owned(),
+                        },
+                    )?;
                     return Ok(job);
                 }
-                SupervisorDecision::Stop { .. } => {
+                SupervisorDecision::Stop { reason } => {
                     job.status = JobStatus::Stopped;
                     job.touch();
                     self.persist(&job)?;
+                    self.emit(&job, JobEventKind::Stopped { reason })?;
+                    self.emit(
+                        &job,
+                        JobEventKind::JobFinished {
+                            status: "STOPPED".to_owned(),
+                        },
+                    )?;
                     return Ok(job);
                 }
             }
@@ -346,11 +499,104 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
             .map_err(OrchestrationError::State)
     }
 
-    fn fail(&self, job: &mut JobState) -> Result<(), OrchestrationError> {
+    fn emit(&self, job: &JobState, kind: JobEventKind) -> Result<(), OrchestrationError> {
+        let project = Project {
+            name: job.project_name.clone(),
+            path: job.project_path.clone(),
+        };
+        match self.event_sink.emit(&JobEvent::new(
+            &job.job_id,
+            &project,
+            Some(job.iteration),
+            kind,
+        )) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let mut failed = job.clone();
+                failed.status = JobStatus::Failed;
+                failed.touch();
+                self.persist(&failed)?;
+                Err(OrchestrationError::Event(error))
+            }
+        }
+    }
+
+    fn emit_request(
+        &self,
+        request: &NewJob,
+        iteration: Option<u32>,
+        kind: JobEventKind,
+    ) -> Result<(), OrchestrationError> {
+        self.event_sink
+            .emit(&JobEvent::new(
+                &request.job_id,
+                &request.project,
+                iteration,
+                kind,
+            ))
+            .map_err(OrchestrationError::Event)
+    }
+
+    fn fail(&self, job: &mut JobState, error: String) -> Result<(), OrchestrationError> {
         job.status = JobStatus::Failed;
         job.touch();
-        self.persist(job)
+        self.persist(job)?;
+        self.emit(job, JobEventKind::Failed { error })
     }
+
+    fn wait_for_quota(
+        &self,
+        job: &mut JobState,
+        provider: &str,
+        reason: String,
+    ) -> Result<(), OrchestrationError> {
+        job.status = if provider == "Claude" {
+            JobStatus::WaitingClaudeQuota
+        } else {
+            JobStatus::WaitingOpenAiQuota
+        };
+        job.touch();
+        self.persist(job)?;
+        self.emit(
+            job,
+            JobEventKind::WaitingForQuota {
+                provider: provider.to_owned(),
+                reason,
+            },
+        )?;
+        self.emit(
+            job,
+            JobEventKind::JobFinished {
+                status: match job.status {
+                    JobStatus::WaitingClaudeQuota => "WAITING_CLAUDE_QUOTA",
+                    JobStatus::WaitingOpenAiQuota => "WAITING_OPENAI_QUOTA",
+                    _ => unreachable!(),
+                }
+                .to_owned(),
+            },
+        )
+    }
+}
+
+fn observable_supervisor_prompt(request: &SupervisorRequest) -> String {
+    format!(
+        "Review the current task and choose CLAUDE, ACCEPT, HUMAN, or STOP.\n\nProject: {}\nPath: {}\nPhase: {}\nIteration: {}\n\nTask:\n{}\n\nExecutor report:\n{}\n\nRepository state:\n{}\n\nPrivate context is intentionally omitted from the event log.",
+        request.project.name,
+        request.project.path.display(),
+        request.phase.as_deref().unwrap_or("not provided"),
+        request.iteration,
+        request.task,
+        request.executor_report.as_deref().unwrap_or("not provided"),
+        request
+            .repository_state
+            .as_deref()
+            .unwrap_or("not provided"),
+    )
+}
+
+fn is_quota_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("quota") || error.contains("rate limit") || error.contains("rate_limit")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,11 +624,12 @@ impl Publisher for () {
 struct JobPublicationProgress<'a> {
     job: &'a mut JobState,
     state_store: &'a StateStore,
+    event_sink: &'a dyn EventSink,
 }
 
 impl PublishProgress for JobPublicationProgress<'_> {
     fn record(&mut self, stage: PublishStage) -> Result<(), PublishError> {
-        self.job.publish_stage = Some(stage);
+        self.job.publish_stage = Some(stage.clone());
         self.job.touch();
         let mut state = self
             .state_store
@@ -391,6 +638,18 @@ impl PublishProgress for JobPublicationProgress<'_> {
         state.upsert(self.job.clone());
         self.state_store
             .save(&state)
+            .map_err(|error| PublishError::ProgressPersistence(error.to_string()))?;
+        let project = Project {
+            name: self.job.project_name.clone(),
+            path: self.job.project_path.clone(),
+        };
+        self.event_sink
+            .emit(&JobEvent::new(
+                &self.job.job_id,
+                &project,
+                Some(self.job.iteration),
+                JobEventKind::PublishStageChanged { stage },
+            ))
             .map_err(|error| PublishError::ProgressPersistence(error.to_string()))
     }
 }
@@ -406,6 +665,7 @@ pub fn new_job_id() -> String {
 
 #[derive(Debug)]
 pub enum OrchestrationError {
+    Event(EventSinkError),
     Supervisor(SupervisorError),
     Executor(ExecutorError),
     Repository(RepositoryError),
@@ -420,6 +680,7 @@ pub enum OrchestrationError {
 impl fmt::Display for OrchestrationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Event(error) => write!(formatter, "job event error: {error}"),
             Self::Supervisor(error) => write!(formatter, "supervisor error: {error}"),
             Self::Executor(error) => write!(formatter, "executor error: {error}"),
             Self::Repository(error) => write!(formatter, "repository error: {error}"),
@@ -447,6 +708,7 @@ impl fmt::Display for OrchestrationError {
 impl Error for OrchestrationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Event(error) => Some(error),
             Self::Supervisor(error) => Some(error),
             Self::Executor(error) => Some(error),
             Self::Repository(error) => Some(error),
@@ -473,6 +735,7 @@ mod tests {
     use super::{AutonomousOrchestrator, NewJob, OrchestrationError};
     use crate::{
         orchestrator::{
+            events::{EventSink, JobEvent, JobEventKind, JsonlEventSink},
             executor::{Executor, ExecutorError, ExecutorRequest, ExecutorResult, ExecutorSession},
             home::LyaHome,
             publisher::{
@@ -489,6 +752,28 @@ mod tests {
     };
 
     static NEXT_GIT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Default)]
+    struct RecordingEventSink {
+        events: Arc<Mutex<Vec<JobEvent>>>,
+    }
+
+    impl EventSink for RecordingEventSink {
+        fn emit(&self, event: &JobEvent) -> Result<(), super::EventSinkError> {
+            self.events.lock().expect("event lock").push(event.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingEventSink;
+
+    impl EventSink for FailingEventSink {
+        fn emit(&self, _event: &JobEvent) -> Result<(), super::EventSinkError> {
+            Err(super::EventSinkError::Write(
+                "event storage unavailable".to_owned(),
+            ))
+        }
+    }
 
     #[derive(Clone)]
     struct FakeSupervisor {
@@ -635,7 +920,7 @@ mod tests {
         fn publish<'a>(
             &'a self,
             request: PublishRequest,
-            _progress: &'a mut dyn PublishProgress,
+            progress: &'a mut dyn PublishProgress,
         ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>>
         {
             self.requests
@@ -648,7 +933,25 @@ mod tests {
                 .expect("publisher result lock")
                 .pop_front()
                 .expect("a publisher result should be queued");
-            Box::pin(async move { result })
+            let progress_result = if result.is_ok() {
+                [
+                    PublishStage::Verifying,
+                    PublishStage::Staging,
+                    PublishStage::Staged,
+                    PublishStage::Committing,
+                    PublishStage::Committed,
+                    PublishStage::Pushing,
+                    PublishStage::Pushed,
+                ]
+                .into_iter()
+                .try_for_each(|stage| progress.record(stage))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move {
+                progress_result?;
+                result
+            })
         }
     }
 
@@ -762,6 +1065,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_loop_emits_supervisor_executor_and_repository_events() {
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Update the explicit README wording.".to_owned(),
+                reason: Some("The repository needs a small correction.".to_owned()),
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Update README wording".to_owned(),
+                next_prompt: None,
+                reason: Some("The change is ready.".to_owned()),
+            }),
+        ]);
+        let executor = FakeExecutor::new(vec![Ok(claude_result(
+            Some("session-visible"),
+            "Updated README and verified the change.",
+        ))]);
+        let directory = home("event-lifecycle");
+        let sink = RecordingEventSink::default();
+        let recorded = sink.events.clone();
+
+        orchestrator(supervisor, executor, &directory)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("job should finish");
+
+        let events = recorded.lock().expect("event lock");
+        assert!(matches!(events[0].kind, JobEventKind::JobStarted { .. }));
+        assert!(matches!(
+            events[1].kind,
+            JobEventKind::RepositoryCaptured { .. }
+        ));
+        assert!(matches!(
+            events[2].kind,
+            JobEventKind::SupervisorStarted { .. }
+        ));
+        assert!(
+            matches!(events[3].kind, JobEventKind::SupervisorFinished { ref action, ref prompt, .. } if action == "CLAUDE" && prompt.as_deref() == Some("Update the explicit README wording."))
+        );
+        assert!(
+            matches!(events[4].kind, JobEventKind::ExecutorStarted { ref prompt, .. } if prompt == "Update the explicit README wording.")
+        );
+        assert!(
+            matches!(events[5].kind, JobEventKind::ExecutorFinished { ref session_id, ref final_response, .. } if session_id.as_deref() == Some("session-visible") && final_response.contains("verified"))
+        );
+        assert!(matches!(
+            events[6].kind,
+            JobEventKind::RepositoryCaptured { .. }
+        ));
+        assert!(matches!(
+            events[7].kind,
+            JobEventKind::SupervisorStarted { .. }
+        ));
+        assert!(
+            matches!(events[8].kind, JobEventKind::SupervisorFinished { ref action, ref commit_title, .. } if action == "ACCEPT" && commit_title.as_deref() == Some("Update README wording"))
+        );
+        assert!(
+            matches!(events[9].kind, JobEventKind::JobFinished { ref status } if status == "ACCEPTED")
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
     async fn correction_resumes_exact_previous_claude_session() {
         let supervisor = FakeSupervisor::new(vec![
             Ok(SupervisorDecision::Claude {
@@ -840,13 +1206,23 @@ mod tests {
         let executor = FakeExecutor::new(vec![]);
         let requests = executor.requests.clone();
         let directory = home("human");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
         let result = orchestrator(supervisor, executor, &directory)
+            .with_event_sink(sink)
             .run(job_request())
             .await
             .expect("job should wait");
 
         assert_eq!(result.status, JobStatus::WaitingHuman);
         assert!(requests.lock().expect("executor request lock").is_empty());
+        assert!(
+            events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::WaitingForHuman { .. }))
+        );
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
 
@@ -858,13 +1234,97 @@ mod tests {
         let executor = FakeExecutor::new(vec![]);
         let requests = executor.requests.clone();
         let directory = home("stop");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
         let result = orchestrator(supervisor, executor, &directory)
+            .with_event_sink(sink)
             .run(job_request())
             .await
             .expect("job should stop");
 
         assert_eq!(result.status, JobStatus::Stopped);
         assert!(requests.lock().expect("executor request lock").is_empty());
+        assert!(
+            events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::Stopped { .. }))
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn provider_quota_failure_becomes_an_observable_waiting_state() {
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Claude {
+            prompt: "Implement.".to_owned(),
+            reason: None,
+        })]);
+        let executor = FakeExecutor::new(vec![Err(ExecutorError::Process(
+            "Claude rate limit reached".to_owned(),
+        ))]);
+        let directory = home("claude-quota");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let result = orchestrator(supervisor, executor, &directory)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("quota is a waiting state");
+
+        assert_eq!(result.status, JobStatus::WaitingClaudeQuota);
+        assert!(events.lock().expect("event lock").iter().any(|event| matches!(event.kind, JobEventKind::WaitingForQuota { ref provider, .. } if provider == "Claude")));
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn failed_job_emits_failed_event() {
+        let supervisor = FakeSupervisor::new(vec![Err(SupervisorError::Process(
+            "supervisor unavailable".to_owned(),
+        ))]);
+        let executor = FakeExecutor::new(vec![]);
+        let directory = home("event-failure");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let error = orchestrator(supervisor, executor, &directory)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect_err("supervisor failure should fail the job");
+
+        assert!(matches!(error, OrchestrationError::Supervisor(_)));
+        assert!(events.lock().expect("event lock").iter().any(|event| matches!(event.kind, JobEventKind::Failed { ref error } if error.contains("unavailable"))));
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn event_sink_failure_stops_before_supervisor_and_persists_failed_state() {
+        let supervisor = FakeSupervisor::new(vec![]);
+        let requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![]);
+        let directory = home("event-sink-failure");
+
+        let error = orchestrator(supervisor, executor, &directory)
+            .with_event_sink(FailingEventSink)
+            .run(job_request())
+            .await
+            .expect_err("event failure should stop the job");
+
+        assert!(matches!(error, OrchestrationError::Event(_)));
+        assert!(requests.lock().expect("supervisor request lock").is_empty());
+        let state = StateStore::new(&LyaHome::from_path(&directory))
+            .load()
+            .expect("state should load");
+        assert_eq!(
+            state
+                .jobs
+                .get("test-job")
+                .expect("job should persist")
+                .status,
+            JobStatus::Failed
+        );
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
 
@@ -1047,6 +1507,96 @@ mod tests {
             supervisor_requests.lock().expect("supervisor request lock")[2].task,
             "task two"
         );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn publication_events_follow_guarded_publish_stages_in_order() {
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Implement.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Publish event test".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let executor = FakeExecutor::new(vec![Ok(claude_result(Some("session-1"), "Done."))]);
+        let publisher = FakePublisher::new(vec![Ok(published_result("Publish event test"))]);
+        let directory = home("publish-events");
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            executor,
+            FakeGitRunner { dirty: false },
+            StateStore::new(&LyaHome::from_path(&directory)),
+        )
+        .with_publisher(publisher)
+        .with_event_sink(sink)
+        .run(job_request())
+        .await
+        .expect("publication should finish");
+
+        assert_eq!(result.status, JobStatus::Published);
+        let stages = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match &event.kind {
+                JobEventKind::PublishStageChanged { stage } => Some(stage.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                PublishStage::Verifying,
+                PublishStage::Staging,
+                PublishStage::Staged,
+                PublishStage::Committing,
+                PublishStage::Committed,
+                PublishStage::Pushing,
+                PublishStage::Pushed,
+            ]
+        );
+        assert!(
+            events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::Published { .. }))
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn event_sink_never_causes_publication_before_acceptance() {
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Human {
+            reason: "Need approval.".to_owned(),
+        })]);
+        let executor = FakeExecutor::new(vec![]);
+        let publisher = FakePublisher::new(vec![Ok(published_result("must not publish"))]);
+        let requests = publisher.requests.clone();
+        let directory = home("event-no-publish-before-accept");
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            executor,
+            FakeGitRunner { dirty: false },
+            StateStore::new(&LyaHome::from_path(&directory)),
+        )
+        .with_publisher(publisher)
+        .with_event_sink(RecordingEventSink::default())
+        .run(job_request())
+        .await
+        .expect("human waiting is normal");
+
+        assert_eq!(result.status, JobStatus::WaitingHuman);
+        assert!(requests.lock().expect("publisher request lock").is_empty());
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
 
@@ -1238,6 +1788,7 @@ mod tests {
             StateStore::new(&LyaHome::from_path(&state_home)),
         )
         .with_publisher(publisher)
+        .with_event_sink(JsonlEventSink::for_job(&state_home, "local-end-to-end"))
         .run_sequential(NewJob {
             job_id: "local-end-to-end".to_owned(),
             project: Project {
@@ -1285,6 +1836,22 @@ mod tests {
                 .await
                 .expect("final state should collect")
                 .is_clean()
+        );
+        let event_log = fs::read_to_string(
+            state_home
+                .join("jobs")
+                .join("local-end-to-end")
+                .join("events.jsonl"),
+        )
+        .expect("event log should be readable");
+        let events = event_log
+            .lines()
+            .map(|line| serde_json::from_str::<JobEvent>(line).expect("event line should be JSON"))
+            .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::Published { .. }))
         );
         fs::remove_dir_all(work.parent().expect("work should have parent"))
             .expect("Git test directory should be removed");

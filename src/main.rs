@@ -1,17 +1,20 @@
-use std::{env, path::Path, process::ExitCode};
+use std::{env, io, path::Path, process::ExitCode};
 
 use lya::{
     agent::Agent,
     llm::ollama::OllamaClient,
     orchestrator::{
         doctor::DoctorReport,
+        events::{
+            CompositeEventSink, HumanEventSink, HumanRenderMode, JsonEventSink, JsonlEventSink,
+        },
         executor::{ClaudeCliExecutor, Executor, ExecutorRequest, ExecutorSession},
         home::LyaHome,
         job::{AutonomousOrchestrator, NewJob, new_job_id},
         publisher::{GitPublishConfig, GitPublisher},
         state::JobStatus,
         supervisor::{
-            CodexCliSupervisor, Project, Supervisor, SupervisorDecision, SupervisorRequest,
+            CodexCliSupervisor, Project, Supervisor, SupervisorRequest,
             load_required_private_context,
         },
     },
@@ -90,13 +93,11 @@ async fn main() -> ExitCode {
 }
 
 async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
-    let (project_path, browser, max_iterations, max_jobs, publish, task) = match parse_run_arguments(
-        arguments,
-    ) {
+    let options = match parse_run_arguments(arguments) {
         Ok(options) => options,
         Err(error) => {
             eprintln!(
-                "{error}\nUsage: lya run [--project <path>] [--browser] [--max-iterations <count>] [--publish] [--max-jobs <count>] <task>"
+                "{error}\nUsage: lya run [--project <path>] [--browser] [--max-iterations <count>] [--max-jobs <count>] [--publish] [--verbose | --json] <task>"
             );
             return ExitCode::FAILURE;
         }
@@ -117,25 +118,27 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
     };
     let job_id = new_job_id();
     let project = Project {
-        name: project_name(&project_path),
-        path: project_path,
+        name: project_name(&options.project_path),
+        path: options.project_path,
     };
-    println!(
-        "Starting job {} for {} (maximum {} iterations, maximum {} jobs{}).",
-        job_id,
-        project.path.display(),
-        max_iterations,
-        max_jobs,
-        if publish { ", publication enabled" } else { "" }
-    );
 
     let request = NewJob {
         job_id: job_id.clone(),
         project,
-        task,
+        task: options.task,
         private_context,
     };
-    let result = if publish {
+    let event_sink = match options.output {
+        RunOutput::Json => CompositeEventSink::new(vec![
+            Box::new(JsonlEventSink::for_job(home.path(), &job_id)),
+            Box::new(JsonEventSink::new(io::stdout())),
+        ]),
+        RunOutput::Human(mode) => CompositeEventSink::new(vec![
+            Box::new(JsonlEventSink::for_job(home.path(), &job_id)),
+            Box::new(HumanEventSink::stdout(mode)),
+        ]),
+    };
+    let result = if options.publish {
         let configuration = match GitPublishConfig::from_environment() {
             Ok(configuration) => configuration,
             Err(error) => {
@@ -149,10 +152,11 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
             SystemProcessRunner,
             lya::orchestrator::state::StateStore::new(&home),
         )
-        .with_max_iterations(max_iterations)
-        .with_max_jobs(max_jobs)
-        .with_browser(browser)
+        .with_max_iterations(options.max_iterations)
+        .with_max_jobs(options.max_jobs)
+        .with_browser(options.browser)
         .with_publisher(GitPublisher::new(configuration))
+        .with_event_sink(event_sink)
         .run_sequential(request)
         .await
     } else {
@@ -162,9 +166,10 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
             SystemProcessRunner,
             lya::orchestrator::state::StateStore::new(&home),
         )
-        .with_max_iterations(max_iterations)
-        .with_max_jobs(max_jobs)
-        .with_browser(browser)
+        .with_max_iterations(options.max_iterations)
+        .with_max_jobs(options.max_jobs)
+        .with_browser(options.browser)
+        .with_event_sink(event_sink)
         .run_sequential(request)
         .await
     };
@@ -175,31 +180,12 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
                 .jobs
                 .last()
                 .expect("a run always contains its first job");
-            println!("Job {} finished with status {:?}.", job.job_id, job.status);
-            match &job.last_supervisor_decision {
-                Some(SupervisorDecision::Accept {
-                    commit_title,
-                    next_prompt,
-                    ..
-                }) => {
-                    if job.status == JobStatus::Accepted {
-                        println!("Commit title (not executed): {commit_title}");
-                    }
-                    if let Some(next_prompt) = next_prompt {
-                        println!("Next prompt: {next_prompt}");
-                    }
-                }
-                Some(SupervisorDecision::Human { reason })
-                | Some(SupervisorDecision::Stop { reason }) => println!("{reason}"),
-                Some(SupervisorDecision::Claude { .. }) | None => {}
-            }
-            if run.max_jobs_reached {
-                println!("Run stopped after reaching the configured maximum of {max_jobs} jobs.");
-            }
             match job.status {
                 JobStatus::Accepted
                 | JobStatus::Published
                 | JobStatus::WaitingHuman
+                | JobStatus::WaitingClaudeQuota
+                | JobStatus::WaitingOpenAiQuota
                 | JobStatus::Stopped => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
             }
@@ -377,14 +363,31 @@ fn parse_executor_arguments(
     ))
 }
 
-fn parse_run_arguments(
-    arguments: &[String],
-) -> Result<(std::path::PathBuf, bool, u32, u32, bool, String), String> {
+#[derive(Debug)]
+struct RunOptions {
+    project_path: std::path::PathBuf,
+    browser: bool,
+    max_iterations: u32,
+    max_jobs: u32,
+    publish: bool,
+    output: RunOutput,
+    task: String,
+}
+
+#[derive(Debug)]
+enum RunOutput {
+    Human(HumanRenderMode),
+    Json,
+}
+
+fn parse_run_arguments(arguments: &[String]) -> Result<RunOptions, String> {
     let mut project_path = env::current_dir().map_err(|error| error.to_string())?;
     let mut browser = false;
     let mut max_iterations = lya::orchestrator::job::DEFAULT_MAX_ITERATIONS;
     let mut max_jobs = lya::orchestrator::job::DEFAULT_MAX_JOBS;
     let mut publish = false;
+    let mut verbose = false;
+    let mut json = false;
     let mut task = Vec::new();
     let mut position = 0;
 
@@ -399,6 +402,8 @@ fn parse_run_arguments(
             }
             "--browser" => browser = true,
             "--publish" => publish = true,
+            "--verbose" => verbose = true,
+            "--json" => json = true,
             "--max-iterations" => {
                 position += 1;
                 max_iterations = arguments
@@ -432,17 +437,27 @@ fn parse_run_arguments(
     if task.is_empty() {
         return Err("a task is required".to_owned());
     }
+    if verbose && json {
+        return Err("--verbose cannot be combined with --json".to_owned());
+    }
     let project_path = project_path
         .canonicalize()
         .map_err(|error| format!("could not resolve project path: {error}"))?;
-    Ok((
+    Ok(RunOptions {
         project_path,
         browser,
         max_iterations,
         max_jobs,
         publish,
-        task.join(" "),
-    ))
+        output: if json {
+            RunOutput::Json
+        } else if verbose {
+            RunOutput::Human(HumanRenderMode::Verbose)
+        } else {
+            RunOutput::Human(HumanRenderMode::Normal)
+        },
+        task: task.join(" "),
+    })
 }
 
 fn project_name(path: &Path) -> String {
@@ -475,7 +490,7 @@ fn run_doctor() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutorSession, parse_executor_arguments, parse_run_arguments};
+    use super::{ExecutorSession, RunOutput, parse_executor_arguments, parse_run_arguments};
 
     #[test]
     fn parses_executor_options_and_preserves_prompt_words() {
@@ -514,14 +529,15 @@ mod tests {
             "the regression".to_owned(),
         ];
 
-        let (_, browser, max_iterations, max_jobs, publish, task) = parse_run_arguments(&arguments)
+        let options = parse_run_arguments(&arguments)
             .expect("arguments should parse from the current project");
 
-        assert!(browser);
-        assert_eq!(max_iterations, 5);
-        assert_eq!(max_jobs, lya::orchestrator::job::DEFAULT_MAX_JOBS);
-        assert!(!publish);
-        assert_eq!(task, "Fix the regression");
+        assert!(options.browser);
+        assert_eq!(options.max_iterations, 5);
+        assert_eq!(options.max_jobs, lya::orchestrator::job::DEFAULT_MAX_JOBS);
+        assert!(!options.publish);
+        assert_eq!(options.task, "Fix the regression");
+        assert!(matches!(options.output, RunOutput::Human(_)));
     }
 
     #[test]
@@ -534,16 +550,30 @@ mod tests {
             "this".to_owned(),
         ];
 
-        let (_, browser, max_iterations, max_jobs, publish, task) = parse_run_arguments(&arguments)
+        let options = parse_run_arguments(&arguments)
             .expect("arguments should parse from the current project");
 
-        assert!(!browser);
+        assert!(!options.browser);
         assert_eq!(
-            max_iterations,
+            options.max_iterations,
             lya::orchestrator::job::DEFAULT_MAX_ITERATIONS
         );
-        assert_eq!(max_jobs, 3);
-        assert!(publish);
-        assert_eq!(task, "Publish this");
+        assert_eq!(options.max_jobs, 3);
+        assert!(options.publish);
+        assert_eq!(options.task, "Publish this");
+    }
+
+    #[test]
+    fn parses_json_mode_and_rejects_conflicting_verbose_mode() {
+        let options = parse_run_arguments(&["--json".to_owned(), "Inspect".to_owned()])
+            .expect("JSON mode should parse");
+        assert!(matches!(options.output, RunOutput::Json));
+        let error = parse_run_arguments(&[
+            "--verbose".to_owned(),
+            "--json".to_owned(),
+            "Inspect".to_owned(),
+        ])
+        .expect_err("conflicting modes should be rejected");
+        assert!(error.contains("cannot be combined"));
     }
 }

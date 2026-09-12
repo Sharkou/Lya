@@ -1,5 +1,6 @@
 pub mod context;
 pub mod doctor;
+pub mod events;
 pub mod executor;
 pub mod home;
 pub mod job;

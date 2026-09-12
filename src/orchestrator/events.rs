@@ -1,0 +1,750 @@
+use std::{
+    error::Error,
+    fmt,
+    fs::{self, OpenOptions},
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    executor::ExecutorResult,
+    publisher::{PublishResult, PublishStage},
+    repository::RepositoryState,
+    supervisor::{Project, SupervisorDecision},
+};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobEvent {
+    pub timestamp_unix_millis: u128,
+    pub job_id: String,
+    pub project_name: String,
+    pub project_path: PathBuf,
+    pub iteration: Option<u32>,
+    #[serde(flatten)]
+    pub kind: JobEventKind,
+}
+
+impl JobEvent {
+    pub fn new(
+        job_id: impl Into<String>,
+        project: &Project,
+        iteration: Option<u32>,
+        kind: JobEventKind,
+    ) -> Self {
+        Self {
+            timestamp_unix_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            job_id: job_id.into(),
+            project_name: project.name.clone(),
+            project_path: project.path.clone(),
+            iteration,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum JobEventKind {
+    JobStarted {
+        task: String,
+    },
+    JobFinished {
+        status: String,
+    },
+    SupervisorStarted {
+        prompt: String,
+    },
+    SupervisorFinished {
+        action: String,
+        reason: Option<String>,
+        prompt: Option<String>,
+        commit_title: Option<String>,
+        next_prompt: Option<String>,
+    },
+    ExecutorStarted {
+        prompt: String,
+        session_id: Option<String>,
+    },
+    ExecutorFinished {
+        session_id: Option<String>,
+        final_response: String,
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+        turns: Option<u32>,
+        total_cost_usd: Option<f64>,
+        usage: Option<serde_json::Value>,
+    },
+    RepositoryCaptured {
+        summary: RepositorySummary,
+    },
+    PublishStarted {
+        commit_title: String,
+    },
+    PublishStageChanged {
+        stage: PublishStage,
+    },
+    Published {
+        result: PublishResult,
+    },
+    WaitingForQuota {
+        provider: String,
+        reason: String,
+    },
+    WaitingForHuman {
+        reason: String,
+    },
+    Stopped {
+        reason: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySummary {
+    pub head: String,
+    pub clean: bool,
+    pub changed_paths: Vec<String>,
+    pub untracked_paths: Vec<String>,
+    pub binary_untracked_paths: Vec<String>,
+    pub diff_stat: String,
+    pub diff_truncated: bool,
+    pub diff_total_bytes: usize,
+    pub untracked_truncated: bool,
+    pub untracked_total_bytes: usize,
+}
+
+impl From<&RepositoryState> for RepositorySummary {
+    fn from(state: &RepositoryState) -> Self {
+        Self {
+            head: state.head.clone(),
+            clean: state.is_clean(),
+            changed_paths: state.changed_files.clone(),
+            untracked_paths: state
+                .untracked_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect(),
+            binary_untracked_paths: state
+                .untracked_files
+                .iter()
+                .filter(|file| file.is_binary)
+                .map(|file| file.path.clone())
+                .collect(),
+            diff_stat: state.diff_stat.clone(),
+            diff_truncated: state.diff_truncated,
+            diff_total_bytes: state.diff_total_bytes,
+            untracked_truncated: state.untracked_truncated,
+            untracked_total_bytes: state.untracked_total_bytes,
+        }
+    }
+}
+
+pub trait EventSink: Send + Sync {
+    fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError>;
+}
+
+#[derive(Debug, Default)]
+pub struct NoopEventSink;
+
+impl EventSink for NoopEventSink {
+    fn emit(&self, _event: &JobEvent) -> Result<(), EventSinkError> {
+        Ok(())
+    }
+}
+
+pub struct CompositeEventSink {
+    sinks: Vec<Box<dyn EventSink>>,
+}
+
+impl CompositeEventSink {
+    pub fn new(sinks: Vec<Box<dyn EventSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl EventSink for CompositeEventSink {
+    fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError> {
+        for sink in &self.sinks {
+            sink.emit(event)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct JsonlEventSink {
+    path: PathBuf,
+    write_lock: Mutex<()>,
+}
+
+impl JsonlEventSink {
+    pub fn for_job(home: &Path, job_id: &str) -> Self {
+        Self::new(home.join("jobs").join(job_id).join("events.jsonl"))
+    }
+
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl EventSink for JsonlEventSink {
+    fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError> {
+        let _lock = self
+            .write_lock
+            .lock()
+            .map_err(|_| EventSinkError::Write("event sink lock was poisoned".to_owned()))?;
+        let parent = self.path.parent().ok_or_else(|| {
+            EventSinkError::Write("event log path has no parent directory".to_owned())
+        })?;
+        fs::create_dir_all(parent).map_err(|error| EventSinkError::Write(error.to_string()))?;
+        let mut line = serde_json::to_vec(event)
+            .map_err(|error| EventSinkError::Serialize(error.to_string()))?;
+        line.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| EventSinkError::Write(error.to_string()))?;
+        file.write_all(&line)
+            .map_err(|error| EventSinkError::Write(error.to_string()))?;
+        file.sync_data()
+            .map_err(|error| EventSinkError::Write(error.to_string()))
+    }
+}
+
+pub struct JsonEventSink<W: Write + Send> {
+    writer: Mutex<W>,
+}
+
+impl<W: Write + Send> JsonEventSink<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+        }
+    }
+}
+
+impl<W: Write + Send> EventSink for JsonEventSink<W> {
+    fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| EventSinkError::Write("JSON output lock was poisoned".to_owned()))?;
+        serde_json::to_writer(&mut *writer, event)
+            .map_err(|error| EventSinkError::Serialize(error.to_string()))?;
+        writer
+            .write_all(b"\n")
+            .and_then(|_| writer.flush())
+            .map_err(|error| EventSinkError::Write(error.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HumanRenderMode {
+    Normal,
+    Verbose,
+}
+
+pub struct HumanEventSink<W: Write + Send> {
+    writer: Mutex<W>,
+    mode: HumanRenderMode,
+    color: bool,
+}
+
+impl<W: Write + Send> HumanEventSink<W> {
+    pub fn new(writer: W, mode: HumanRenderMode, color: bool) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+            mode,
+            color,
+        }
+    }
+}
+
+impl HumanEventSink<io::Stdout> {
+    pub fn stdout(mode: HumanRenderMode) -> Self {
+        Self::new(io::stdout(), mode, io::stdout().is_terminal())
+    }
+}
+
+impl<W: Write + Send> EventSink for HumanEventSink<W> {
+    fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| EventSinkError::Write("terminal output lock was poisoned".to_owned()))?;
+        writer
+            .write_all(render_human(event, self.mode, self.color).as_bytes())
+            .and_then(|_| writer.flush())
+            .map_err(|error| EventSinkError::Write(error.to_string()))
+    }
+}
+
+pub fn supervisor_event_fields(
+    decision: &SupervisorDecision,
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    match decision {
+        SupervisorDecision::Claude { prompt, reason } => (
+            "CLAUDE".to_owned(),
+            reason.clone(),
+            Some(prompt.clone()),
+            None,
+            None,
+        ),
+        SupervisorDecision::Accept {
+            commit_title,
+            next_prompt,
+            reason,
+        } => (
+            "ACCEPT".to_owned(),
+            reason.clone(),
+            None,
+            Some(commit_title.clone()),
+            next_prompt.clone(),
+        ),
+        SupervisorDecision::Human { reason } => {
+            ("HUMAN".to_owned(), Some(reason.clone()), None, None, None)
+        }
+        SupervisorDecision::Stop { reason } => {
+            ("STOP".to_owned(), Some(reason.clone()), None, None, None)
+        }
+    }
+}
+
+pub fn executor_event_kind(result: ExecutorResult) -> JobEventKind {
+    JobEventKind::ExecutorFinished {
+        session_id: result.session_id,
+        final_response: result.final_response,
+        exit_code: result.exit_code,
+        duration_ms: result.duration_ms,
+        turns: result.turns,
+        total_cost_usd: result.total_cost_usd,
+        usage: result.usage,
+    }
+}
+
+pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> String {
+    let timestamp = format_timestamp(event.timestamp_unix_millis);
+    let heading = |name: &str| style(name, "36", color);
+    let detail = |value: &str| format!("      {value}\n");
+    let full = |value: &str| format!("      {}\n", indent(value, "      "));
+    let mut output = String::new();
+    match &event.kind {
+        JobEventKind::JobStarted { task } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}\n",
+                heading("JOB"),
+                event.project_name
+            ));
+            output.push_str(&detail(&format!(
+                "{} (iteration limit pending)",
+                truncate(task, 180)
+            )));
+        }
+        JobEventKind::JobFinished { status } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}\n",
+                heading("JOB"),
+                style(status, "32", color)
+            ));
+        }
+        JobEventKind::SupervisorStarted { prompt } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("SUPERVISOR")));
+            output.push_str(&detail("review started"));
+            if mode == HumanRenderMode::Verbose {
+                output.push_str(&full(prompt));
+            }
+        }
+        JobEventKind::SupervisorFinished {
+            action,
+            reason,
+            prompt,
+            commit_title,
+            next_prompt,
+        } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}\n",
+                heading("SUPERVISOR"),
+                style(action, "35", color)
+            ));
+            if let Some(reason) = reason {
+                output.push_str(&detail(&truncate(reason, 360)));
+            }
+            if let Some(commit_title) = commit_title {
+                output.push_str(&detail(&format!("commit: {commit_title}")));
+            }
+            if let Some(prompt) = prompt {
+                output.push_str(&detail(&format!("Claude: {}", truncate(prompt, 360))));
+            }
+            if let Some(next_prompt) = next_prompt {
+                output.push_str(&detail(&format!("next: {}", truncate(next_prompt, 360))));
+            }
+            if mode == HumanRenderMode::Verbose
+                && let Some(prompt) = prompt
+            {
+                output.push_str(&full(&format!("Claude prompt:\n{prompt}")));
+            }
+        }
+        JobEventKind::ExecutorStarted { prompt, session_id } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("CLAUDE")));
+            if let Some(session_id) = session_id {
+                output.push_str(&detail(&format!("resuming session {session_id}")));
+            }
+            output.push_str(&detail(&truncate(prompt, 360)));
+            if mode == HumanRenderMode::Verbose {
+                output.push_str(&full(prompt));
+            }
+        }
+        JobEventKind::ExecutorFinished {
+            session_id,
+            final_response,
+            duration_ms,
+            turns,
+            total_cost_usd,
+            ..
+        } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("CLAUDE")));
+            if let Some(session_id) = session_id {
+                output.push_str(&detail(&format!("session {session_id}")));
+            }
+            output.push_str(&detail(&truncate(final_response, 360)));
+            if mode == HumanRenderMode::Verbose {
+                if let Some(duration_ms) = duration_ms {
+                    output.push_str(&detail(&format!("reported duration: {duration_ms} ms")));
+                }
+                if let Some(turns) = turns {
+                    output.push_str(&detail(&format!("reported turns: {turns}")));
+                }
+                if let Some(total_cost_usd) = total_cost_usd {
+                    output.push_str(&detail(&format!("reported cost: ${total_cost_usd:.4}")));
+                }
+                output.push_str(&full(final_response));
+            }
+        }
+        JobEventKind::RepositoryCaptured { summary } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("REPOSITORY")));
+            output.push_str(&detail(&format!(
+                "HEAD {} ({})",
+                short_sha(&summary.head),
+                if summary.clean { "clean" } else { "dirty" }
+            )));
+            let paths = summary
+                .changed_paths
+                .iter()
+                .chain(summary.untracked_paths.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                output.push_str(&detail(&paths.join(", ")));
+            }
+            if !summary.diff_stat.trim().is_empty() {
+                output.push_str(&detail(&truncate(
+                    &summary.diff_stat.replace('\n', "; "),
+                    360,
+                )));
+            }
+            if summary.diff_truncated || summary.untracked_truncated {
+                output.push_str(&detail("repository capture is truncated"));
+            }
+            if mode == HumanRenderMode::Verbose && !summary.binary_untracked_paths.is_empty() {
+                output.push_str(&detail(&format!(
+                    "binary untracked: {}",
+                    summary.binary_untracked_paths.join(", ")
+                )));
+            }
+        }
+        JobEventKind::PublishStarted { commit_title } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("PUBLISH")));
+            output.push_str(&detail(&format!("commit: {commit_title}")));
+        }
+        JobEventKind::PublishStageChanged { stage } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}\n",
+                heading("PUBLISH"),
+                publish_stage_label(stage)
+            ));
+        }
+        JobEventKind::Published { result } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {} {}\n",
+                heading("PUBLISH"),
+                style("committed", "32", color),
+                short_sha(&result.commit_sha)
+            ));
+            output.push_str(&detail(&format!(
+                "pushed {}/{}",
+                result.remote, result.branch
+            )));
+        }
+        JobEventKind::WaitingForQuota { provider, reason } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}\n",
+                heading("WAITING"),
+                provider
+            ));
+            output.push_str(&detail(reason));
+        }
+        JobEventKind::WaitingForHuman { reason } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("WAITING FOR HUMAN")));
+            output.push_str(&detail(reason));
+        }
+        JobEventKind::Stopped { reason } => {
+            output.push_str(&format!("{timestamp}  {}\n", heading("STOPPED")));
+            output.push_str(&detail(reason));
+        }
+        JobEventKind::Failed { error } => {
+            output.push_str(&format!("{timestamp}  {}\n", style("FAILED", "31", color)));
+            output.push_str(&detail(error));
+        }
+    }
+    output
+}
+
+fn format_timestamp(timestamp_unix_millis: u128) -> String {
+    let seconds = (timestamp_unix_millis / 1_000) % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    )
+}
+
+fn style(value: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{value}\x1b[0m")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn short_sha(value: &str) -> &str {
+    value.get(..value.len().min(7)).unwrap_or(value)
+}
+
+fn truncate(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        return value.to_owned();
+    }
+    value.chars().take(maximum).collect::<String>() + "..."
+}
+
+fn indent(value: &str, prefix: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn publish_stage_label(stage: &PublishStage) -> &'static str {
+    match stage {
+        PublishStage::Verifying => "verifying snapshot",
+        PublishStage::Staging => "staging accepted changes",
+        PublishStage::Staged => "staged state verified",
+        PublishStage::Committing => "committing",
+        PublishStage::Committed => "committed",
+        PublishStage::Pushing => "pushing",
+        PublishStage::Pushed => "pushed",
+    }
+}
+
+#[derive(Debug)]
+pub enum EventSinkError {
+    Serialize(String),
+    Write(String),
+}
+
+impl fmt::Display for EventSinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Serialize(error) => write!(formatter, "could not serialize job event: {error}"),
+            Self::Write(error) => write!(formatter, "could not write job event: {error}"),
+        }
+    }
+}
+
+impl Error for EventSinkError {}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+
+    use super::{
+        CompositeEventSink, EventSink, HumanEventSink, HumanRenderMode, JobEvent, JobEventKind,
+        JsonEventSink, JsonlEventSink, RepositorySummary,
+    };
+    use crate::orchestrator::supervisor::Project;
+
+    fn event(kind: JobEventKind) -> JobEvent {
+        JobEvent::new(
+            "job-1",
+            &Project {
+                name: "demo".to_owned(),
+                path: PathBuf::from("C:/demo"),
+            },
+            Some(1),
+            kind,
+        )
+    }
+
+    #[test]
+    fn events_round_trip_through_json() {
+        let event = event(JobEventKind::SupervisorFinished {
+            action: "CLAUDE".to_owned(),
+            reason: Some("Needs a fix".to_owned()),
+            prompt: Some("Fix it".to_owned()),
+            commit_title: None,
+            next_prompt: None,
+        });
+        let json = serde_json::to_string(&event).expect("event should serialize");
+        let restored: JobEvent = serde_json::from_str(&json).expect("event should deserialize");
+        assert_eq!(restored, event);
+    }
+
+    #[test]
+    fn jsonl_sink_appends_events_in_order() {
+        let directory =
+            std::env::temp_dir().join(format!("lya-events-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let sink = JsonlEventSink::for_job(&directory, "job-1");
+        sink.emit(&event(JobEventKind::JobStarted {
+            task: "first".to_owned(),
+        }))
+        .expect("first event should persist");
+        sink.emit(&event(JobEventKind::JobFinished {
+            status: "ACCEPTED".to_owned(),
+        }))
+        .expect("second event should append");
+        let events = fs::read_to_string(sink.path())
+            .expect("event log should exist")
+            .lines()
+            .map(|line| serde_json::from_str::<JobEvent>(line).expect("line should be JSON"))
+            .collect::<Vec<_>>();
+        assert!(matches!(events[0].kind, JobEventKind::JobStarted { .. }));
+        assert!(matches!(events[1].kind, JobEventKind::JobFinished { .. }));
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[derive(Clone)]
+    struct RecordingSink(Arc<Mutex<Vec<String>>>);
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: &JobEvent) -> Result<(), super::EventSinkError> {
+            self.0
+                .lock()
+                .expect("record lock")
+                .push(format!("{:?}", event.kind));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn composite_sink_delivers_to_each_sink() {
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let sink = CompositeEventSink::new(vec![
+            Box::new(RecordingSink(first.clone())),
+            Box::new(RecordingSink(second.clone())),
+        ]);
+        sink.emit(&event(JobEventKind::JobFinished {
+            status: "STOPPED".to_owned(),
+        }))
+        .expect("composite sink should emit");
+        assert_eq!(first.lock().expect("first lock").len(), 1);
+        assert_eq!(second.lock().expect("second lock").len(), 1);
+    }
+
+    #[test]
+    fn human_renderer_summarizes_repository_without_diff_content() {
+        let event = event(JobEventKind::RepositoryCaptured {
+            summary: RepositorySummary {
+                head: "abcdef123".to_owned(),
+                clean: false,
+                changed_paths: vec!["README.md".to_owned()],
+                untracked_paths: Vec::new(),
+                binary_untracked_paths: Vec::new(),
+                diff_stat: " README.md | 1 +\n".to_owned(),
+                diff_truncated: true,
+                diff_total_bytes: 200_000,
+                untracked_truncated: false,
+                untracked_total_bytes: 0,
+            },
+        });
+        let mut output = Vec::new();
+        HumanEventSink::new(&mut output, HumanRenderMode::Normal, false)
+            .emit(&event)
+            .expect("renderer should write");
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(output.contains("README.md"));
+        assert!(!output.contains("diff --git"));
+    }
+
+    #[test]
+    fn verbose_renderer_exposes_explicit_prompt() {
+        let prompt = format!("{} tail-visible-only-in-verbose", "x".repeat(360));
+        let event = event(JobEventKind::ExecutorStarted {
+            prompt,
+            session_id: None,
+        });
+        let mut normal = Vec::new();
+        HumanEventSink::new(&mut normal, HumanRenderMode::Normal, false)
+            .emit(&event)
+            .expect("normal should write");
+        let mut verbose = Vec::new();
+        HumanEventSink::new(&mut verbose, HumanRenderMode::Verbose, false)
+            .emit(&event)
+            .expect("verbose should write");
+        let normal = String::from_utf8(normal).expect("normal UTF-8");
+        let verbose = String::from_utf8(verbose).expect("verbose UTF-8");
+        assert!(!normal.contains("tail-visible-only-in-verbose"));
+        assert!(verbose.contains("tail-visible-only-in-verbose"));
+    }
+
+    #[test]
+    fn json_renderer_writes_one_valid_object_per_line() {
+        let mut output = Vec::new();
+        let sink = JsonEventSink::new(&mut output);
+        sink.emit(&event(JobEventKind::JobStarted {
+            task: "one".to_owned(),
+        }))
+        .expect("first JSON event should write");
+        sink.emit(&event(JobEventKind::JobFinished {
+            status: "ACCEPTED".to_owned(),
+        }))
+        .expect("second JSON event should write");
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .all(|line| serde_json::from_str::<JobEvent>(line).is_ok())
+        );
+        assert!(!output.contains("\x1b["));
+    }
+}
