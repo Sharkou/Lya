@@ -1,9 +1,28 @@
 use std::{
-    collections::BTreeMap, error::Error, ffi::OsString, fmt, path::PathBuf, process::Stdio,
-    time::Duration,
+    collections::BTreeMap, error::Error, ffi::OsString, fmt, future::Future, path::PathBuf,
+    pin::Pin, process::Stdio, time::Duration,
 };
 
 use tokio::{io::AsyncWriteExt, process::Command};
+
+pub trait ProcessRunner: Send + Sync {
+    fn run(
+        &self,
+        spec: ProcessSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + '_>>;
+}
+
+#[derive(Debug, Default)]
+pub struct SystemProcessRunner;
+
+impl ProcessRunner for SystemProcessRunner {
+    fn run(
+        &self,
+        spec: ProcessSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + '_>> {
+        Box::pin(async move { spec.run().await })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {

@@ -5,6 +5,7 @@ use lya::{
     llm::ollama::OllamaClient,
     orchestrator::{
         doctor::DoctorReport,
+        executor::{ClaudeCliExecutor, Executor, ExecutorRequest, ExecutorSession},
         home::LyaHome,
         supervisor::{
             CodexCliSupervisor, Project, Supervisor, SupervisorRequest,
@@ -32,6 +33,12 @@ async fn main() -> ExitCode {
         .is_some_and(|argument| argument == "supervisor")
     {
         return run_supervisor(&arguments[1..]).await;
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "executor")
+    {
+        return run_executor(&arguments[1..]).await;
     }
 
     let model = match env::var("OLLAMA_MODEL") {
@@ -135,6 +142,112 @@ async fn run_supervisor(arguments: &[String]) -> ExitCode {
     }
 }
 
+async fn run_executor(arguments: &[String]) -> ExitCode {
+    let (request, max_turns) = match parse_executor_arguments(arguments) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!(
+                "{error}\nUsage: lya executor [--project <path>] [--resume <session>] [--browser] [--timeout-seconds <seconds>] [--max-turns <count>] <prompt>"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut executor = ClaudeCliExecutor::new();
+    if let Some(max_turns) = max_turns {
+        executor = executor.with_max_turns(max_turns);
+    }
+
+    match executor.execute(request).await {
+        Ok(result) => match serde_json::to_string_pretty(&result) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Could not render executor result: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("Executor failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn parse_executor_arguments(
+    arguments: &[String],
+) -> Result<(ExecutorRequest, Option<u32>), String> {
+    let mut project_path = env::current_dir().map_err(|error| error.to_string())?;
+    let mut session = ExecutorSession::New;
+    let mut browser = false;
+    let mut timeout = None;
+    let mut max_turns = None;
+    let mut prompt = Vec::new();
+    let mut position = 0;
+
+    while position < arguments.len() {
+        match arguments[position].as_str() {
+            "--project" => {
+                position += 1;
+                project_path = arguments
+                    .get(position)
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| "--project requires a path".to_owned())?;
+            }
+            "--resume" => {
+                position += 1;
+                session = ExecutorSession::Resume(
+                    arguments
+                        .get(position)
+                        .cloned()
+                        .ok_or_else(|| "--resume requires a session ID".to_owned())?,
+                );
+            }
+            "--browser" => browser = true,
+            "--timeout-seconds" => {
+                position += 1;
+                let seconds = arguments
+                    .get(position)
+                    .ok_or_else(|| "--timeout-seconds requires a number".to_owned())?
+                    .parse::<u64>()
+                    .map_err(|_| "--timeout-seconds must be an unsigned integer".to_owned())?;
+                timeout = Some(std::time::Duration::from_secs(seconds));
+            }
+            "--max-turns" => {
+                position += 1;
+                max_turns = Some(
+                    arguments
+                        .get(position)
+                        .ok_or_else(|| "--max-turns requires a number".to_owned())?
+                        .parse::<u32>()
+                        .map_err(|_| "--max-turns must be an unsigned integer".to_owned())?,
+                );
+            }
+            argument if argument.starts_with("--") => {
+                return Err(format!("unknown executor option: {argument}"));
+            }
+            argument => prompt.push(argument.to_owned()),
+        }
+        position += 1;
+    }
+
+    let project_path = project_path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve project path: {error}"))?;
+    Ok((
+        ExecutorRequest {
+            project_name: project_name(&project_path),
+            project_path,
+            prompt: prompt.join(" "),
+            session,
+            browser,
+            timeout,
+        },
+        max_turns,
+    ))
+}
+
 fn project_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -160,5 +273,37 @@ fn run_doctor() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutorSession, parse_executor_arguments};
+
+    #[test]
+    fn parses_executor_options_and_preserves_prompt_words() {
+        let arguments = vec![
+            "--resume".to_owned(),
+            "session-name".to_owned(),
+            "--browser".to_owned(),
+            "--timeout-seconds".to_owned(),
+            "900".to_owned(),
+            "--max-turns".to_owned(),
+            "4".to_owned(),
+            "inspect".to_owned(),
+            "files with spaces".to_owned(),
+        ];
+
+        let (request, max_turns) = parse_executor_arguments(&arguments)
+            .expect("arguments should parse from the current project");
+
+        assert_eq!(request.prompt, "inspect files with spaces");
+        assert_eq!(
+            request.session,
+            ExecutorSession::Resume("session-name".to_owned())
+        );
+        assert!(request.browser);
+        assert_eq!(request.timeout.map(|timeout| timeout.as_secs()), Some(900));
+        assert_eq!(max_turns, Some(4));
     }
 }

@@ -82,7 +82,21 @@ cargo run -- supervisor "Determine the next development step"
 
 The command requires `context.md`, runs `codex exec` with a strict JSON Schema, removes `OPENAI_API_KEY` from the Codex child process, and prints one of `CLAUDE`, `ACCEPT`, `HUMAN`, or `STOP` as JSON.
 
-The Claude execution loop, automated Git operations, quota handling, and a daemon are not implemented yet.
+## Executor Development Command
+
+The Claude Executor runs independently from the Supervisor. It invokes Claude Code in print mode with JSON output, sending the complete task through stdin so long Supervisor prompts do not depend on the Windows command-line limit. It then prints an `ExecutorResult` containing Claude's final response, session reference, exit code, and any available duration, turn, cost, and usage metadata. It does not connect a Codex decision to Claude, commit, push, or start a daemon.
+
+From the project to work on, run:
+
+```bash
+cargo run -- executor --max-turns 1 "Summarize this repository without modifying any files"
+```
+
+The command accepts `--project <path>`, `--resume <session>`, `--browser`, `--timeout-seconds <seconds>`, and `--max-turns <count>`. `--resume` accepts the session reference returned in the preceding JSON result. By default there is no Lya-imposed timeout or turn limit. Set `LYA_CLAUDE_BIN` to use a Claude executable not available on `PATH`; otherwise Lya invokes `claude`.
+
+Lya starts Claude Code with `--permission-mode auto --permission-prompts none`: Claude's safety classifier evaluates actions, while actions that would need an unanswered approval are denied. Lya never uses `--dangerously-skip-permissions`. It removes `ANTHROPIC_API_KEY` only from the Claude child process, so the CLI uses its normal Claude subscription authentication and cannot silently fall back to API-key billing.
+
+The Claude execution loop, automated Git operations, automatic quota handling, and a daemon are not implemented yet.
 
 > Lya is currently under active development. APIs, architecture and features may change significantly.
 

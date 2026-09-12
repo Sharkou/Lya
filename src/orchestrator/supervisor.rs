@@ -10,7 +10,8 @@ use std::{
 
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 
-use crate::process::{ProcessError, ProcessOutput, ProcessSpec};
+use crate::process::{ProcessError, ProcessSpec};
+pub use crate::process::{ProcessRunner, SystemProcessRunner};
 
 use super::{context::PrivateContext, home::LyaHome};
 
@@ -336,25 +337,6 @@ pub trait Supervisor {
         &self,
         request: SupervisorRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SupervisorDecision, SupervisorError>> + Send + '_>>;
-}
-
-pub trait ProcessRunner: Send + Sync {
-    fn run(
-        &self,
-        spec: ProcessSpec,
-    ) -> Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + '_>>;
-}
-
-#[derive(Debug, Default)]
-pub struct SystemProcessRunner;
-
-impl ProcessRunner for SystemProcessRunner {
-    fn run(
-        &self,
-        spec: ProcessSpec,
-    ) -> Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + '_>> {
-        Box::pin(async move { spec.run().await })
-    }
 }
 
 pub struct CodexCliSupervisor<R = SystemProcessRunner> {
