@@ -1,138 +1,508 @@
 # Lya
 
-**Lya** is a lightweight, open-source AI agent written in Rust.
+**Lya** is a lightweight, open-source, local-first AI agent and development orchestrator written in Rust.
 
-The goal of Lya is to provide a simple, extensible and local-first AI agent capable of interacting with tools and external systems while keeping the architecture lightweight and understandable.
+Lya started as a simple agent runtime for local language models and has evolved to also support autonomous software-development workflows. It can coordinate specialized AI tools, inspect real repository state, persist job progress, and safely publish reviewed changes through Git.
 
-Lya is designed to work with local LLMs through [Ollama](https://ollama.com/). It also provides local-only process, private-context, state, and environment-diagnostic foundations for future development orchestration.
+The project intentionally favors small, understandable components over a large agent framework.
+
+> Lya is under active development. APIs, commands, and internal architecture may change significantly.
 
 ## Goals
 
-* 🦀 Built in Rust
-* 🧠 Support local LLMs
-* 🛠️ Tool and function calling
-* 🔌 Extensible agent architecture
-* 🏠 Local-first and privacy-friendly
-* ⚡ Lightweight and fast
-* 📖 Easy to understand and extend
+* 🦀 **Rust-first** — small, fast, strongly typed runtime
+* 🏠 **Local-first** — orchestration, state, configuration, and repository access stay on your machine
+* 🧠 **Multiple AI backends** — local models and external AI tools can be integrated behind focused adapters
+* 🛠️ **Tool and function calling** — agents can interact with files, commands, and external systems
+* 🤖 **Autonomous development** — AI supervisors and executors can work together in controlled loops
+* 🔒 **Guarded automation** — repository changes are reviewed and revalidated before publication
+* 🔌 **Extensible architecture** — providers and tools remain replaceable
+* 📖 **Understandable by design** — avoid unnecessary framework complexity
 
 ## Architecture
 
-Lya is built around a modular agent architecture.
+Lya currently has two complementary roles:
 
 ```text
 Lya
-├── Agent
+├── Agent Runtime
 │   ├── LLM
-│   ├── Tools
-│   └── Memory
+│   │   └── Ollama
+│   └── Tools
 │
-└── Providers
-    └── Ollama
+└── Development Orchestration
+    ├── Supervisor
+    │   └── Codex CLI
+    ├── Executor
+    │   └── Claude Code
+    ├── Repository State
+    │   └── Git
+    ├── Publisher
+    │   └── Git
+    └── Local State
+        ├── context.md
+        ├── state.json
+        └── jobs/
 ```
 
-The architecture is intentionally kept simple during the early development stages so that new components can be added without unnecessary complexity.
+The components are intentionally separated:
+
+* the **Supervisor** decides what should happen next;
+* the **Executor** performs development work;
+* Lya independently inspects the repository instead of trusting executor reports;
+* the **Publisher** can commit and push only changes that match the reviewed repository state;
+* persistent state is stored locally so long-running orchestration can later support pause/resume workflows.
+
+The current development workflow uses Codex as the Supervisor and Claude Code as the Executor, but the architecture is designed so implementations can be replaced without rewriting the orchestration core.
 
 ## Requirements
 
+### Base
+
 * Rust
-* Ollama
-* A compatible local LLM
+* Git
+
+### Local agent mode
+
+* [Ollama](https://ollama.com/)
+* a compatible local model
+
+### Development orchestration
+
+* Codex CLI
+* Claude Code
+
+The relevant CLIs must be authenticated independently according to their providers' normal setup.
+
+Lya does not require API keys for its standard Codex/Claude CLI workflow.
 
 ## Getting Started
 
-Clone the repository:
+Clone and build Lya:
 
 ```bash
 git clone https://github.com/Sharkou/Lya.git
 cd Lya
-```
-
-Install and run Ollama, then make sure a compatible model is available.
-
-Build Lya:
-
-```bash
 cargo build
 ```
 
-Run it:
+Run the test suite:
+
+```bash
+cargo test
+```
+
+### Local agent
+
+Start Ollama, make sure a compatible model is installed, then run:
 
 ```bash
 OLLAMA_MODEL=<model> cargo run -- <prompt>
 ```
 
-## Supervisor Development Command
+## Local State
 
-Lya resolves its private local directory from `LYA_HOME`, falling back to `~/.lya`. This directory is outside the repository and contains the required private `context.md`. The Codex Supervisor reads that context, builds a structured request for the current directory, and returns a validated JSON decision. It does not invoke Claude, modify the project, commit, or push.
+Lya stores private runtime data outside the repository.
 
-Check the local prerequisites without contacting an LLM or network service:
+The location is resolved from:
+
+```text
+LYA_HOME
+```
+
+and defaults to:
+
+```text
+~/.lya
+```
+
+The directory currently contains data such as:
+
+```text
+~/.lya/
+├── context.md
+├── state.json
+└── jobs/
+```
+
+`context.md` provides private user/project context to the Supervisor.
+
+**Important:** "private" means that this file is kept outside the project repository. Its relevant content is sent to the configured Supervisor when a request is made. Do not store credentials, API keys, passwords, or other secrets in it.
+
+## Diagnostics
+
+Check the local environment without contacting an LLM:
 
 ```bash
 cargo run -- doctor
 ```
 
-`doctor` reports the resolved `LYA_HOME`, whether `context.md` is readable, and whether `git`, `codex`, and `claude` are available on `PATH`.
+`doctor` reports:
 
-With a Codex CLI installation authenticated through ChatGPT, test the Supervisor from a project directory:
+* the resolved `LYA_HOME`;
+* whether `context.md` is readable;
+* whether Git is available;
+* whether Codex is available;
+* whether Claude Code is available.
+
+Custom executable locations can be supplied with:
+
+```text
+LYA_CODEX_BIN
+LYA_CLAUDE_BIN
+```
+
+Otherwise Lya resolves `codex` and `claude` through `PATH`.
+
+## Supervisor
+
+The Supervisor can be tested independently:
 
 ```bash
 cargo run -- supervisor "Determine the next development step"
 ```
 
-The command requires `context.md`, runs `codex exec` with a strict JSON Schema, removes `OPENAI_API_KEY` from the Codex child process, and prints one of `CLAUDE`, `ACCEPT`, `HUMAN`, or `STOP` as JSON. Set `LYA_CODEX_BIN` to use a Codex executable not available on `PATH`; otherwise Lya invokes `codex`.
+The Codex Supervisor:
 
-## Executor Development Command
+1. loads the local private context;
+2. builds a structured request describing the current task and repository state;
+3. invokes `codex exec`;
+4. requires a structured decision;
+5. validates that decision locally.
 
-The Claude Executor runs independently from the Supervisor. It invokes Claude Code in print mode with JSON output, sending the complete task through stdin so long Supervisor prompts do not depend on the Windows command-line limit. It then prints an `ExecutorResult` containing Claude's final response, session reference, exit code, and any available duration, turn, cost, and usage metadata. It does not connect a Codex decision to Claude, commit, push, or start a daemon.
+A decision is one of:
 
-From the project to work on, run:
+```text
+CLAUDE
+ACCEPT
+HUMAN
+STOP
+```
+
+Their meanings are:
+
+* `CLAUDE` — send additional work to the Executor;
+* `ACCEPT` — the current work is accepted;
+* `HUMAN` — human input is required;
+* `STOP` — stop the current job intentionally.
+
+Lya removes `OPENAI_API_KEY` from the Codex child-process environment so an environment-provided API key is not used accidentally.
+
+## Executor
+
+The Claude Executor can also be tested independently:
 
 ```bash
 cargo run -- executor --max-turns 1 "Summarize this repository without modifying any files"
 ```
 
-The command accepts `--project <path>`, `--resume <session>`, `--browser`, `--timeout-seconds <seconds>`, and `--max-turns <count>`. `--resume` accepts the session reference returned in the preceding JSON result. By default there is no Lya-imposed timeout or turn limit. Set `LYA_CLAUDE_BIN` to use a Claude executable not available on `PATH`; otherwise Lya invokes `claude`.
+Useful options include:
 
-Lya starts Claude Code with `--permission-mode auto --permission-prompts none`: Claude's safety classifier evaluates actions, while actions that would need an unanswered approval are denied. Lya never uses `--dangerously-skip-permissions`. It removes `ANTHROPIC_API_KEY` only from the Claude child process, so the CLI uses its normal Claude subscription authentication and cannot silently fall back to API-key billing.
-
-## Autonomous Development Command
-
-`lya run` connects the Codex Supervisor to the Claude Executor in a single sequential development loop. It requires a readable `context.md` in `LYA_HOME` (or `~/.lya`), a valid Git repository, and a clean working tree at startup. Lya refuses dirty projects rather than mixing pre-existing changes with the autonomous job's changes.
-
-```bash
-cargo run -- run --project C:\Projects\PixelCreator --browser --max-iterations 5 "Fix the current Inspector regression"
+```text
+--project <path>
+--resume <session>
+--browser
+--timeout-seconds <seconds>
+--max-turns <count>
 ```
 
-The command persists each job in `LYA_HOME/state.json` and stores Codex's schema/output files under `LYA_HOME/jobs/<job-id>`. An iteration is one Codex Supervisor review and the optional Claude execution it requests. The default limit is 10 iterations. Before every post-Claude review, Lya collects read-only repository facts (`git status --short`, `git diff --stat`, changed files, `git diff`, and `HEAD`); diffs above 128 KiB are explicitly marked as truncated while retaining the full stat and file list.
+The full task is sent to Claude through stdin instead of being embedded in the command line, allowing large prompts to work reliably across platforms.
 
-`CLAUDE` starts or resumes the recorded Claude session. `ACCEPT` records and prints the proposed commit title, but does not execute Git. `HUMAN` records the question and leaves the job in `WAITING_HUMAN`; `STOP` records the reason and leaves it `STOPPED`. Failures and the iteration limit leave the job `FAILED`. There is no automatic commit, push, daemon, parallel execution, or automatic job-resume command.
+Claude sessions can be resumed using the session reference returned by the previous execution.
 
-> Lya is currently under active development. APIs, architecture and features may change significantly.
+When browser support is enabled, Lya passes the corresponding browser capability to Claude Code. Browser automation itself remains Claude Code's responsibility.
+
+Lya starts Claude Code using its non-interactive permission system and never enables `--dangerously-skip-permissions`.
+
+`ANTHROPIC_API_KEY` is removed from the Claude child-process environment so an environment-provided API key is not used accidentally.
+
+## Autonomous Development
+
+The `run` command connects the Supervisor and Executor into a sequential autonomous-development loop.
+
+For example:
+
+```bash
+cargo run -- run \
+  --project /path/to/project \
+  --browser \
+  --max-iterations 5 \
+  "Fix a small regression and verify the result."
+```
+
+A project must:
+
+* exist;
+* be a Git repository;
+* have a clean working tree when the job starts.
+
+Lya deliberately refuses to start autonomous work on an already dirty repository so pre-existing changes cannot be confused with agent-generated work.
+
+The loop is conceptually:
+
+```text
+Task
+ ↓
+Supervisor
+ ↓
+CLAUDE
+ ↓
+Executor
+ ↓
+Repository inspection
+ ↓
+Supervisor
+ ↓
+CLAUDE / ACCEPT / HUMAN / STOP
+ ↓
+...
+```
+
+One iteration consists of one Supervisor review and the optional Executor invocation requested by that review.
+
+The default maximum is 10 iterations.
+
+Claude sessions are resumed across correction cycles so the Executor retains the context of its previous work.
+
+## Repository Review
+
+Lya independently collects repository state before reviews.
+
+This includes information such as:
+
+```text
+HEAD
+git status --short
+git diff --stat
+changed files
+tracked diff
+untracked files
+```
+
+Untracked files are included explicitly rather than being represented only by `git status`.
+
+For review safety, Lya records:
+
+* paths;
+* file sizes;
+* UTF-8 content when appropriate;
+* Git blobs;
+* binary/non-UTF-8 markers;
+* explicit truncation markers.
+
+Large repository data is bounded before being sent to the Supervisor. Truncation is always reported explicitly rather than hidden.
+
+Binary or insufficiently reviewed states cannot be published automatically.
+
+## Guarded Git Publication
+
+Git publication is opt-in.
+
+Without:
+
+```text
+--publish
+```
+
+an `ACCEPT` decision records the proposed commit title but performs no Git write.
+
+With publication enabled:
+
+```bash
+cargo run -- run \
+  --publish \
+  --project /path/to/project \
+  "Implement and verify a small change."
+```
+
+Lya performs a guarded publication sequence:
+
+```text
+Supervisor ACCEPT
+ ↓
+store reviewed snapshot
+ ↓
+recollect repository state
+ ↓
+verify exact match
+ ↓
+git add --all
+ ↓
+verify staged state
+ ↓
+commit
+ ↓
+push
+ ↓
+verify clean working tree
+```
+
+If the repository changes between review and publication, Lya refuses to publish it.
+
+The staged content is also checked against the reviewed state before the commit is created.
+
+Lya does **not** automatically:
+
+```text
+checkout
+switch
+pull
+merge
+rebase
+reset
+force-push
+```
+
+Normal Git hooks are respected.
+
+A rejected push stops publication instead of attempting to rewrite history or resolve the conflict automatically.
+
+## Git Configuration
+
+Publication requires an explicit Git identity and branch.
+
+Configure:
+
+```text
+LYA_GIT_NAME
+LYA_GIT_EMAIL
+LYA_GIT_BRANCH
+```
+
+The remote can optionally be configured with:
+
+```text
+LYA_GIT_REMOTE
+```
+
+and defaults to:
+
+```text
+origin
+```
+
+For example:
+
+```powershell
+$env:LYA_GIT_NAME = "Automation Bot"
+$env:LYA_GIT_EMAIL = "bot@example.com"
+$env:LYA_GIT_BRANCH = "main"
+$env:LYA_GIT_REMOTE = "origin"
+
+cargo run -- run `
+  --publish `
+  --project C:\Projects\Example `
+  "Implement and verify one small improvement."
+```
+
+The configured branch must already be the current local branch.
+
+Lya applies the configured identity only to the commit it creates. It does not need or persist GitHub credentials.
+
+Push authentication is delegated entirely to the machine's existing Git configuration, such as SSH or a credential manager.
+
+## Sequential Jobs
+
+An accepted job may contain a `next_prompt`.
+
+When publication is enabled and succeeds, Lya can use that prompt to start another sequential job.
+
+```text
+Job 1
+ ↓
+PUBLISHED
+ ↓
+next_prompt
+ ↓
+Job 2
+ ↓
+PUBLISHED
+ ↓
+...
+```
+
+The number of sequential jobs is bounded by:
+
+```text
+--max-jobs <count>
+```
+
+with a default of 10.
+
+A new job starts only after:
+
+* the previous job was accepted;
+* publication succeeded;
+* the push succeeded;
+* the working tree is clean.
+
+Without `--publish`, `next_prompt` is retained and displayed but does not automatically start another job.
+
+## Safety Model
+
+Lya deliberately separates reasoning from repository publication.
+
+The Supervisor does not commit.
+
+The Executor does not own publication.
+
+The Publisher does not use an LLM.
+
+Before publication, Lya checks that what Git is about to commit is the same repository state the Supervisor reviewed.
+
+Lya also avoids giving provider processes unnecessary billing credentials by removing environment-provided API keys from their child-process environments.
+
+These protections reduce accidental autonomous changes, but Lya is experimental software. Run autonomous workflows only in repositories where you understand and accept the risks.
+
+## Current Limitations
+
+Lya currently runs jobs sequentially.
+
+The following are not implemented yet:
+
+* automatic resume after process restart;
+* quota-aware pause and resume;
+* persistent daemon/service mode;
+* background scheduling;
+* parallel jobs;
+* remote administration UI;
+* automatic conflict resolution;
+* GitHub API integration.
 
 ## Roadmap
 
-* [x] Initial Rust project
-* [ ] Ollama integration
-* [ ] Tool calling
-* [ ] Agent loop
-* [ ] Conversation context
-* [ ] Memory system
-* [ ] More LLM providers
-* [ ] Configuration system
-* [ ] Documentation
-* [ ] Stable API
+* [x] Rust agent core
+* [x] Ollama provider
+* [x] Tool and function calling
+* [x] Agent execution loop
+* [x] Structured local process runtime
+* [x] Private local context
+* [x] Persistent job state
+* [x] Codex Supervisor
+* [x] Claude Code Executor
+* [x] Resumable Claude sessions
+* [x] Autonomous Supervisor ↔ Executor loop
+* [x] Independent Git repository review
+* [x] Guarded Git commit and push
+* [x] Sequential multi-job runs
+* [ ] Persisted job/run resume
+* [ ] Quota-aware pause and resume
+* [ ] Daemon/service mode
+* [ ] Remote administration interface
+* [ ] Scheduling and parallel execution
+* [ ] Additional Supervisor and Executor providers
+* [ ] Stable public API
 
 ## Contributing
 
-Lya is an open-source project and contributions are welcome.
+Lya is open source and contributions are welcome.
 
-The project is still in an early stage, so architecture and APIs are expected to evolve.
+The project is still evolving quickly, so architecture and public APIs may change while the autonomous runtime is being stabilized.
+
+When contributing, prefer small, focused changes that preserve Lya's lightweight and understandable architecture.
 
 ## License
 
 Lya is licensed under the MIT License.
 
-This means you are free to use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the software, subject to the terms of the license.
-
-See the [`LICENSE`](LICENSE) file for the full license text.
+See [`LICENSE`](LICENSE) for details.

@@ -10,7 +10,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{home::LyaHome, supervisor::SupervisorDecision};
+use super::{
+    home::LyaHome,
+    publisher::{PublishResult, PublishStage},
+    repository::RepositoryState,
+    supervisor::SupervisorDecision,
+};
 
 static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
@@ -26,6 +31,10 @@ pub enum JobStatus {
     WaitingHuman,
     #[serde(rename = "ACCEPTED")]
     Accepted,
+    #[serde(rename = "PUBLISHING")]
+    Publishing,
+    #[serde(rename = "PUBLISHED")]
+    Published,
     #[serde(rename = "FAILED")]
     Failed,
     #[serde(rename = "STOPPED")]
@@ -38,6 +47,8 @@ pub enum JobPhase {
     Supervisor,
     #[serde(rename = "EXECUTOR")]
     Executor,
+    #[serde(rename = "PUBLISHER")]
+    Publisher,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +63,9 @@ pub struct JobState {
     pub claude_session_id: Option<String>,
     pub last_executor_report: Option<String>,
     pub last_supervisor_decision: Option<SupervisorDecision>,
+    pub accepted_repository_state: Option<RepositoryState>,
+    pub publish_result: Option<PublishResult>,
+    pub publish_stage: Option<PublishStage>,
     pub created_unix_seconds: u64,
     pub last_updated_unix_seconds: u64,
 }
@@ -75,6 +89,9 @@ impl JobState {
             claude_session_id: None,
             last_executor_report: None,
             last_supervisor_decision: None,
+            accepted_repository_state: None,
+            publish_result: None,
+            publish_stage: None,
             created_unix_seconds: now,
             last_updated_unix_seconds: now,
         }

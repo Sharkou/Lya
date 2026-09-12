@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod executor;
 pub mod home;
 pub mod job;
+pub mod publisher;
 pub mod repository;
 pub mod state;
 pub mod supervisor;

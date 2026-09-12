@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fmt,
     path::PathBuf,
+    pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,12 +11,14 @@ use crate::process::{ProcessRunner, SystemProcessRunner};
 
 use super::{
     executor::{Executor, ExecutorError, ExecutorRequest, ExecutorSession},
+    publisher::{PublishError, PublishProgress, PublishRequest, PublishStage, Publisher},
     repository::{RepositoryError, RepositoryState},
     state::{JobPhase, JobState, JobStatus, StateError, StateStore},
     supervisor::{Project, Supervisor, SupervisorDecision, SupervisorError, SupervisorRequest},
 };
 
 pub const DEFAULT_MAX_ITERATIONS: u32 = 10;
+pub const DEFAULT_MAX_JOBS: u32 = 10;
 
 static NEXT_JOB_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -27,29 +30,40 @@ pub struct NewJob {
     pub private_context: String,
 }
 
-pub struct AutonomousOrchestrator<S, E, R = SystemProcessRunner> {
+pub struct AutonomousOrchestrator<S, E, R = SystemProcessRunner, P = ()> {
     supervisor: S,
     executor: E,
     repository_runner: R,
     state_store: StateStore,
+    publisher: P,
     max_iterations: u32,
+    max_jobs: u32,
     browser: bool,
 }
 
-impl<S, E, R> AutonomousOrchestrator<S, E, R> {
+impl<S, E, R> AutonomousOrchestrator<S, E, R, ()> {
     pub fn new(supervisor: S, executor: E, repository_runner: R, state_store: StateStore) -> Self {
         Self {
             supervisor,
             executor,
             repository_runner,
             state_store,
+            publisher: (),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_jobs: DEFAULT_MAX_JOBS,
             browser: false,
         }
     }
+}
 
+impl<S, E, R, P> AutonomousOrchestrator<S, E, R, P> {
     pub fn with_max_iterations(mut self, max_iterations: u32) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    pub fn with_max_jobs(mut self, max_jobs: u32) -> Self {
+        self.max_jobs = max_jobs;
         self
     }
 
@@ -57,9 +71,24 @@ impl<S, E, R> AutonomousOrchestrator<S, E, R> {
         self.browser = browser;
         self
     }
+
+    pub fn with_publisher<Q>(self, publisher: Q) -> AutonomousOrchestrator<S, E, R, Q> {
+        AutonomousOrchestrator {
+            supervisor: self.supervisor,
+            executor: self.executor,
+            repository_runner: self.repository_runner,
+            state_store: self.state_store,
+            publisher,
+            max_iterations: self.max_iterations,
+            max_jobs: self.max_jobs,
+            browser: self.browser,
+        }
+    }
 }
 
-impl<S: Supervisor, E: Executor, R: ProcessRunner> AutonomousOrchestrator<S, E, R> {
+impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher>
+    AutonomousOrchestrator<S, E, R, P>
+{
     pub async fn run(&self, request: NewJob) -> Result<JobState, OrchestrationError> {
         if request.task.trim().is_empty() {
             return Err(OrchestrationError::InvalidTransition(
@@ -79,6 +108,11 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner> AutonomousOrchestrator<S, E, 
         if self.max_iterations == 0 {
             return Err(OrchestrationError::InvalidTransition(
                 "max iterations must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_jobs == 0 {
+            return Err(OrchestrationError::InvalidTransition(
+                "max jobs must be greater than zero".to_owned(),
             ));
         }
 
@@ -185,11 +219,69 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner> AutonomousOrchestrator<S, E, 
                         }
                     };
                 }
-                SupervisorDecision::Accept { .. } => {
+                SupervisorDecision::Accept { commit_title, .. } => {
                     job.status = JobStatus::Accepted;
+                    job.accepted_repository_state = Some(repository_state.clone());
                     job.touch();
                     self.persist(&job)?;
-                    return Ok(job);
+                    if !self.publisher.is_enabled() {
+                        return Ok(job);
+                    }
+
+                    job.status = JobStatus::Publishing;
+                    job.phase = JobPhase::Publisher;
+                    job.touch();
+                    self.persist(&job)?;
+                    let publish = {
+                        let mut progress = JobPublicationProgress {
+                            job: &mut job,
+                            state_store: &self.state_store,
+                        };
+                        self.publisher
+                            .publish(
+                                PublishRequest {
+                                    project_path: progress.job.project_path.clone(),
+                                    accepted_repository_state: repository_state,
+                                    commit_title,
+                                },
+                                &mut progress,
+                            )
+                            .await
+                    };
+                    match publish {
+                        Ok(result) => {
+                            job.publish_result = Some(result);
+                            let post_commit_state = match RepositoryState::collect(
+                                &self.repository_runner,
+                                &job.project_path,
+                            )
+                            .await
+                            {
+                                Ok(state) => state,
+                                Err(error) => {
+                                    self.fail(&mut job)?;
+                                    return Err(OrchestrationError::Repository(error));
+                                }
+                            };
+                            if !post_commit_state.is_clean() {
+                                self.fail(&mut job)?;
+                                return Err(OrchestrationError::PostCommitWorkingTreeDirty(
+                                    job.project_path.clone(),
+                                ));
+                            }
+                            job.status = JobStatus::Published;
+                            job.touch();
+                            self.persist(&job)?;
+                            return Ok(job);
+                        }
+                        Err(error) => {
+                            if let PublishError::PushRejected(result) = &error {
+                                job.publish_result = Some(result.clone());
+                            }
+                            self.fail(&mut job)?;
+                            return Err(OrchestrationError::Publish(error));
+                        }
+                    }
                 }
                 SupervisorDecision::Human { .. } => {
                     job.status = JobStatus::WaitingHuman;
@@ -204,6 +296,45 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner> AutonomousOrchestrator<S, E, 
                     return Ok(job);
                 }
             }
+        }
+    }
+
+    pub async fn run_sequential(&self, request: NewJob) -> Result<RunResult, OrchestrationError> {
+        if self.max_jobs == 0 {
+            return Err(OrchestrationError::InvalidTransition(
+                "max jobs must be greater than zero".to_owned(),
+            ));
+        }
+        let mut jobs = Vec::new();
+        let mut current_request = request;
+        loop {
+            if jobs.len() as u32 >= self.max_jobs {
+                return Ok(RunResult {
+                    jobs,
+                    max_jobs_reached: true,
+                });
+            }
+            let job = self.run(current_request.clone()).await?;
+            let next_prompt = match &job.last_supervisor_decision {
+                Some(SupervisorDecision::Accept {
+                    next_prompt: Some(next_prompt),
+                    ..
+                }) if job.status == JobStatus::Published => Some(next_prompt.clone()),
+                _ => None,
+            };
+            jobs.push(job);
+            let Some(task) = next_prompt else {
+                return Ok(RunResult {
+                    jobs,
+                    max_jobs_reached: false,
+                });
+            };
+            current_request = NewJob {
+                job_id: new_job_id(),
+                project: current_request.project,
+                task,
+                private_context: current_request.private_context,
+            };
         }
     }
 
@@ -222,6 +353,48 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner> AutonomousOrchestrator<S, E, 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunResult {
+    pub jobs: Vec<JobState>,
+    pub max_jobs_reached: bool,
+}
+
+impl Publisher for () {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+
+    fn publish<'a>(
+        &'a self,
+        _request: PublishRequest,
+        _progress: &'a mut dyn PublishProgress,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<super::publisher::PublishResult, PublishError>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(PublishError::PublishingDisabled) })
+    }
+}
+
+struct JobPublicationProgress<'a> {
+    job: &'a mut JobState,
+    state_store: &'a StateStore,
+}
+
+impl PublishProgress for JobPublicationProgress<'_> {
+    fn record(&mut self, stage: PublishStage) -> Result<(), PublishError> {
+        self.job.publish_stage = Some(stage);
+        self.job.touch();
+        let mut state = self
+            .state_store
+            .load()
+            .map_err(|error| PublishError::ProgressPersistence(error.to_string()))?;
+        state.upsert(self.job.clone());
+        self.state_store
+            .save(&state)
+            .map_err(|error| PublishError::ProgressPersistence(error.to_string()))
+    }
+}
+
 pub fn new_job_id() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -237,6 +410,8 @@ pub enum OrchestrationError {
     Executor(ExecutorError),
     Repository(RepositoryError),
     RepositoryDirty(PathBuf),
+    PostCommitWorkingTreeDirty(PathBuf),
+    Publish(PublishError),
     State(StateError),
     IterationLimit { limit: u32 },
     InvalidTransition(String),
@@ -253,6 +428,12 @@ impl fmt::Display for OrchestrationError {
                 "refusing to start job because the working tree is not clean: {}",
                 path.display()
             ),
+            Self::PostCommitWorkingTreeDirty(path) => write!(
+                formatter,
+                "working tree is not clean after publishing: {}",
+                path.display()
+            ),
+            Self::Publish(error) => write!(formatter, "publication error: {error}"),
             Self::State(error) => write!(formatter, "state error: {error}"),
             Self::IterationLimit { limit } => write!(
                 formatter,
@@ -269,6 +450,7 @@ impl Error for OrchestrationError {
             Self::Supervisor(error) => Some(error),
             Self::Executor(error) => Some(error),
             Self::Repository(error) => Some(error),
+            Self::Publish(error) => Some(error),
             Self::State(error) => Some(error),
             _ => None,
         }
@@ -281,8 +463,10 @@ mod tests {
         collections::VecDeque,
         fs,
         future::Future,
-        path::PathBuf,
+        path::{Path, PathBuf},
         pin::Pin,
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
         sync::{Arc, Mutex},
     };
 
@@ -291,13 +475,20 @@ mod tests {
         orchestrator::{
             executor::{Executor, ExecutorError, ExecutorRequest, ExecutorResult, ExecutorSession},
             home::LyaHome,
+            publisher::{
+                GitPublishConfig, GitPublisher, PublishError, PublishProgress, PublishRequest,
+                PublishResult, PublishStage, Publisher, PushStatus,
+            },
+            repository::RepositoryState,
             state::{JobStatus, StateStore},
             supervisor::{
                 Project, Supervisor, SupervisorDecision, SupervisorError, SupervisorRequest,
             },
         },
-        process::{ProcessError, ProcessOutput, ProcessRunner, ProcessSpec},
+        process::{ProcessError, ProcessOutput, ProcessRunner, ProcessSpec, SystemProcessRunner},
     };
+
+    static NEXT_GIT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone)]
     struct FakeSupervisor {
@@ -380,6 +571,18 @@ mod tests {
                 {
                     "true\n"
                 }
+                [command, argument] if command == "rev-parse" && argument == "--show-toplevel" => {
+                    return Box::pin(async move {
+                        Ok(ProcessOutput {
+                            exit_code: Some(0),
+                            stdout: format!(
+                                "{}\n",
+                                spec.cwd.expect("Git cwd should be set").display()
+                            ),
+                            stderr: String::new(),
+                        })
+                    });
+                }
                 [command, argument] if command == "rev-parse" && argument == "HEAD" => "abc123\n",
                 [command, argument] if command == "status" && argument == "--short" => {
                     if self.dirty { " M hello.txt\n" } else { "" }
@@ -393,6 +596,14 @@ mod tests {
                 [command, argument] if command == "diff" && argument == "--no-ext-diff" => {
                     "diff --git a/hello.txt b/hello.txt\n"
                 }
+                [command, first, second, third]
+                    if command == "ls-files"
+                        && first == "--others"
+                        && second == "--exclude-standard"
+                        && third == "-z" =>
+                {
+                    ""
+                }
                 _ => panic!("unexpected Git invocation: {:?}", spec.args),
             };
             Box::pin(async move {
@@ -402,6 +613,52 @@ mod tests {
                     stderr: String::new(),
                 })
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakePublisher {
+        results: Arc<Mutex<VecDeque<Result<PublishResult, PublishError>>>>,
+        requests: Arc<Mutex<Vec<PublishRequest>>>,
+    }
+
+    impl FakePublisher {
+        fn new(results: Vec<Result<PublishResult, PublishError>>) -> Self {
+            Self {
+                results: Arc::new(Mutex::new(results.into())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Publisher for FakePublisher {
+        fn publish<'a>(
+            &'a self,
+            request: PublishRequest,
+            _progress: &'a mut dyn PublishProgress,
+        ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>>
+        {
+            self.requests
+                .lock()
+                .expect("publisher request lock")
+                .push(request);
+            let result = self
+                .results
+                .lock()
+                .expect("publisher result lock")
+                .pop_front()
+                .expect("a publisher result should be queued");
+            Box::pin(async move { result })
+        }
+    }
+
+    fn published_result(title: &str) -> PublishResult {
+        PublishResult {
+            commit_sha: format!("sha-{title}"),
+            commit_title: title.to_owned(),
+            remote: "origin".to_owned(),
+            branch: "main".to_owned(),
+            push_status: PushStatus::Pushed,
         }
     }
 
@@ -474,6 +731,7 @@ mod tests {
 
         assert_eq!(result.status, JobStatus::Accepted);
         assert_eq!(result.claude_session_id.as_deref(), Some("session-1"));
+        assert!(result.accepted_repository_state.is_some());
         assert!(
             matches!(result.last_supervisor_decision, Some(SupervisorDecision::Accept { ref commit_title, .. }) if commit_title == "Update hello")
         );
@@ -723,5 +981,313 @@ mod tests {
         assert!(matches!(error, OrchestrationError::RepositoryDirty(_)));
         assert!(requests.lock().expect("supervisor request lock").is_empty());
         fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn sequential_run_starts_next_job_only_after_successful_publication() {
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Implement task one.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Complete task one".to_owned(),
+                next_prompt: Some("task two".to_owned()),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Claude {
+                prompt: "Implement task two.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Complete task two".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let supervisor_requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![
+            Ok(claude_result(Some("session-1"), "Task one complete.")),
+            Ok(claude_result(Some("session-2"), "Task two complete.")),
+        ]);
+        let publisher = FakePublisher::new(vec![
+            Ok(published_result("Complete task one")),
+            Ok(published_result("Complete task two")),
+        ]);
+        let publish_requests = publisher.requests.clone();
+        let directory = home("sequential");
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            executor,
+            FakeGitRunner { dirty: false },
+            StateStore::new(&LyaHome::from_path(&directory)),
+        )
+        .with_publisher(publisher)
+        .run_sequential(job_request())
+        .await
+        .expect("sequential run should finish");
+
+        assert_eq!(result.jobs.len(), 2);
+        assert!(!result.max_jobs_reached);
+        assert!(
+            result
+                .jobs
+                .iter()
+                .all(|job| job.status == JobStatus::Published)
+        );
+        assert_eq!(
+            publish_requests
+                .lock()
+                .expect("publisher request lock")
+                .len(),
+            2
+        );
+        assert_eq!(
+            supervisor_requests.lock().expect("supervisor request lock")[2].task,
+            "task two"
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn publication_failure_never_creates_next_job() {
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Implement.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "First".to_owned(),
+                next_prompt: Some("must not start".to_owned()),
+                reason: None,
+            }),
+        ]);
+        let supervisor_requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![Ok(claude_result(Some("session-1"), "Complete."))]);
+        let publisher = FakePublisher::new(vec![Err(PublishError::RepositoryChangedAfterReview)]);
+        let directory = home("publish-failure");
+
+        let error = AutonomousOrchestrator::new(
+            supervisor,
+            executor,
+            FakeGitRunner { dirty: false },
+            StateStore::new(&LyaHome::from_path(&directory)),
+        )
+        .with_publisher(publisher)
+        .run_sequential(job_request())
+        .await
+        .expect_err("publish failure should stop the run");
+
+        assert!(matches!(error, OrchestrationError::Publish(_)));
+        assert_eq!(
+            supervisor_requests
+                .lock()
+                .expect("supervisor request lock")
+                .len(),
+            2
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn sequential_run_stops_cleanly_at_max_jobs() {
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Implement.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "First".to_owned(),
+                next_prompt: Some("next task".to_owned()),
+                reason: None,
+            }),
+        ]);
+        let executor = FakeExecutor::new(vec![Ok(claude_result(Some("session-1"), "Complete."))]);
+        let publisher = FakePublisher::new(vec![Ok(published_result("First"))]);
+        let directory = home("max-jobs");
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            executor,
+            FakeGitRunner { dirty: false },
+            StateStore::new(&LyaHome::from_path(&directory)),
+        )
+        .with_publisher(publisher)
+        .with_max_jobs(1)
+        .run_sequential(job_request())
+        .await
+        .expect("max jobs is a normal run stop");
+
+        assert_eq!(result.jobs.len(), 1);
+        assert!(result.max_jobs_reached);
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[derive(Clone)]
+    struct WritingExecutor {
+        project_path: PathBuf,
+    }
+
+    impl Executor for WritingExecutor {
+        fn execute(
+            &self,
+            _request: ExecutorRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ExecutorResult, ExecutorError>> + Send + '_>>
+        {
+            let project_path = self.project_path.clone();
+            Box::pin(async move {
+                fs::write(project_path.join("hello.txt"), "hello\nLYA_PUBLISH_OK\n")
+                    .expect("executor test change should be written");
+                Ok(claude_result(
+                    Some("test-session"),
+                    "Added and verified LYA_PUBLISH_OK.",
+                ))
+            })
+        }
+    }
+
+    fn git(path: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(path)
+            .output()
+            .expect("Git should start");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("Git stdout should be UTF-8")
+    }
+
+    fn local_publish_repository() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "lya-job-publish-test-{}-{}",
+            std::process::id(),
+            NEXT_GIT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let work = root.join("work");
+        let remote = root.join("remote.git");
+        fs::create_dir_all(&work).expect("work directory should be created");
+        git(&work, &["init", "--initial-branch", "main"]);
+        fs::write(work.join("hello.txt"), "hello\n").expect("initial file should be written");
+        git(&work, &["add", "hello.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=Initial",
+                "-c",
+                "user.email=initial@example.com",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        );
+        git(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "--initial-branch",
+                "main",
+                remote.to_str().expect("remote path should be UTF-8"),
+            ],
+        );
+        git(
+            &work,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path should be UTF-8"),
+            ],
+        );
+        git(&work, &["push", "origin", "main"]);
+        (work, remote)
+    }
+
+    #[tokio::test]
+    async fn local_end_to_end_review_execution_commit_and_push_succeeds() {
+        let (work, remote) = local_publish_repository();
+        let state_home = home("local-end-to-end");
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Add one line containing LYA_PUBLISH_OK to hello.txt and verify it."
+                    .to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Add LYA publish marker".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let publisher = GitPublisher::new(
+            GitPublishConfig::new("Test Publisher", "publisher@example.com", "origin", "main")
+                .expect("test publisher configuration should be valid"),
+        );
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            WritingExecutor {
+                project_path: work.clone(),
+            },
+            SystemProcessRunner,
+            StateStore::new(&LyaHome::from_path(&state_home)),
+        )
+        .with_publisher(publisher)
+        .run_sequential(NewJob {
+            job_id: "local-end-to-end".to_owned(),
+            project: Project {
+                name: "local-end-to-end".to_owned(),
+                path: work.clone(),
+            },
+            task: "Add one line containing LYA_PUBLISH_OK to hello.txt and verify it.".to_owned(),
+            private_context: "Test context.".to_owned(),
+        })
+        .await
+        .expect("local end-to-end run should succeed");
+
+        let job = result.jobs.last().expect("one job should have run");
+        assert_eq!(job.status, JobStatus::Published);
+        assert_eq!(
+            fs::read_to_string(work.join("hello.txt")).expect("file should be readable"),
+            "hello\nLYA_PUBLISH_OK\n"
+        );
+        let publication = job
+            .publish_result
+            .as_ref()
+            .expect("publication should persist");
+        assert_eq!(job.publish_stage, Some(PublishStage::Pushed));
+        assert_eq!(publication.commit_title, "Add LYA publish marker");
+        assert_eq!(publication.push_status, PushStatus::Pushed);
+        assert_eq!(
+            git(&work, &["show", "-s", "--format=%B", "HEAD"]),
+            "Add LYA publish marker\n\n"
+        );
+        assert_eq!(
+            git(
+                remote.parent().expect("remote parent should exist"),
+                &[
+                    "--git-dir",
+                    remote.to_str().expect("remote path should be UTF-8"),
+                    "rev-parse",
+                    "main"
+                ],
+            )
+            .trim(),
+            publication.commit_sha
+        );
+        assert!(
+            RepositoryState::collect(&SystemProcessRunner, &work)
+                .await
+                .expect("final state should collect")
+                .is_clean()
+        );
+        fs::remove_dir_all(work.parent().expect("work should have parent"))
+            .expect("Git test directory should be removed");
+        fs::remove_dir_all(state_home).expect("state home should be removed");
     }
 }

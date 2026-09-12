@@ -8,6 +8,7 @@ use lya::{
         executor::{ClaudeCliExecutor, Executor, ExecutorRequest, ExecutorSession},
         home::LyaHome,
         job::{AutonomousOrchestrator, NewJob, new_job_id},
+        publisher::{GitPublishConfig, GitPublisher},
         state::JobStatus,
         supervisor::{
             CodexCliSupervisor, Project, Supervisor, SupervisorDecision, SupervisorRequest,
@@ -89,11 +90,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
-    let (project_path, browser, max_iterations, task) = match parse_run_arguments(arguments) {
+    let (project_path, browser, max_iterations, max_jobs, publish, task) = match parse_run_arguments(
+        arguments,
+    ) {
         Ok(options) => options,
         Err(error) => {
             eprintln!(
-                "{error}\nUsage: lya run [--project <path>] [--browser] [--max-iterations <count>] <task>"
+                "{error}\nUsage: lya run [--project <path>] [--browser] [--max-iterations <count>] [--publish] [--max-jobs <count>] <task>"
             );
             return ExitCode::FAILURE;
         }
@@ -118,39 +121,70 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
         path: project_path,
     };
     println!(
-        "Starting job {} for {} (maximum {} iterations).",
+        "Starting job {} for {} (maximum {} iterations, maximum {} jobs{}).",
         job_id,
         project.path.display(),
-        max_iterations
+        max_iterations,
+        max_jobs,
+        if publish { ", publication enabled" } else { "" }
     );
 
-    let orchestrator = AutonomousOrchestrator::new(
-        CodexCliSupervisor::new_for_job(home.path(), &job_id),
-        ClaudeCliExecutor::new(),
-        SystemProcessRunner,
-        lya::orchestrator::state::StateStore::new(&home),
-    )
-    .with_max_iterations(max_iterations)
-    .with_browser(browser);
-    let result = orchestrator
-        .run(NewJob {
-            job_id: job_id.clone(),
-            project,
-            task,
-            private_context,
-        })
-        .await;
+    let request = NewJob {
+        job_id: job_id.clone(),
+        project,
+        task,
+        private_context,
+    };
+    let result = if publish {
+        let configuration = match GitPublishConfig::from_environment() {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                eprintln!("Could not configure Git publication: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        AutonomousOrchestrator::new(
+            CodexCliSupervisor::new_for_job(home.path(), &job_id),
+            ClaudeCliExecutor::new(),
+            SystemProcessRunner,
+            lya::orchestrator::state::StateStore::new(&home),
+        )
+        .with_max_iterations(max_iterations)
+        .with_max_jobs(max_jobs)
+        .with_browser(browser)
+        .with_publisher(GitPublisher::new(configuration))
+        .run_sequential(request)
+        .await
+    } else {
+        AutonomousOrchestrator::new(
+            CodexCliSupervisor::new_for_job(home.path(), &job_id),
+            ClaudeCliExecutor::new(),
+            SystemProcessRunner,
+            lya::orchestrator::state::StateStore::new(&home),
+        )
+        .with_max_iterations(max_iterations)
+        .with_max_jobs(max_jobs)
+        .with_browser(browser)
+        .run_sequential(request)
+        .await
+    };
 
     match result {
-        Ok(job) => {
+        Ok(run) => {
+            let job = run
+                .jobs
+                .last()
+                .expect("a run always contains its first job");
             println!("Job {} finished with status {:?}.", job.job_id, job.status);
-            match job.last_supervisor_decision {
+            match &job.last_supervisor_decision {
                 Some(SupervisorDecision::Accept {
                     commit_title,
                     next_prompt,
                     ..
                 }) => {
-                    println!("Commit title (not executed): {commit_title}");
+                    if job.status == JobStatus::Accepted {
+                        println!("Commit title (not executed): {commit_title}");
+                    }
                     if let Some(next_prompt) = next_prompt {
                         println!("Next prompt: {next_prompt}");
                     }
@@ -159,10 +193,14 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
                 | Some(SupervisorDecision::Stop { reason }) => println!("{reason}"),
                 Some(SupervisorDecision::Claude { .. }) | None => {}
             }
+            if run.max_jobs_reached {
+                println!("Run stopped after reaching the configured maximum of {max_jobs} jobs.");
+            }
             match job.status {
-                JobStatus::Accepted | JobStatus::WaitingHuman | JobStatus::Stopped => {
-                    ExitCode::SUCCESS
-                }
+                JobStatus::Accepted
+                | JobStatus::Published
+                | JobStatus::WaitingHuman
+                | JobStatus::Stopped => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
             }
         }
@@ -341,10 +379,12 @@ fn parse_executor_arguments(
 
 fn parse_run_arguments(
     arguments: &[String],
-) -> Result<(std::path::PathBuf, bool, u32, String), String> {
+) -> Result<(std::path::PathBuf, bool, u32, u32, bool, String), String> {
     let mut project_path = env::current_dir().map_err(|error| error.to_string())?;
     let mut browser = false;
     let mut max_iterations = lya::orchestrator::job::DEFAULT_MAX_ITERATIONS;
+    let mut max_jobs = lya::orchestrator::job::DEFAULT_MAX_JOBS;
+    let mut publish = false;
     let mut task = Vec::new();
     let mut position = 0;
 
@@ -358,6 +398,7 @@ fn parse_run_arguments(
                     .ok_or_else(|| "--project requires a path".to_owned())?;
             }
             "--browser" => browser = true,
+            "--publish" => publish = true,
             "--max-iterations" => {
                 position += 1;
                 max_iterations = arguments
@@ -367,6 +408,17 @@ fn parse_run_arguments(
                     .map_err(|_| "--max-iterations must be an unsigned integer".to_owned())?;
                 if max_iterations == 0 {
                     return Err("--max-iterations must be greater than zero".to_owned());
+                }
+            }
+            "--max-jobs" => {
+                position += 1;
+                max_jobs = arguments
+                    .get(position)
+                    .ok_or_else(|| "--max-jobs requires a number".to_owned())?
+                    .parse::<u32>()
+                    .map_err(|_| "--max-jobs must be an unsigned integer".to_owned())?;
+                if max_jobs == 0 {
+                    return Err("--max-jobs must be greater than zero".to_owned());
                 }
             }
             argument if argument.starts_with("--") => {
@@ -383,7 +435,14 @@ fn parse_run_arguments(
     let project_path = project_path
         .canonicalize()
         .map_err(|error| format!("could not resolve project path: {error}"))?;
-    Ok((project_path, browser, max_iterations, task.join(" ")))
+    Ok((
+        project_path,
+        browser,
+        max_iterations,
+        max_jobs,
+        publish,
+        task.join(" "),
+    ))
 }
 
 fn project_name(path: &Path) -> String {
@@ -455,11 +514,36 @@ mod tests {
             "the regression".to_owned(),
         ];
 
-        let (_, browser, max_iterations, task) = parse_run_arguments(&arguments)
+        let (_, browser, max_iterations, max_jobs, publish, task) = parse_run_arguments(&arguments)
             .expect("arguments should parse from the current project");
 
         assert!(browser);
         assert_eq!(max_iterations, 5);
+        assert_eq!(max_jobs, lya::orchestrator::job::DEFAULT_MAX_JOBS);
+        assert!(!publish);
         assert_eq!(task, "Fix the regression");
+    }
+
+    #[test]
+    fn parses_explicit_publish_and_max_jobs_options() {
+        let arguments = vec![
+            "--publish".to_owned(),
+            "--max-jobs".to_owned(),
+            "3".to_owned(),
+            "Publish".to_owned(),
+            "this".to_owned(),
+        ];
+
+        let (_, browser, max_iterations, max_jobs, publish, task) = parse_run_arguments(&arguments)
+            .expect("arguments should parse from the current project");
+
+        assert!(!browser);
+        assert_eq!(
+            max_iterations,
+            lya::orchestrator::job::DEFAULT_MAX_ITERATIONS
+        );
+        assert_eq!(max_jobs, 3);
+        assert!(publish);
+        assert_eq!(task, "Publish this");
     }
 }
