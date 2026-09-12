@@ -62,9 +62,9 @@ Run it:
 OLLAMA_MODEL=<model> cargo run -- <prompt>
 ```
 
-## Local Orchestration Foundations
+## Supervisor Development Command
 
-Lya resolves its private local directory from `LYA_HOME`, falling back to `~/.lya`. This directory is outside the repository and may contain a private `context.md` and the future orchestrator state file `state.json`.
+Lya resolves its private local directory from `LYA_HOME`, falling back to `~/.lya`. This directory is outside the repository and contains the required private `context.md`. The Codex Supervisor reads that context, builds a structured request for the current directory, and returns a validated JSON decision. It does not invoke Claude, modify the project, commit, or push.
 
 Check the local prerequisites without contacting an LLM or network service:
 
@@ -74,7 +74,15 @@ cargo run -- doctor
 
 `doctor` reports the resolved `LYA_HOME`, whether `context.md` is readable, and whether `git`, `codex`, and `claude` are available on `PATH`.
 
-The Codex/Claude execution loop, automated Git operations, quota handling, and a daemon are not implemented yet.
+With a Codex CLI installation authenticated through ChatGPT, test the Supervisor from a project directory:
+
+```bash
+cargo run -- supervisor "Determine the next development step"
+```
+
+The command requires `context.md`, runs `codex exec` with a strict JSON Schema, removes `OPENAI_API_KEY` from the Codex child process, and prints one of `CLAUDE`, `ACCEPT`, `HUMAN`, or `STOP` as JSON.
+
+The Claude execution loop, automated Git operations, quota handling, and a daemon are not implemented yet.
 
 > Lya is currently under active development. APIs, architecture and features may change significantly.
 

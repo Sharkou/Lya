@@ -48,9 +48,13 @@ impl ProcessSpec {
             command.stdin(Stdio::piped());
         }
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| ProcessError::Start(error.to_string()))?;
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProcessError::ExecutableMissing(error.to_string())
+            } else {
+                ProcessError::Start(error.to_string())
+            }
+        })?;
         let stdin = child.stdin.take();
         let input = self.stdin.clone();
         let collect = async move {
@@ -98,8 +102,9 @@ pub struct ProcessOutput {
     pub stderr: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ProcessError {
+    ExecutableMissing(String),
     Start(String),
     Stdin(String),
     Wait(String),
@@ -109,6 +114,12 @@ pub enum ProcessError {
 impl fmt::Display for ProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ExecutableMissing(error) => {
+                write!(
+                    formatter,
+                    "could not start process: executable was not found: {error}"
+                )
+            }
             Self::Start(error) => write!(formatter, "could not start process: {error}"),
             Self::Stdin(error) => write!(formatter, "could not write process stdin: {error}"),
             Self::Wait(error) => write!(formatter, "could not wait for process: {error}"),
