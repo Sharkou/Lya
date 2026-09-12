@@ -357,10 +357,7 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
                 heading("JOB"),
                 event.project_name
             ));
-            output.push_str(&detail(&format!(
-                "{} (iteration limit pending)",
-                truncate(task, 180)
-            )));
+            output.push_str(&detail(&truncate(task, 180)));
         }
         JobEventKind::JobFinished { status } => {
             output.push_str(&format!(
@@ -395,25 +392,25 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
                 output.push_str(&detail(&format!("commit: {commit_title}")));
             }
             if let Some(prompt) = prompt {
-                output.push_str(&detail(&format!("Claude: {}", truncate(prompt, 360))));
+                if mode == HumanRenderMode::Verbose {
+                    output.push_str(&full(&format!("Claude prompt:\n{prompt}")));
+                } else {
+                    output.push_str(&detail(&format!("Claude: {}", truncate(prompt, 360))));
+                }
             }
             if let Some(next_prompt) = next_prompt {
                 output.push_str(&detail(&format!("next: {}", truncate(next_prompt, 360))));
             }
-            if mode == HumanRenderMode::Verbose
-                && let Some(prompt) = prompt
-            {
-                output.push_str(&full(&format!("Claude prompt:\n{prompt}")));
-            }
         }
-        JobEventKind::ExecutorStarted { prompt, session_id } => {
+        JobEventKind::ExecutorStarted {
+            prompt: _,
+            session_id,
+        } => {
             output.push_str(&format!("{timestamp}  {}\n", heading("CLAUDE")));
             if let Some(session_id) = session_id {
                 output.push_str(&detail(&format!("resuming session {session_id}")));
-            }
-            output.push_str(&detail(&truncate(prompt, 360)));
-            if mode == HumanRenderMode::Verbose {
-                output.push_str(&full(prompt));
+            } else {
+                output.push_str(&detail("starting requested execution"));
             }
         }
         JobEventKind::ExecutorFinished {
@@ -428,7 +425,6 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
             if let Some(session_id) = session_id {
                 output.push_str(&detail(&format!("session {session_id}")));
             }
-            output.push_str(&detail(&truncate(final_response, 360)));
             if mode == HumanRenderMode::Verbose {
                 if let Some(duration_ms) = duration_ms {
                     output.push_str(&detail(&format!("reported duration: {duration_ms} ms")));
@@ -440,6 +436,8 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
                     output.push_str(&detail(&format!("reported cost: ${total_cost_usd:.4}")));
                 }
                 output.push_str(&full(final_response));
+            } else {
+                output.push_str(&detail(&truncate_response(final_response, 360)));
             }
         }
         JobEventKind::RepositoryCaptured { summary } => {
@@ -449,19 +447,22 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
                 short_sha(&summary.head),
                 if summary.clean { "clean" } else { "dirty" }
             )));
-            let paths = summary
-                .changed_paths
-                .iter()
-                .chain(summary.untracked_paths.iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            if !paths.is_empty() {
-                output.push_str(&detail(&paths.join(", ")));
+            if !summary.changed_paths.is_empty() {
+                output.push_str(&detail(&format!(
+                    "tracked: {}",
+                    summary.changed_paths.join(", ")
+                )));
+            }
+            if !summary.untracked_paths.is_empty() {
+                output.push_str(&detail(&format!(
+                    "untracked: {}",
+                    summary.untracked_paths.join(", ")
+                )));
             }
             if !summary.diff_stat.trim().is_empty() {
-                output.push_str(&detail(&truncate(
-                    &summary.diff_stat.replace('\n', "; "),
-                    360,
+                output.push_str(&detail(&format!(
+                    "tracked diff: {}",
+                    truncate(&summary.diff_stat.replace('\n', "; "), 360)
                 )));
             }
             if summary.diff_truncated || summary.untracked_truncated {
@@ -550,6 +551,16 @@ fn truncate(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect::<String>() + "..."
 }
 
+fn truncate_response(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        return value.to_owned();
+    }
+    format!(
+        "{}... (use --verbose for full response)",
+        value.chars().take(maximum).collect::<String>()
+    )
+}
+
 fn indent(value: &str, prefix: &str) -> String {
     value
         .lines()
@@ -597,7 +608,7 @@ mod tests {
 
     use super::{
         CompositeEventSink, EventSink, HumanEventSink, HumanRenderMode, JobEvent, JobEventKind,
-        JsonEventSink, JsonlEventSink, RepositorySummary,
+        JsonEventSink, JsonlEventSink, RepositorySummary, render_human,
     };
     use crate::orchestrator::supervisor::Project;
 
@@ -686,7 +697,7 @@ mod tests {
                 head: "abcdef123".to_owned(),
                 clean: false,
                 changed_paths: vec!["README.md".to_owned()],
-                untracked_paths: Vec::new(),
+                untracked_paths: vec!["app.js".to_owned(), "app.test.js".to_owned()],
                 binary_untracked_paths: Vec::new(),
                 diff_stat: " README.md | 1 +\n".to_owned(),
                 diff_truncated: true,
@@ -700,16 +711,21 @@ mod tests {
             .emit(&event)
             .expect("renderer should write");
         let output = String::from_utf8(output).expect("output should be UTF-8");
-        assert!(output.contains("README.md"));
+        assert!(output.contains("tracked: README.md"));
+        assert!(output.contains("untracked: app.js, app.test.js"));
+        assert!(output.contains("tracked diff:"));
         assert!(!output.contains("diff --git"));
     }
 
     #[test]
     fn verbose_renderer_exposes_explicit_prompt() {
         let prompt = format!("{} tail-visible-only-in-verbose", "x".repeat(360));
-        let event = event(JobEventKind::ExecutorStarted {
-            prompt,
-            session_id: None,
+        let event = event(JobEventKind::SupervisorFinished {
+            action: "CLAUDE".to_owned(),
+            reason: None,
+            prompt: Some(prompt),
+            commit_title: None,
+            next_prompt: None,
         });
         let mut normal = Vec::new();
         HumanEventSink::new(&mut normal, HumanRenderMode::Normal, false)
@@ -723,6 +739,57 @@ mod tests {
         let verbose = String::from_utf8(verbose).expect("verbose UTF-8");
         assert!(!normal.contains("tail-visible-only-in-verbose"));
         assert!(verbose.contains("tail-visible-only-in-verbose"));
+        assert_eq!(verbose.matches("tail-visible-only-in-verbose").count(), 1);
+    }
+
+    #[test]
+    fn normal_renderer_does_not_repeat_claude_prompt_at_execution_start() {
+        let prompt = "Apply the requested README correction.";
+        let started = event(JobEventKind::JobStarted {
+            task: "Update README.".to_owned(),
+        });
+        let decision = event(JobEventKind::SupervisorFinished {
+            action: "CLAUDE".to_owned(),
+            reason: None,
+            prompt: Some(prompt.to_owned()),
+            commit_title: None,
+            next_prompt: None,
+        });
+        let execution = event(JobEventKind::ExecutorStarted {
+            prompt: prompt.to_owned(),
+            session_id: None,
+        });
+        let output = format!(
+            "{}{}",
+            render_human(&decision, HumanRenderMode::Normal, false),
+            render_human(&execution, HumanRenderMode::Normal, false)
+        );
+        assert_eq!(output.matches(prompt).count(), 1);
+        assert!(output.contains("starting requested execution"));
+        assert!(
+            !render_human(&started, HumanRenderMode::Normal, false)
+                .contains("iteration limit pending")
+        );
+    }
+
+    #[test]
+    fn renderer_marks_truncated_normal_response_and_renders_verbose_response_once() {
+        let response = format!("{} response-tail", "x".repeat(360));
+        let event = event(JobEventKind::ExecutorFinished {
+            session_id: Some("session-1".to_owned()),
+            final_response: response.clone(),
+            exit_code: Some(0),
+            duration_ms: None,
+            turns: None,
+            total_cost_usd: None,
+            usage: None,
+        });
+        let normal = render_human(&event, HumanRenderMode::Normal, false);
+        let verbose = render_human(&event, HumanRenderMode::Verbose, false);
+        assert!(normal.contains("... (use --verbose for full response)"));
+        assert!(!normal.contains("response-tail"));
+        assert!(verbose.contains("response-tail"));
+        assert_eq!(verbose.matches("response-tail").count(), 1);
     }
 
     #[test]

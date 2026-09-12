@@ -303,6 +303,8 @@ cargo run -- run --json --project /path/to/project "Fix a small regression and v
 
 This visibility records the exchange Lya is legitimately allowed to know: the safe review request it sends Codex, Codex's structured decision and explicit reason, the prompt Lya sends Claude, Claude's final response/report, and subsequent repository state. Hidden model chain-of-thought is not available and is never claimed or logged. The same event model is intentionally independent of terminal rendering so a later daemon or web UI can subscribe to it.
 
+Lya currently does not log an actual Codex or Claude model identifier. Both CLIs support model selection, but the structured Codex decision and Claude JSON result contracts used by Lya do not reliably report which model executed a request. Lya will add model metadata only when it is available through a documented structured provider contract.
+
 ## Repository Review
 
 Lya independently collects repository state before reviews.
