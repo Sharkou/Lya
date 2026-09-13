@@ -5,7 +5,7 @@
 //! start, *when*, and *how much at once*:
 //!
 //! ```text
-//! CLI / future daemon
+//! CLI / daemon
 //!         |
 //!         v
 //!     Scheduler ── repository claims, concurrency slots, queue bookkeeping
@@ -20,6 +20,15 @@
 //!
 //! Supervisors and executors know nothing about scheduling, and nothing here can reach around Git
 //! verification: the scheduler starts jobs, it never publishes.
+//!
+//! A scheduler is driven in one of two shapes, and both use the same queue, the same claims and the
+//! same workers:
+//!
+//! * [`Scheduler::run`] takes one batch, closes admission immediately and resolves when that batch
+//!   is drained. This is what `lya scheduler` uses.
+//! * [`Scheduler::serve`] leaves admission open, so a long-lived owner — the daemon — can keep
+//!   handing work to [`SchedulerAdmission::submit`] while jobs run, and resolves once admission is
+//!   closed and the queue is drained.
 //!
 //! Two rules define it:
 //!
@@ -37,9 +46,8 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +55,7 @@ use tokio::sync::watch;
 
 use super::{
     control::{ControlReceiver, ControlSender},
-    events::{EventSinkError, format_timestamp, style},
+    events::{EventSinkError, current_unix_millis, format_timestamp, style},
     job::new_job_id,
     lock::JobLock,
     repository_lock::{RepositoryIdentity, RepositoryLock},
@@ -58,6 +66,18 @@ use super::{
 /// How many repositories may be driven at once by default.
 pub const DEFAULT_MAX_CONCURRENT: usize = 2;
 
+/// Whether a scheduled entry starts new work or continues a persisted job.
+///
+/// The distinction is deliberately narrow: [`ScheduleMode::Resume`] means "this job already exists
+/// and its persisted state is authoritative", so the scheduler never rewrites that state when it
+/// accepts the entry. Deciding *where* a resumed job continues stays entirely in
+/// [`ResumePlan`](super::resume::ResumePlan); the scheduler only decides that it may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleMode {
+    Start,
+    Resume,
+}
+
 /// One unit of work handed to the scheduler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledRequest {
@@ -66,6 +86,10 @@ pub struct ScheduledRequest {
     /// `None` for new work, which the scheduler gives a fresh job ID. `Some` when re-queueing a job
     /// the scheduler already persisted, so an interrupted queue keeps its identities.
     pub job_id: Option<String>,
+    /// Limits this one job is accepted with. `None` adopts the scheduler-wide configuration, which
+    /// is what a `lya scheduler` invocation does for every job in its batch.
+    pub run: Option<RunConfiguration>,
+    pub mode: ScheduleMode,
 }
 
 impl ScheduledRequest {
@@ -74,6 +98,8 @@ impl ScheduledRequest {
             project,
             task: task.into(),
             job_id: None,
+            run: None,
+            mode: ScheduleMode::Start,
         }
     }
 
@@ -86,7 +112,29 @@ impl ScheduledRequest {
             },
             task: job.task.clone(),
             job_id: Some(job.job_id.clone()),
+            run: None,
+            mode: ScheduleMode::Start,
         }
+    }
+
+    /// Continue a persisted job that is resumable. Its own persisted state stays untouched.
+    pub fn to_resume(job: &JobState) -> Self {
+        Self {
+            project: Project {
+                name: job.project_name.clone(),
+                path: job.project_path.clone(),
+            },
+            task: job.task.clone(),
+            job_id: Some(job.job_id.clone()),
+            run: Some(job.run.clone()),
+            mode: ScheduleMode::Resume,
+        }
+    }
+
+    /// Accept this one job with its own limits instead of the scheduler-wide ones.
+    pub fn with_run(mut self, run: RunConfiguration) -> Self {
+        self.run = Some(run);
+        self
     }
 }
 
@@ -101,6 +149,10 @@ pub struct JobAssignment {
     pub task: String,
     /// The canonical repository this job is claiming.
     pub repository: PathBuf,
+    /// The limits this job was accepted with, exactly as they were persisted on it.
+    pub run: RunConfiguration,
+    /// Whether the driver starts this job or continues a persisted one.
+    pub mode: ScheduleMode,
     /// This job's own control channel. The scheduler routes a graceful stop into it.
     pub control: ControlReceiver,
 }
@@ -170,6 +222,33 @@ impl SchedulerControl {
         self.inner.stop_requested.load(Ordering::Acquire)
     }
 
+    /// The control channel of one active job, if this scheduler is driving it.
+    ///
+    /// This is how a named-job control request reaches the job: the command travels through the
+    /// same [`ControlSender`] an interactive `lya run` writes to, so there is exactly one control
+    /// state machine. A job this scheduler does not drive has no sender here, which is what lets a
+    /// control request fail closed instead of pretending to have been delivered.
+    pub fn sender_for(&self, job_id: &str) -> Option<ControlSender> {
+        self.inner
+            .active
+            .lock()
+            .expect("scheduler control lock")
+            .iter()
+            .find(|(registered, _)| registered == job_id)
+            .map(|(_, sender)| sender.clone())
+    }
+
+    /// Every job this scheduler is currently driving.
+    pub fn active_job_ids(&self) -> Vec<String> {
+        self.inner
+            .active
+            .lock()
+            .expect("scheduler control lock")
+            .iter()
+            .map(|(job_id, _)| job_id.clone())
+            .collect()
+    }
+
     fn register(&self, job_id: &str, sender: ControlSender) {
         let mut active = self.inner.active.lock().expect("scheduler control lock");
         active.push((job_id.to_owned(), sender.clone()));
@@ -202,7 +281,7 @@ impl SchedulerControl {
 /// scheduler itself. Like job events it is observation, never authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerEvent {
-    pub timestamp_unix_millis: u128,
+    pub timestamp_unix_millis: u64,
     #[serde(flatten)]
     pub kind: SchedulerEventKind,
 }
@@ -210,10 +289,7 @@ pub struct SchedulerEvent {
 impl SchedulerEvent {
     pub fn new(kind: SchedulerEventKind) -> Self {
         Self {
-            timestamp_unix_millis: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
+            timestamp_unix_millis: current_unix_millis(),
             kind,
         }
     }
@@ -513,6 +589,8 @@ struct QueueEntry {
     project: Project,
     task: String,
     repository: RepositoryIdentity,
+    run: RunConfiguration,
+    mode: ScheduleMode,
     /// Whether a "waiting for repository" observation was already emitted for this entry, so a
     /// blocked entry is announced once instead of on every scan.
     wait_announced: bool,
@@ -562,16 +640,44 @@ impl QueueState {
     fn release(&mut self, key: &str) {
         self.active.remove(key);
     }
+
+    /// Put back an entry that was taken but never started.
+    ///
+    /// At the front, because it was already first in line: a worker that gives an entry back
+    /// because a stop arrived must not push it behind work that was queued after it.
+    fn requeue(&mut self, entry: QueueEntry) {
+        self.pending.push_front(entry);
+    }
 }
 
 struct SchedulerShared {
     queue: Mutex<QueueState>,
     results: Mutex<Vec<ScheduledJobReport>>,
     progress: watch::Sender<u64>,
+    progress_receiver: watch::Receiver<u64>,
     event_failure: Mutex<Option<String>>,
+    /// Submission order across every submission, so a report reads the same however the work
+    /// arrived — as one batch or as many.
+    next_position: AtomicUsize,
+    /// Whether new work may still be accepted. Closing it is what lets the workers finish: an empty
+    /// queue only means "nothing left to do" once nothing more can arrive.
+    admission_open: AtomicBool,
 }
 
 impl SchedulerShared {
+    fn new() -> Self {
+        let (progress, progress_receiver) = watch::channel(0u64);
+        Self {
+            queue: Mutex::new(QueueState::default()),
+            results: Mutex::new(Vec::new()),
+            progress,
+            progress_receiver,
+            event_failure: Mutex::new(None),
+            next_position: AtomicUsize::new(0),
+            admission_open: AtomicBool::new(true),
+        }
+    }
+
     fn emit(&self, sink: &dyn SchedulerEventSink, kind: SchedulerEventKind) {
         if let Err(error) = sink.emit(&SchedulerEvent::new(kind)) {
             let mut failure = self.event_failure.lock().expect("event failure lock");
@@ -584,6 +690,213 @@ impl SchedulerShared {
     fn announce_progress(&self) {
         self.progress.send_modify(|version| *version += 1);
     }
+
+    fn admission_open(&self) -> bool {
+        self.admission_open.load(Ordering::Acquire)
+    }
+
+    /// Stop accepting work and wake every idle worker, so a drained queue can end the run.
+    fn close_admission(&self) {
+        self.admission_open.store(false, Ordering::Release);
+        self.announce_progress();
+    }
+}
+
+/// Hands work to a scheduler that is already running.
+///
+/// Cloneable and independent of the scheduler value itself, so a long-lived owner — the daemon — can
+/// keep submitting while [`Scheduler::serve`] drives what was submitted before. It holds no queue of
+/// its own: submitted work is persisted and queued by the scheduler exactly as a batch is, which is
+/// why a client never reimplements queue or state bookkeeping.
+#[derive(Clone)]
+pub struct SchedulerAdmission {
+    shared: Arc<SchedulerShared>,
+    store: Arc<StateStore>,
+    events: Arc<dyn SchedulerEventSink>,
+    run: RunConfiguration,
+}
+
+/// What accepting one request did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionOutcome {
+    /// Durably recorded and queued. New work exists as a persisted `QUEUED` job before this
+    /// returns.
+    Queued {
+        job_id: String,
+        project_name: String,
+        repository: PathBuf,
+    },
+    /// Never queued. Nothing was written for it.
+    Rejected {
+        job_id: String,
+        project_name: String,
+        reason: String,
+    },
+}
+
+impl AdmissionOutcome {
+    pub fn job_id(&self) -> &str {
+        match self {
+            Self::Queued { job_id, .. } | Self::Rejected { job_id, .. } => job_id,
+        }
+    }
+}
+
+impl SchedulerAdmission {
+    /// Give every request an identity, a repository claim target and a durable record before
+    /// anything starts.
+    ///
+    /// Persisting first is what makes a crash survivable: accepted work exists on disk as a real
+    /// job, distinguishable from work that was already being driven. A [`ScheduleMode::Resume`]
+    /// entry is the one exception — its persisted state is already authoritative and is never
+    /// rewritten here.
+    ///
+    /// **Every request gets an outcome.** One request that cannot be accepted — an unresolvable
+    /// repository, a state store that will not write — is [`AdmissionOutcome::Rejected`] and
+    /// nothing more. It never becomes an error for the batch, because an error for the batch would
+    /// throw away the identities of the requests already durably accepted before it, and a caller
+    /// that never learns those identities has no way to tell a failed submission from a partly
+    /// succeeded one. The only whole-batch refusal is a closed admission, which accepts nothing and
+    /// therefore hides nothing.
+    pub fn submit(
+        &self,
+        requests: Vec<ScheduledRequest>,
+    ) -> Result<Vec<AdmissionOutcome>, SchedulerError> {
+        if !self.shared.admission_open() {
+            return Err(SchedulerError::AdmissionClosed);
+        }
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            let position = self.shared.next_position.fetch_add(1, Ordering::Relaxed);
+            outcomes.push(self.accept_one(position, request));
+        }
+        if outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, AdmissionOutcome::Queued { .. }))
+        {
+            // An idle worker is waiting on exactly this: newly submitted work is as much progress
+            // as a released repository.
+            self.shared.announce_progress();
+        }
+        Ok(outcomes)
+    }
+
+    /// Stop accepting new work. Work that is already queued still runs.
+    pub fn close(&self) {
+        self.shared.close_admission();
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.shared.admission_open()
+    }
+
+    /// Accept, or refuse, exactly one request.
+    ///
+    /// Infallible by construction: every way a request can fail to be accepted produces a
+    /// [`AdmissionOutcome::Rejected`] naming the reason, so one bad request in a batch can never
+    /// cost the caller the identities of the good ones around it.
+    fn accept_one(&self, position: usize, request: ScheduledRequest) -> AdmissionOutcome {
+        let job_id = request.job_id.clone().unwrap_or_else(new_job_id);
+        let reject = |reason: String| {
+            self.shared.emit(
+                self.events.as_ref(),
+                SchedulerEventKind::JobRejected {
+                    job_id: job_id.clone(),
+                    project_name: request.project.name.clone(),
+                    reason: reason.clone(),
+                },
+            );
+            self.shared
+                .results
+                .lock()
+                .expect("scheduler results lock")
+                .push(ScheduledJobReport {
+                    position,
+                    job_id: job_id.clone(),
+                    project_name: request.project.name.clone(),
+                    outcome: ScheduledOutcome::Rejected {
+                        reason: reason.clone(),
+                    },
+                });
+            AdmissionOutcome::Rejected {
+                job_id: job_id.clone(),
+                project_name: request.project.name.clone(),
+                reason,
+            }
+        };
+
+        let repository = match RepositoryIdentity::resolve(&request.project.path) {
+            Ok(identity) => identity,
+            Err(error) => return reject(error.to_string()),
+        };
+        let run = match request.mode {
+            ScheduleMode::Start => {
+                let run = request.run.clone().unwrap_or_else(|| self.run.clone());
+                let mut job = JobState::new(
+                    job_id.clone(),
+                    request.project.name.clone(),
+                    request.project.path.clone(),
+                    request.task.clone(),
+                );
+                job.status = JobStatus::Queued;
+                job.run = run.clone();
+                // A job that cannot be written down was never accepted, and saying so about this
+                // one request is the whole answer: the requests already written stay accepted and
+                // keep their identities.
+                if let Err(error) = self.store.save_job(&job) {
+                    return reject(format!("could not persist queued work: {error}"));
+                }
+                run
+            }
+            // A resumed job already owns authoritative state. Refusing here instead of queueing is
+            // what keeps a scheduler from starting work the resume rules would reject anyway.
+            ScheduleMode::Resume => {
+                let job = match self.store.load_job(&job_id) {
+                    Ok(Some(job)) => job,
+                    Ok(None) => return reject(format!("no persisted job {job_id} to resume")),
+                    Err(error) => {
+                        return reject(format!("could not read job {job_id} to resume: {error}"));
+                    }
+                };
+                if !job.status.is_resumable() {
+                    return reject(format!(
+                        "job {job_id} is {} and cannot be resumed",
+                        job.status.label()
+                    ));
+                }
+                job.run
+            }
+        };
+        self.shared.emit(
+            self.events.as_ref(),
+            SchedulerEventKind::JobQueued {
+                job_id: job_id.clone(),
+                project_name: request.project.name.clone(),
+                repository: repository.root().to_owned(),
+            },
+        );
+        let queued = AdmissionOutcome::Queued {
+            job_id: job_id.clone(),
+            project_name: request.project.name.clone(),
+            repository: repository.root().to_owned(),
+        };
+        self.shared
+            .queue
+            .lock()
+            .expect("scheduler queue lock")
+            .pending
+            .push_back(QueueEntry {
+                position,
+                job_id,
+                project: request.project,
+                task: request.task,
+                repository,
+                run,
+                mode: request.mode,
+                wait_announced: false,
+            });
+        queued
+    }
 }
 
 pub struct Scheduler<D: JobDriver> {
@@ -591,6 +904,7 @@ pub struct Scheduler<D: JobDriver> {
     store: Arc<StateStore>,
     events: Arc<dyn SchedulerEventSink>,
     control: SchedulerControl,
+    shared: Arc<SchedulerShared>,
     max_concurrent: usize,
     run: RunConfiguration,
 }
@@ -602,6 +916,7 @@ impl<D: JobDriver> Scheduler<D> {
             store: Arc::new(store),
             events: Arc::new(NoopSchedulerSink),
             control: SchedulerControl::new(),
+            shared: Arc::new(SchedulerShared::new()),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             run: RunConfiguration::default(),
         }
@@ -622,8 +937,8 @@ impl<D: JobDriver> Scheduler<D> {
         self
     }
 
-    /// The run configuration recorded on every queued job, so an interrupted queue keeps the limits
-    /// it was accepted with.
+    /// The run configuration recorded on every queued job that does not carry its own, so an
+    /// interrupted queue keeps the limits it was accepted with.
     pub fn with_run_configuration(mut self, run: RunConfiguration) -> Self {
         self.run = run;
         self
@@ -633,6 +948,22 @@ impl<D: JobDriver> Scheduler<D> {
         self.control.clone()
     }
 
+    /// A handle that can submit work to this scheduler, including while it is running.
+    ///
+    /// Take it before [`Scheduler::serve`] consumes the scheduler.
+    pub fn admission(&self) -> SchedulerAdmission {
+        SchedulerAdmission {
+            shared: Arc::clone(&self.shared),
+            store: Arc::clone(&self.store),
+            events: Arc::clone(&self.events),
+            run: self.run.clone(),
+        }
+    }
+
+    /// Drive exactly one batch and resolve when it is drained.
+    ///
+    /// Admission closes before the workers start, so nothing can be added to this batch and an
+    /// empty queue unambiguously means the batch is finished.
     pub async fn run(
         self,
         requests: Vec<ScheduledRequest>,
@@ -640,25 +971,47 @@ impl<D: JobDriver> Scheduler<D> {
         if self.max_concurrent == 0 {
             return Err(SchedulerError::InvalidConcurrency);
         }
+        let accepted = self
+            .admission()
+            .submit(requests)?
+            .iter()
+            .filter(|outcome| matches!(outcome, AdmissionOutcome::Queued { .. }))
+            .count();
+        self.shared.close_admission();
+        let workers = self.max_concurrent.min(accepted.max(1));
+        self.drive(accepted, workers).await
+    }
 
-        let (progress, progress_receiver) = watch::channel(0u64);
-        let shared = Arc::new(SchedulerShared {
-            queue: Mutex::new(QueueState::default()),
-            results: Mutex::new(Vec::new()),
-            progress,
-            event_failure: Mutex::new(None),
-        });
+    /// Drive work for as long as admission stays open.
+    ///
+    /// Every worker exists from the start, because work arrives later: this is the shape a daemon
+    /// uses. It resolves once [`SchedulerAdmission::close`] has been called and the queue is
+    /// drained, or once a graceful stop has been requested and the active jobs have shut down.
+    pub async fn serve(self) -> Result<SchedulerReport, SchedulerError> {
+        if self.max_concurrent == 0 {
+            return Err(SchedulerError::InvalidConcurrency);
+        }
+        let queued = self
+            .shared
+            .queue
+            .lock()
+            .expect("scheduler queue lock")
+            .pending
+            .len();
+        let workers = self.max_concurrent;
+        self.drive(queued, workers).await
+    }
 
-        let accepted = self.accept(&shared, requests)?;
-        shared.emit(
+    async fn drive(self, queued: usize, workers: usize) -> Result<SchedulerReport, SchedulerError> {
+        self.shared.emit(
             self.events.as_ref(),
             SchedulerEventKind::SchedulerStarted {
                 max_concurrent: self.max_concurrent,
-                queued: accepted,
+                queued,
             },
         );
         if self.control.claim_stop_announcement() {
-            shared.emit(
+            self.shared.emit(
                 self.events.as_ref(),
                 SchedulerEventKind::SchedulerStopping {
                     reason: "a stop was requested before any job started".to_owned(),
@@ -666,15 +1019,14 @@ impl<D: JobDriver> Scheduler<D> {
             );
         }
 
-        let workers = self.max_concurrent.min(accepted.max(1));
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let shared = Arc::clone(&shared);
+            let shared = Arc::clone(&self.shared);
             let store = Arc::clone(&self.store);
             let driver = Arc::clone(&self.driver);
             let events = Arc::clone(&self.events);
             let control = self.control.clone();
-            let progress = progress_receiver.clone();
+            let progress = self.shared.progress_receiver.clone();
             handles.push(tokio::spawn(async move {
                 worker(shared, store, driver, events, control, progress).await;
             }));
@@ -685,13 +1037,15 @@ impl<D: JobDriver> Scheduler<D> {
                 .map_err(|error| SchedulerError::Worker(error.to_string()))?;
         }
 
-        let mut jobs = shared
+        let mut jobs = self
+            .shared
             .results
             .lock()
             .expect("scheduler results lock")
             .clone();
         jobs.sort_by_key(|job| job.position);
-        let queued_remaining = shared
+        let queued_remaining = self
+            .shared
             .queue
             .lock()
             .expect("scheduler queue lock")
@@ -720,7 +1074,7 @@ impl<D: JobDriver> Scheduler<D> {
             .iter()
             .filter(|job| matches!(job.outcome, ScheduledOutcome::Rejected { .. }))
             .count();
-        shared.emit(
+        self.shared.emit(
             self.events.as_ref(),
             SchedulerEventKind::SchedulerFinished {
                 completed,
@@ -730,7 +1084,8 @@ impl<D: JobDriver> Scheduler<D> {
             },
         );
 
-        if let Some(error) = shared
+        if let Some(error) = self
+            .shared
             .event_failure
             .lock()
             .expect("event failure lock")
@@ -739,78 +1094,6 @@ impl<D: JobDriver> Scheduler<D> {
             return Err(SchedulerError::Event(error));
         }
         Ok(report)
-    }
-
-    /// Give every request an identity, a repository claim target and a durable `QUEUED` record
-    /// before anything starts.
-    ///
-    /// Persisting first is what makes a scheduler crash survivable: accepted work exists on disk as
-    /// a real job, distinguishable from work that was already being driven.
-    fn accept(
-        &self,
-        shared: &Arc<SchedulerShared>,
-        requests: Vec<ScheduledRequest>,
-    ) -> Result<usize, SchedulerError> {
-        let mut accepted = 0;
-        for (position, request) in requests.into_iter().enumerate() {
-            let job_id = request.job_id.clone().unwrap_or_else(new_job_id);
-            let repository = match RepositoryIdentity::resolve(&request.project.path) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    shared.emit(
-                        self.events.as_ref(),
-                        SchedulerEventKind::JobRejected {
-                            job_id: job_id.clone(),
-                            project_name: request.project.name.clone(),
-                            reason: error.to_string(),
-                        },
-                    );
-                    shared.results.lock().expect("scheduler results lock").push(
-                        ScheduledJobReport {
-                            position,
-                            job_id,
-                            project_name: request.project.name,
-                            outcome: ScheduledOutcome::Rejected {
-                                reason: error.to_string(),
-                            },
-                        },
-                    );
-                    continue;
-                }
-            };
-            let mut job = JobState::new(
-                job_id.clone(),
-                request.project.name.clone(),
-                request.project.path.clone(),
-                request.task.clone(),
-            );
-            job.status = JobStatus::Queued;
-            job.run = self.run.clone();
-            self.store.save_job(&job).map_err(SchedulerError::State)?;
-            shared.emit(
-                self.events.as_ref(),
-                SchedulerEventKind::JobQueued {
-                    job_id: job_id.clone(),
-                    project_name: request.project.name.clone(),
-                    repository: repository.root().to_owned(),
-                },
-            );
-            shared
-                .queue
-                .lock()
-                .expect("scheduler queue lock")
-                .pending
-                .push_back(QueueEntry {
-                    position,
-                    job_id,
-                    project: request.project,
-                    task: request.task,
-                    repository,
-                    wait_announced: false,
-                });
-            accepted += 1;
-        }
-        Ok(accepted)
     }
 }
 
@@ -863,10 +1146,14 @@ async fn worker<D: JobDriver>(
                 .expect("scheduler queue lock")
                 .pending
                 .is_empty();
-            if pending_empty {
+            // A drained queue only ends this worker once nothing more can be submitted. While
+            // admission stays open — the daemon's shape — the worker waits for the next submission
+            // instead of exiting, so a daemon never has to restart a scheduler to accept work.
+            if pending_empty && !shared.admission_open() {
                 return;
             }
-            // Only another worker releasing a repository can unblock the queue.
+            // Only a released repository, a new submission or admission closing can change the
+            // answer.
             if progress.changed().await.is_err() {
                 return;
             }
@@ -874,6 +1161,27 @@ async fn worker<D: JobDriver>(
         };
 
         let key = entry.repository.key().to_owned();
+        // Selecting an entry and observing a stop are two separate steps, and a graceful stop can
+        // land between them: closing admission wakes this worker before the stop flag is set. An
+        // entry taken in that window has not been started — nothing has been claimed, no state has
+        // been rewritten — so it goes back exactly as it was found. Anything else would turn work
+        // that was only ever queued into a terminal job the next daemon can never recover.
+        if control.stop_requested() {
+            let mut queue = shared.queue.lock().expect("scheduler queue lock");
+            queue.release(&key);
+            queue.requeue(entry);
+            drop(queue);
+            if control.claim_stop_announcement() {
+                shared.emit(
+                    events.as_ref(),
+                    SchedulerEventKind::SchedulerStopping {
+                        reason: "a graceful stop was requested".to_owned(),
+                    },
+                );
+            }
+            return;
+        }
+
         let report = execute(
             &shared,
             &store,
@@ -964,6 +1272,8 @@ async fn execute<D: JobDriver + ?Sized>(
             project: entry.project.clone(),
             task: entry.task.clone(),
             repository: entry.repository.root().to_owned(),
+            run: entry.run.clone(),
+            mode: entry.mode,
             control: receiver,
         })
         .await;
@@ -1041,6 +1351,7 @@ fn settle_failed_queued_state(store: &StateStore, job_id: &str) {
 #[derive(Debug)]
 pub enum SchedulerError {
     InvalidConcurrency,
+    AdmissionClosed,
     State(StateError),
     Event(String),
     Worker(String),
@@ -1051,6 +1362,9 @@ impl fmt::Display for SchedulerError {
         match self {
             Self::InvalidConcurrency => {
                 formatter.write_str("maximum concurrency must be greater than zero")
+            }
+            Self::AdmissionClosed => {
+                formatter.write_str("the scheduler is no longer accepting new work")
             }
             Self::State(error) => write!(formatter, "could not persist queued work: {error}"),
             Self::Event(error) => write!(formatter, "scheduler event error: {error}"),
@@ -1086,14 +1400,14 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::{
-        JobAssignment, JobDriver, JobOutcome, JsonSchedulerSink, ScheduledOutcome,
-        ScheduledRequest, Scheduler, SchedulerControl, SchedulerError, SchedulerEvent,
-        SchedulerEventKind, SchedulerEventSink, queued_jobs,
+        AdmissionOutcome, JobAssignment, JobDriver, JobOutcome, JsonSchedulerSink, ScheduleMode,
+        ScheduledOutcome, ScheduledRequest, Scheduler, SchedulerControl, SchedulerError,
+        SchedulerEvent, SchedulerEventKind, SchedulerEventSink, queued_jobs,
     };
     use crate::orchestrator::{
         events::EventSinkError,
         repository_lock::{RepositoryIdentity, RepositoryLock},
-        state::{JobStatus, RunConfiguration, StateStore},
+        state::{JobState, JobStatus, RunConfiguration, StateStore},
         supervisor::Project,
     };
 
@@ -2069,5 +2383,497 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A driver that reports every assignment it is given and finishes immediately.
+    struct ReportingDriver {
+        assignments: mpsc::UnboundedSender<(String, String, ScheduleMode, RunConfiguration)>,
+    }
+
+    impl JobDriver for ReportingDriver {
+        fn drive<'a>(
+            &'a self,
+            assignment: JobAssignment,
+        ) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                let _ = self.assignments.send((
+                    assignment.job_id,
+                    assignment.task,
+                    assignment.mode,
+                    assignment.run,
+                ));
+                JobOutcome::Finished {
+                    status: "ACCEPTED".to_owned(),
+                    jobs: 1,
+                    succeeded: true,
+                }
+            })
+        }
+    }
+
+    /// The shape a long-lived owner needs: work can arrive after the scheduler started, and the run
+    /// only ends when admission is closed and the queue is drained.
+    #[tokio::test]
+    async fn a_serving_scheduler_accepts_work_submitted_while_it_runs() {
+        let home = unique("scheduler-serve-home");
+        let first_project = repository("scheduler-serve-a");
+        let second_project = repository("scheduler-serve-b");
+        let (assignments, mut driven) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new(ReportingDriver { assignments }, StateStore::at(&home));
+        let admission = scheduler.admission();
+        let serving = tokio::spawn(scheduler.serve());
+
+        // Nothing was queued when the workers started.
+        admission
+            .submit(vec![ScheduledRequest::new(
+                project(&first_project),
+                "first",
+            )])
+            .expect("an open admission accepts work");
+        let (_, first_task, mode, _) = driven.recv().await.expect("the first job should be driven");
+        assert_eq!(first_task, "first");
+        assert_eq!(mode, ScheduleMode::Start);
+
+        admission
+            .submit(vec![ScheduledRequest::new(
+                project(&second_project),
+                "second",
+            )])
+            .expect("admission stays open between submissions");
+        let (_, second_task, _, _) = driven
+            .recv()
+            .await
+            .expect("work submitted later is driven too");
+        assert_eq!(second_task, "second");
+
+        // Closing admission is what ends the run; until then the workers wait for more work.
+        admission.close();
+        let report = serving
+            .await
+            .expect("the scheduler task should finish")
+            .expect("serving should end cleanly");
+
+        assert_eq!(report.jobs.len(), 2);
+        assert!(report.queued_remaining.is_empty());
+        assert!(report.is_success());
+        assert!(!admission.is_open());
+        let error = admission
+            .submit(vec![ScheduledRequest::new(project(&first_project), "late")])
+            .expect_err("a closed admission accepts nothing");
+        assert!(matches!(error, SchedulerError::AdmissionClosed), "{error}");
+        // Nothing was persisted for the refused request.
+        assert_eq!(
+            StateStore::at(&home)
+                .load_all()
+                .expect("state should be readable")
+                .len(),
+            2
+        );
+        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(first_project).expect("repository should be removed");
+        fs::remove_dir_all(second_project).expect("repository should be removed");
+    }
+
+    /// One batch behaves exactly as it did before: admission closes before the workers start, so a
+    /// drained queue ends the run without anyone closing anything.
+    #[tokio::test]
+    async fn a_batch_run_closes_its_own_admission() {
+        let home = unique("scheduler-batch-home");
+        let project_path = repository("scheduler-batch");
+        let (assignments, mut driven) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new(ReportingDriver { assignments }, StateStore::at(&home));
+        let admission = scheduler.admission();
+
+        let report = scheduler
+            .run(vec![ScheduledRequest::new(project(&project_path), "one")])
+            .await
+            .expect("the batch should run");
+
+        assert!(report.is_success());
+        assert!(!admission.is_open(), "a batch closes admission itself");
+        assert!(driven.recv().await.is_some());
+        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(project_path).expect("repository should be removed");
+    }
+
+    /// A submitted job may bring its own limits, and they are what the driver is handed and what is
+    /// persisted on the job.
+    #[tokio::test]
+    async fn a_request_can_carry_its_own_run_configuration() {
+        let home = unique("scheduler-run-configuration-home");
+        let project_path = repository("scheduler-run-configuration");
+        let (assignments, mut driven) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new(ReportingDriver { assignments }, StateStore::at(&home))
+            .with_run_configuration(RunConfiguration {
+                max_iterations: 2,
+                ..RunConfiguration::default()
+            });
+
+        let report = scheduler
+            .run(vec![
+                ScheduledRequest::new(project(&project_path), "scheduler default"),
+                ScheduledRequest::new(project(&project_path), "its own limits").with_run(
+                    RunConfiguration {
+                        max_iterations: 9,
+                        max_jobs: 4,
+                        browser: true,
+                        publish: false,
+                        git: None,
+                    },
+                ),
+            ])
+            .await
+            .expect("both jobs should run");
+
+        assert_eq!(report.jobs.len(), 2);
+        let mut driven_jobs = Vec::new();
+        while let Ok(job) = driven.try_recv() {
+            driven_jobs.push(job);
+        }
+        driven_jobs.sort_by(|left, right| left.1.cmp(&right.1));
+        assert_eq!(driven_jobs[0].1, "its own limits");
+        assert_eq!(driven_jobs[0].3.max_iterations, 9);
+        assert!(driven_jobs[0].3.browser);
+        assert_eq!(driven_jobs[1].1, "scheduler default");
+        assert_eq!(driven_jobs[1].3.max_iterations, 2);
+
+        let store = StateStore::at(&home);
+        let persisted = store
+            .load_job(&driven_jobs[0].0)
+            .expect("readable")
+            .expect("exists");
+        assert_eq!(
+            persisted.run.max_iterations, 9,
+            "the limits a job was accepted with are persisted on it"
+        );
+        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(project_path).expect("repository should be removed");
+    }
+
+    /// Accepting a resume must never rewrite the state the resume depends on, and must refuse work
+    /// that is not resumable at all.
+    #[tokio::test]
+    async fn accepting_a_resume_preserves_authoritative_state_and_refuses_the_rest() {
+        let home = unique("scheduler-resume-home");
+        let project_path = repository("scheduler-resume");
+        let store = StateStore::at(&home);
+        let mut running =
+            JobState::new("resumable-job", "project", project_path.clone(), "continue");
+        running.status = JobStatus::Running;
+        running.iteration = 3;
+        running.claude_session_id = Some("session-7".to_owned());
+        running.run = RunConfiguration {
+            max_iterations: 5,
+            ..RunConfiguration::default()
+        };
+        store.save_job(&running).expect("the job should persist");
+        let mut published = JobState::new("published-job", "project", project_path.clone(), "done");
+        published.status = JobStatus::Published;
+        store.save_job(&published).expect("the job should persist");
+
+        let (assignments, mut driven) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new(ReportingDriver { assignments }, StateStore::at(&home));
+
+        let report = scheduler
+            .run(vec![
+                ScheduledRequest::to_resume(&running),
+                ScheduledRequest::to_resume(&published),
+                ScheduledRequest {
+                    project: project(&project_path),
+                    task: "gone".to_owned(),
+                    job_id: Some("no-such-job".to_owned()),
+                    run: None,
+                    mode: ScheduleMode::Resume,
+                },
+            ])
+            .await
+            .expect("the scheduler should run");
+
+        let (job_id, task, mode, run) = driven
+            .recv()
+            .await
+            .expect("the resumable job should be driven");
+        assert_eq!(job_id, "resumable-job");
+        assert_eq!(task, "continue");
+        assert_eq!(mode, ScheduleMode::Resume);
+        assert_eq!(
+            run.max_iterations, 5,
+            "a resumed job keeps the limits it was persisted with"
+        );
+        assert!(
+            driven.try_recv().is_err(),
+            "nothing else may be driven: {report:?}"
+        );
+
+        let untouched = store
+            .load_job("resumable-job")
+            .expect("readable")
+            .expect("exists");
+        assert_eq!(untouched.iteration, 3);
+        assert_eq!(untouched.claude_session_id.as_deref(), Some("session-7"));
+        assert_eq!(
+            untouched.status,
+            JobStatus::Running,
+            "accepting a resume must never rewrite the job it resumes"
+        );
+
+        for (job_id, expected) in [("published-job", "PUBLISHED"), ("no-such-job", "resume")] {
+            assert!(
+                report.jobs.iter().any(|job| job.job_id == job_id
+                    && matches!(&job.outcome, ScheduledOutcome::Rejected { reason }
+                        if reason.contains(expected))),
+                "{job_id} should be refused with a reason: {:?}",
+                report.jobs
+            );
+        }
+        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(project_path).expect("repository should be removed");
+    }
+
+    /// A named job's control channel is reachable while that job is being driven, and belongs to it
+    /// alone.
+    #[tokio::test]
+    async fn a_scheduler_exposes_the_control_channel_of_each_active_job() {
+        let home = unique("scheduler-control-home");
+        let first_project = repository("scheduler-control-a");
+        let second_project = repository("scheduler-control-b");
+        let (first_gate, first_receiver) = oneshot::channel();
+        let (second_gate, second_receiver) = oneshot::channel();
+        let (driver, mut started, _witness) = GatedDriver::new(vec![
+            ("first".to_owned(), first_receiver),
+            ("second".to_owned(), second_receiver),
+        ]);
+        let scheduler = Scheduler::new(driver, StateStore::at(&home));
+        let control = scheduler.control();
+        let admission = scheduler.admission();
+        let serving = tokio::spawn(scheduler.serve());
+        admission
+            .submit(vec![
+                ScheduledRequest::new(project(&first_project), "first"),
+                ScheduledRequest::new(project(&second_project), "second"),
+            ])
+            .expect("both jobs should be accepted");
+        started.recv().await.expect("a job should start");
+        started.recv().await.expect("a job should start");
+
+        let active = control.active_job_ids();
+
+        assert_eq!(active.len(), 2, "{active:?}");
+        for job_id in &active {
+            assert!(
+                control.sender_for(job_id).is_some(),
+                "an active job has a control channel"
+            );
+        }
+        assert!(
+            control.sender_for("no-such-job").is_none(),
+            "a job this scheduler does not drive has none"
+        );
+
+        let _ = first_gate.send(JobOutcome::Finished {
+            status: "ACCEPTED".to_owned(),
+            jobs: 1,
+            succeeded: true,
+        });
+        let _ = second_gate.send(JobOutcome::Finished {
+            status: "ACCEPTED".to_owned(),
+            jobs: 1,
+            succeeded: true,
+        });
+        admission.close();
+        serving
+            .await
+            .expect("the scheduler task should finish")
+            .expect("serving should end cleanly");
+        assert!(
+            control.active_job_ids().is_empty(),
+            "a finished job releases its control channel"
+        );
+        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(first_project).expect("repository should be removed");
+        fs::remove_dir_all(second_project).expect("repository should be removed");
+    }
+
+    /// The mechanical half of the guarantee, tested directly: an entry a worker took but never
+    /// started goes back where it was, and the repository it had reserved is free again.
+    #[test]
+    fn an_entry_given_back_keeps_its_place_and_frees_its_repository() {
+        let first_project = repository("scheduler-requeue-a");
+        let second_project = repository("scheduler-requeue-b");
+        let mut queue = super::QueueState::default();
+        for (position, path) in [&first_project, &second_project].into_iter().enumerate() {
+            queue.pending.push_back(super::QueueEntry {
+                position,
+                job_id: format!("job-{position}"),
+                project: project(path),
+                task: "task".to_owned(),
+                repository: RepositoryIdentity::resolve(path).expect("a repository should resolve"),
+                run: RunConfiguration::default(),
+                mode: ScheduleMode::Start,
+                wait_announced: false,
+            });
+        }
+
+        let (taken, _) = queue.take_runnable();
+        let taken = taken.expect("the first entry should be runnable");
+        let key = taken.repository.key().to_owned();
+        assert_eq!(taken.job_id, "job-0");
+        assert!(
+            queue.active.contains(&key),
+            "taking reserves the repository"
+        );
+
+        queue.release(&key);
+        queue.requeue(taken);
+
+        assert!(
+            !queue.active.contains(&key),
+            "giving an entry back must free the repository it reserved"
+        );
+        assert_eq!(queue.pending.len(), 2);
+        assert_eq!(
+            queue
+                .pending
+                .front()
+                .expect("the queue is not empty")
+                .job_id,
+            "job-0",
+            "an entry that was first in line must not be pushed behind later work"
+        );
+        fs::remove_dir_all(first_project).expect("repository should be removed");
+        fs::remove_dir_all(second_project).expect("repository should be removed");
+    }
+
+    /// A graceful stop must never consume queued work.
+    ///
+    /// One worker, one job running and one job waiting behind it. The stop is requested while the
+    /// running job is still gated, so it is unambiguously visible before the worker can look at the
+    /// queue again. The waiting job must never be handed to the driver and must still be `QUEUED`
+    /// on disk, because a job that is started only to be stopped becomes terminal and no later
+    /// daemon can ever recover it.
+    #[tokio::test]
+    async fn a_graceful_stop_never_starts_queued_work() {
+        let home = unique("scheduler-stop-queued-home");
+        let running_project = repository("scheduler-stop-running");
+        let waiting_project = repository("scheduler-stop-waiting");
+        let (gate, gated) = oneshot::channel();
+        let (driver, mut started, _witness) = GatedDriver::new(vec![("running".to_owned(), gated)]);
+        let scheduler = Scheduler::new(driver, StateStore::at(&home)).with_max_concurrent(1);
+        let control = scheduler.control();
+        let admission = scheduler.admission();
+        let serving = tokio::spawn(scheduler.serve());
+
+        let outcomes = admission
+            .submit(vec![
+                ScheduledRequest::new(project(&running_project), "running"),
+                ScheduledRequest::new(project(&waiting_project), "waiting"),
+            ])
+            .expect("both jobs should be accepted");
+        let waiting_id = outcomes[1].job_id().to_owned();
+        assert_eq!(
+            started.recv().await.expect("a job should start"),
+            project(&running_project).name,
+            "the single worker starts the first job"
+        );
+
+        // Requested while the only worker is inside the gated job, so no worker can be between
+        // choosing an entry and observing this.
+        control.request_stop();
+        admission.close();
+        let _ = gate.send(JobOutcome::Finished {
+            status: "ACCEPTED".to_owned(),
+            jobs: 1,
+            succeeded: true,
+        });
+
+        let report = serving
+            .await
+            .expect("the scheduler task should finish")
+            .expect("serving should end cleanly");
+
+        assert!(
+            started.try_recv().is_err(),
+            "a graceful stop must never hand queued work to the driver"
+        );
+        assert_eq!(
+            report.queued_remaining,
+            vec![waiting_id.clone()],
+            "work that was never started stays in the queue"
+        );
+        let waiting = StateStore::at(&home)
+            .load_job(&waiting_id)
+            .expect("the job should be readable")
+            .expect("the job was persisted when it was accepted");
+        assert_eq!(
+            waiting.status,
+            JobStatus::Queued,
+            "untouched queued work must never be turned into a terminal status"
+        );
+        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(running_project).expect("repository should be removed");
+        fs::remove_dir_all(waiting_project).expect("repository should be removed");
+    }
+
+    /// One request that cannot be accepted must not cost the caller the identities of the requests
+    /// accepted before it.
+    ///
+    /// The middle request names a path that is not a repository, which is a failure raised inside
+    /// the per-request accept path exactly as an unwritable state store is. The batch still answers
+    /// for all three.
+    #[test]
+    fn a_failure_partway_through_a_batch_keeps_the_outcomes_already_accepted() {
+        let home = unique("scheduler-partial-batch-home");
+        let first_project = repository("scheduler-partial-a");
+        let last_project = repository("scheduler-partial-b");
+        let missing = unique("scheduler-partial-missing");
+        fs::remove_dir_all(&missing).expect("the missing path should not exist");
+        let scheduler = Scheduler::new(
+            ReportingDriver {
+                assignments: mpsc::unbounded_channel().0,
+            },
+            StateStore::at(&home),
+        );
+        let admission = scheduler.admission();
+
+        let outcomes = admission
+            .submit(vec![
+                ScheduledRequest::new(project(&first_project), "first"),
+                ScheduledRequest::new(project(&missing), "unusable"),
+                ScheduledRequest::new(project(&last_project), "last"),
+            ])
+            .expect("an open admission answers the whole batch");
+
+        assert_eq!(outcomes.len(), 3, "every request is answered: {outcomes:?}");
+        let first = &outcomes[0];
+        let middle = &outcomes[1];
+        let last = &outcomes[2];
+        assert!(
+            matches!(first, AdmissionOutcome::Queued { .. }),
+            "the request accepted before the failure keeps its outcome: {first:?}"
+        );
+        assert!(
+            matches!(middle, AdmissionOutcome::Rejected { .. }),
+            "the failing request is rejected on its own: {middle:?}"
+        );
+        assert!(
+            matches!(last, AdmissionOutcome::Queued { .. }),
+            "a failure does not end the batch: {last:?}"
+        );
+
+        let store = StateStore::at(&home);
+        for accepted in [first, last] {
+            let job = store
+                .load_job(accepted.job_id())
+                .expect("the job should be readable")
+                .expect("a queued outcome means the job exists on disk");
+            assert_eq!(
+                job.status,
+                JobStatus::Queued,
+                "a returned job id must name durably accepted work"
+            );
+        }
+        fs::remove_dir_all(home).expect("home should be removed");
+        fs::remove_dir_all(first_project).expect("repository should be removed");
+        fs::remove_dir_all(last_project).expect("repository should be removed");
     }
 }

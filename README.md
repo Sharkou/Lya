@@ -31,6 +31,9 @@ Lya
 │   └── Tools
 │
 └── Development Orchestration
+    ├── Daemon
+    │   ├── Local control endpoint (named pipe / Unix socket)
+    │   └── Live job event streams
     ├── Scheduler
     │   └── Repository claims and concurrency slots
     ├── Supervisor
@@ -43,6 +46,10 @@ Lya
     │   └── Git
     └── Local State
         ├── context.md
+        ├── daemon.lock
+        ├── daemon.json
+        ├── daemon/
+        │   └── events.jsonl
         ├── repositories/
         │   └── <repository-fingerprint>.lock
         └── jobs/
@@ -55,6 +62,8 @@ Lya
 
 The components are intentionally separated:
 
+* the **Daemon** owns the process-level concerns — the claim on one `LYA_HOME`, the local control
+  endpoint, connected clients and graceful shutdown — so autonomous work no longer needs a terminal;
 * the **Scheduler** decides which jobs may start, how many run at once, and which repository each one owns;
 * the **Supervisor** decides what should happen next;
 * the **Executor** performs development work;
@@ -62,14 +71,19 @@ The components are intentionally separated:
 * the **Publisher** can commit and push only changes that match the reviewed repository state;
 * persistent state is stored locally per job, so an interrupted run can be continued by a later process.
 
-The scheduler is a boundary above the orchestrator, not a replacement for it. The orchestrator still
-owns exactly one autonomous job and its sequential chain:
+The daemon and the scheduler are both boundaries above the orchestrator, not replacements for it.
+The orchestrator still owns exactly one autonomous job and its sequential chain:
 
 ```text
-CLI / future daemon
+lya submit / attach / control        (clients)
+        |
+ local IPC, same machine only
         |
         v
-    Scheduler
+     Daemon            claim on LYA_HOME, endpoint, clients, shutdown
+        |
+        v
+    Scheduler          repository claims, concurrency slots, queue
    /    |    \
   v     v     v
 Job A  Job B  Job C
@@ -79,7 +93,8 @@ Job A  Job B  Job C
   AutonomousOrchestrator
 ```
 
-Supervisor and Executor implementations know nothing about scheduling.
+Supervisor and Executor implementations know nothing about scheduling, and nothing in the daemon
+knows how a job works. Each layer adds one decision and delegates the rest.
 
 The current development workflow uses Codex as the Supervisor and Claude Code as the Executor, but the architecture is designed so implementations can be replaced without rewriting the orchestration core.
 
@@ -128,6 +143,19 @@ Start Ollama, make sure a compatible model is installed, then run:
 OLLAMA_MODEL=<model> cargo run -- <prompt>
 ```
 
+### Background daemon
+
+Autonomous work can run without your terminal staying open:
+
+```bash
+lya daemon start
+lya submit --project /path/to/project "Fix a small regression and verify the result."
+lya daemon status
+lya attach <job-id>
+```
+
+See [Daemon Mode](#daemon-mode).
+
 ## Local State
 
 Lya stores private runtime data outside the repository.
@@ -149,6 +177,12 @@ The directory currently contains data such as:
 ```text
 ~/.lya/
 ├── context.md
+├── daemon.lock
+├── daemon.json
+├── daemon.sock            (Unix only; the Windows endpoint is a named pipe)
+├── daemon/
+│   ├── events.jsonl
+│   └── daemon.log
 ├── repositories/
 │   └── <repository-fingerprint>.lock
 └── jobs/
@@ -218,10 +252,43 @@ The kernel releases it when the process exits, including a crash or a kill, so a
 recovers by itself. The file body is diagnostics only, and a released claim keeps its file for the
 same reason a job lock does.
 
-`lya run`, `lya resume` and `lya scheduler` all take the claim, so a manual run and a scheduled job
-can never drive one working tree at the same time — not even across two Lya processes.
+`lya run`, `lya resume`, `lya scheduler` and the daemon all take the claim, so a manual run and a
+daemon-driven job can never drive one working tree at the same time — not even across two Lya
+processes.
 
 **Important:** "private" means that this file is kept outside the project repository. Its relevant content is sent to the configured Supervisor when a request is made. Do not store credentials, API keys, passwords, or other secrets in it.
+
+### The Daemon Claim
+
+A daemon holds an exclusive claim on:
+
+```text
+LYA_HOME/daemon.lock
+```
+
+for as long as it runs, using exactly the locking philosophy job locks and repository claims use: the
+operating system's own advisory lock on an open handle. Starting a second daemon against the same
+`LYA_HOME` is refused before it can bind an endpoint or touch a job, and a daemon that dies for any
+reason — crash, forced kill, machine restart — releases the claim automatically, so the next one
+starts without cleanup.
+
+Diagnostics live in a separate file, `LYA_HOME/daemon.json`:
+
+```json
+{
+  "process_id": 4812,
+  "started_unix_seconds": 1763040000,
+  "protocol_version": 1,
+  "endpoint": "\\\\.\\pipe\\lya-daemon-<home-fingerprint>"
+}
+```
+
+They are separate on purpose. Nothing reads them to decide whether a daemon may start, so a recorded
+process ID that has been reused grants nothing, and metadata left behind by a crash cannot block
+startup. They are also unreadable through a held lock on Windows, which is precisely when a refusal
+needs to name the holder — hence two files rather than one.
+
+Ownership authority is the claim and the endpoint. A process ID never is.
 
 ### Job Event History
 
@@ -345,6 +412,9 @@ A project must:
 * have a clean working tree when the job starts.
 
 Lya deliberately refuses to start autonomous work on an already dirty repository so pre-existing changes cannot be confused with agent-generated work.
+
+`lya run` stays attached to the terminal that started it and ends with it. To hand the same work to a
+background daemon instead, use [`lya submit`](#submitting-work).
 
 The loop is conceptually:
 
@@ -956,14 +1026,418 @@ active job would receive from a single `lya run`, including provider process-tre
 scheduler then waits for those jobs to shut down in a controlled way. Jobs that never started stay
 `QUEUED`. A second `Ctrl+C` keeps its existing force-exit meaning.
 
-### Interactive Control Is Not Multiplexed Yet
+### Typed Commands Are Not Multiplexed
 
 Scheduler mode is **non-interactive**. `/pause`, `/resume`, `/status`, `/diff`, `/send` and `/stop`
-act on one unambiguous job, and multiplexing them across several simultaneous jobs needs an
-interaction model Lya does not have yet. Rather than redesign that casually, `lya scheduler` accepts
-no typed commands.
+act on one unambiguous job, and multiplexing typed commands across several simultaneous jobs on one
+terminal needs an interaction model Lya does not have. Rather than invent one casually,
+`lya scheduler` accepts no typed commands.
+
+Controlling one of several concurrent jobs is answered by naming it instead, in
+[daemon mode](#controlling-a-job):
+
+```bash
+lya control <job-id> pause
+```
 
 `lya run` keeps the full interactive control it has always had. Graceful termination works in both.
+
+## Daemon Mode
+
+Autonomous work does not need your terminal to stay open.
+
+A Lya daemon owns the scheduler, the running jobs, the queued jobs, the repository coordination and
+the live control endpoint. It survives the shell that started it. Other `lya` commands become
+clients of it.
+
+```text
+lya daemon start          start it detached and get your prompt back
+lya daemon status         is one running, and what is it doing
+lya daemon stop           stop accepting work, shut active jobs down safely, exit
+lya daemon run            run it in the foreground (development and debugging)
+
+lya submit ...            hand work over; get the job ids back
+lya attach <job-id>       watch one job live; Ctrl+C detaches, the job keeps running
+lya control <job-id> ...  pause / resume / stop / status / diff / send, per job
+```
+
+This is **local daemon mode only**. No port is opened, no address is advertised, no remote access
+exists and there is nothing to authenticate over a network.
+
+### Starting And Stopping
+
+```bash
+lya daemon start
+```
+
+starts Lya detached — a new session on Unix, a detached process group on Windows — and returns
+immediately:
+
+```text
+Lya daemon started as process 4812 on \\.\pipe\lya-daemon-9f1c....
+Log: ~/.lya/daemon/daemon.log
+```
+
+Starting twice cannot produce two daemons for one `LYA_HOME`. The second one is refused by the
+[daemon claim](#the-daemon-claim) before it binds anything, and `lya daemon start` reports the daemon
+that is already running instead of failing:
+
+```text
+A Lya daemon is already running for ~/.lya as process 4812 on \\.\pipe\lya-daemon-9f1c....
+```
+
+Options:
+
+| Option | Meaning |
+| --- | --- |
+| `--max-concurrent <n>` | How many repositories may be driven at once (default 2). |
+| `--resume-interrupted` | Continue interrupted jobs on startup. Off by default; see [Restart Recovery](#restart-recovery). |
+| `--no-recover-queued` | Do not pick up work a previous daemon accepted and never started. |
+| `--verbose` / `--json` | `lya daemon run` only: how the foreground daemon narrates. |
+
+```bash
+lya daemon status
+```
+
+```text
+Lya daemon
+
+STATE          running
+PROCESS        4812
+LYA_HOME       ~/.lya
+ENDPOINT       \\.\pipe\lya-daemon-9f1c...
+PROTOCOL       1
+CONCURRENCY    at most 2 repositories
+CLIENTS        1 connected, 0 attached
+RESUME         interrupted jobs are left parked
+
+ACTIVE (1)
+  job-1763040000-4812-0  api  RUNNING  iteration 2/10  Fix the flaky test
+  watch one with: lya attach <job-id>
+
+QUEUED (1)
+  job-1763040007-4812-1  web  QUEUED  iteration 0/10  Update the changelog
+
+RESUMABLE (0)
+```
+
+`lya daemon status --json` prints the same information as one JSON object. The command exits with a
+failure when no daemon is running, so a script can test for one.
+
+```bash
+lya daemon stop
+```
+
+requests a graceful shutdown and waits until it has actually happened:
+
+1. no further work is accepted — a submission arriving now is refused with `SHUTTING_DOWN`;
+2. every active job receives the same graceful stop a foreground `Ctrl+C` would request, including
+   provider process-tree cancellation, and parks itself at a safe boundary under the existing job
+   semantics;
+3. the daemon waits for those jobs to shut down;
+4. it releases its claim and exits.
+
+The command does not print `Lya daemon stopped.` until step 4 has happened, and it decides that by
+polling the claim on `LYA_HOME` — never by watching the endpoint. The endpoint stops answering at
+step 1, while the daemon is still running and still shutting jobs down, so treating an unreachable
+endpoint as "stopped" would report success on a home the next command cannot use. Because the claim
+is the authority:
+
+```bash
+lya daemon stop && lya daemon start
+```
+
+works even when active jobs take minutes to drain.
+
+Work that never started stays `QUEUED` and is picked up by the next daemon — a shutdown never starts
+a queued job in order to stop it. Stopping when nothing is running succeeds and says so, so the
+command is safe to repeat.
+
+### Submitting Work
+
+```bash
+lya submit "Fix the flaky test in tests/api.rs"
+lya submit --project ../web --max-iterations 6 --publish "Update the changelog"
+lya submit --file jobs.jsonl
+```
+
+Submitted work becomes ordinary persisted Lya jobs and flows through the same scheduler
+`lya scheduler` uses. The client prints the job ids the daemon created:
+
+```text
+job-1763040000-4812-0  QUEUED  /home/you/projects/api
+Watch one with: lya attach <job-id>
+```
+
+Options are the ones `lya run` already has — `--project`, `--max-iterations`, `--max-jobs`,
+`--browser`, `--publish` — plus `--file` and `--json`. `--file` takes exactly the
+[job file](#multi-project-scheduling) `lya scheduler` takes, parsed by the same parser, so one
+grammar has one implementation.
+
+Two things are resolved by the client, in the shell that has the context for them, and travel with
+the job:
+
+* the project path, canonicalized, so a relative path is never interpreted against the daemon's
+  working directory;
+* the Git publication configuration, read from `LYA_GIT_*` and validated before the job is queued,
+  so a job is never accepted in a shape that can only fail later.
+
+Each job is validated and accepted on its own, and **every submitted job gets an answer**. A
+submission of ten jobs with one unusable path queues nine and says exactly which one it refused:
+
+```text
+-                      NOT QUEUED  could not resolve the repository at ../gone
+job-1763040000-4812-0  QUEUED  /home/you/projects/api
+```
+
+That holds for every way one job can fail, including one the daemon could not write down. A failure
+partway through a batch refuses that job and nothing else; it never becomes an error for the whole
+submission, because an error for the whole submission would throw away the ids of the jobs already
+durably accepted before it — and a client that never learns those ids cannot tell a failed
+submission from a partly succeeded one.
+
+The client holds no queue and no state. It sends a request and prints the answer.
+
+#### Delivery Semantics
+
+A job id is returned only after that job exists on disk as `QUEUED`. What the daemon reports, it has
+already committed to.
+
+The reverse is not guaranteed, and the honest statement is: **submission is at-least-once.** The
+daemon can durably accept jobs and then fail to deliver the response — the connection drops, the
+client is interrupted, the machine loses power between the write and the read. The client then
+reports a failure for work that is queued and will run.
+
+There is no submission identity on the wire and no de-duplication, so **re-running an identical
+`lya submit` after a lost response can create duplicate jobs**, each with its own id, each running
+against the same repository. They will not run concurrently — the repository claim serialises them —
+but the work does happen twice.
+
+If a submission fails in a way that leaves it unclear, check before retrying:
+
+```bash
+lya daemon status
+```
+
+Anything durably accepted is listed under `QUEUED` or `ACTIVE` with its id.
+
+### Attaching And Detaching
+
+```bash
+lya attach job-1763040000-4812-0
+```
+
+streams that job's live events — the same `JobEvent` objects `events.jsonl` and `lya run --json`
+carry — rendered exactly as `lya run` renders them:
+
+```text
+Attached to job-1763040000-4812-0. Ctrl+C detaches; the job keeps running.
+14:03:21  SUPERVISOR  CLAUDE  Run the failing test and fix the race
+14:04:02  EXECUTOR    finished in 41s (3 turns)
+```
+
+Attach is **observational**. `Ctrl+C` detaches the viewer: the connection closes, the daemon forgets
+it and the job continues untouched under the daemon. Nothing about attaching can pause, stop or steer
+a job — that is what `lya control` is for. Any number of viewers may watch one job, and a job with no
+viewers runs exactly the same.
+
+`--replay` shows the job's recorded history before the live events. The subscription is opened before
+the history is read, so nothing emitted during the replay is lost, and an event the replay already
+showed is not repeated when it arrives live. The replay is bounded to the most recent events, and a
+line the event log cannot parse — what a crash mid-write leaves behind — is skipped rather than
+failing the attach. `events.jsonl` remains a record, never an authority.
+
+A viewer that stops reading is disconnected on its own, with a reason, and the job is unaffected:
+
+```text
+Detached from job-1763040000-4812-0: the client fell behind by 128 event(s)
+```
+
+A [sequential chain](#sequential-jobs) is one piece of work with several job identities. Attaching to
+the job you submitted follows the whole chain, and each job of it can also be watched by its own
+name.
+
+`--json` streams the raw events instead, one object per line.
+
+### Controlling A Job
+
+The interactive commands `lya run` accepts are addressable by job name:
+
+```bash
+lya control job-1763040000-4812-0 pause
+lya control job-1763040000-4812-0 resume
+lya control job-1763040000-4812-0 send "Also update the changelog"
+lya control job-1763040000-4812-0 status
+lya control job-1763040000-4812-0 diff
+lya control job-1763040000-4812-0 stop
+```
+
+Each command is delivered into that job's own existing control channel, so it means exactly what it
+means in an interactive `lya run`: `pause` takes effect at a safe boundary, `stop` performs a
+controlled shutdown, and `send` queues an instruction for the next agent turn under the existing
+per-job instruction limits and persistence. There is one control state machine, and the daemon does
+not add a second one.
+
+Naming the job is what makes this unambiguous while several jobs run at once — the multiplexing
+problem `lya scheduler` deliberately does not solve.
+
+`status` and `diff` answer into the job's own event stream rather than into the command's output,
+because that is where a job reports. The acknowledgement says so:
+
+```text
+Status requested; job-1763040000-4812-0 reports it in its events (lya attach job-1763040000-4812-0).
+```
+
+A control request fails, with a distinct reason, when it cannot be delivered:
+
+| Situation | Reported as |
+| --- | --- |
+| No such persisted job | `UNKNOWN_JOB` |
+| The job has reached a terminal status | `JOB_TERMINAL` |
+| The job is queued and has not started | `INVALID_FOR_STATE` |
+| The job is live but this daemon is not driving it | `JOB_NOT_OWNED` |
+| The command itself is not usable (an empty or oversized instruction) | `INVALID_REQUEST` |
+
+It never reports success for a command that was not delivered.
+
+### Restart Recovery
+
+If a daemon crashes, or the machine restarts, no job state is lost. Authoritative state is each job's
+own `state.json`, and every lock is released by the operating system on process exit.
+
+On the next start the daemon separates two questions it must not confuse:
+
+* **Queued work** was accepted and never started, so there is nothing to reconstruct. It is
+  submitted again, keeping its job identity and the limits it was accepted with. `--no-recover-queued`
+  turns this off.
+* **Interrupted work** was in the middle of something. By default the daemon finds it, reports it and
+  leaves it exactly as it is:
+
+  ```text
+  DAEMON  parked 1 interrupted job(s): job-1763039000-3140-0 (continue with lya resume --job <id>)
+  ```
+
+  Parked jobs appear under `RESUMABLE` in `lya daemon status`, so nothing is silently dropped, and
+  their persisted state is not touched.
+
+`--resume-interrupted` asks the daemon to continue them, through the ordinary resume path with its
+full validation: the persisted job is never rewritten to start it, `ResumePlan` decides where it
+continues, and anything ambiguous is parked in `WAITING_HUMAN` exactly as `lya resume` would park it.
+The daemon invents no recovery semantics of its own — it only decides whether to ask.
+
+A job another Lya process is currently driving is never taken over, even with
+`--resume-interrupted`: its job lock is held, so the daemon parks it and reports it. Startup fails
+closed.
+
+### Ownership And Exclusion
+
+Every job the daemon drives holds the same claims a foreground `lya run` takes — its
+[job lock](#job-locks) and its [repository claim](#repository-claims) — for the whole sequential
+chain. Consequently:
+
+* a foreground `lya run`, `lya resume` or `lya scheduler` cannot drive a job or a repository the
+  daemon owns; it is refused, not queued behind it;
+* the daemon cannot take over a job or a repository a foreground process owns;
+* scheduler concurrency, persisted resume rules and queued-job semantics are unchanged.
+
+Both directions fail closed, and both are enforced by the operating system rather than by
+bookkeeping.
+
+### Existing Commands Are Unchanged
+
+`doctor`, `supervisor`, `executor`, `run`, `resume`, `jobs` and `scheduler` behave exactly as before
+and are **never silently redirected** to a daemon.
+
+That is a deliberate compatibility rule, not an omission. `lya run` and `lya scheduler` are attached
+to your terminal and end with it; daemon-owned work does not. Quietly changing which one you got
+would change where your job lives, who can control it and what happens when you close the shell. Work
+reaches the daemon when you ask it to, through `lya submit`.
+
+`lya jobs` keeps listing every persisted job, whoever is driving it, and stays read-only.
+
+### The Local Protocol
+
+Clients and daemon speak a versioned, newline-delimited JSON protocol over a local transport:
+
+| Platform | Endpoint |
+| --- | --- |
+| Windows | Named pipe, `\\.\pipe\lya-daemon-<home-fingerprint>` |
+| Linux, macOS | Unix stream socket, `LYA_HOME/daemon.sock` |
+
+The endpoint is derived from `LYA_HOME`, so two homes are two independent daemons and one home is
+always the same endpoint. A client never has to be told where to look.
+
+Each frame is one JSON object on one line: an envelope carrying the protocol version around one
+tagged payload.
+
+```text
+{"protocol_version":1,"message":{"request":"ATTACH","job_id":"job-1763040000-4812-0","replay":true}}
+{"protocol_version":1,"message":{"response":"ATTACHED","job_id":"job-1763040000-4812-0"}}
+```
+
+The payload is nested rather than merged into the envelope so that no payload field can ever collide
+with the envelope's own. Requests and responses are explicit data transfer objects: a job in a status
+listing is a projection of persisted state, not that state serialized, so the on-disk layout is free
+to change and fields that have no business leaving the machine do not exist on the wire. Live job
+events are the deliberate exception — they are already Lya's published observation format.
+
+Every frame is bounded, and a malformed one is answered with an error rather than tolerated:
+
+* a frame that is not JSON, or not a message this version knows, gets `INVALID_REQUEST`;
+* a client speaking another protocol version gets `UNSUPPORTED_PROTOCOL`, naming both versions;
+* a frame that exceeds the size bound ends that connection.
+
+None of this can affect the daemon, the jobs or another client. Every connection is its own task: a
+client that sends nonsense, stops reading, or disappears mid-frame is the only thing affected.
+
+### Daemon Observability
+
+The daemon keeps its own structured history, separate from job events:
+
+```text
+LYA_HOME/daemon/events.jsonl
+```
+
+One JSON object per line, tagged `daemon_event`, covering the daemon's own life: started, stopping,
+stopped, scheduler started and stopped, work submitted, control delivered, queued work recovered,
+interrupted work parked or resumed.
+
+Transient per-connection traffic — clients connecting, disconnecting, attaching, detaching, being
+refused — is shown while you watch a daemon and deliberately **not** written to the permanent log. A
+daemon that runs for weeks would otherwise fill its history with the comings and goings of
+`lya daemon status`.
+
+Each job keeps its own `events.jsonl`, unchanged. Neither log is ever authority: every decision comes
+from authoritative persisted state and from the operating system's own claims.
+
+A detached daemon's narration is captured in `LYA_HOME/daemon/daemon.log`, which is also where a
+startup failure explains itself.
+
+### Security
+
+* The endpoint is local-only. No TCP socket is opened and no port is bound.
+* **Windows — the named pipe carries an explicit access control list.** Only the user running the
+  daemon and `SYSTEM` are granted access. Windows' *default* named-pipe descriptor is not used,
+  because it also grants read access to `Everyone` and to `ANONYMOUS LOGON`, which is enough for any
+  local account to open the pipe and hold an instance. Remote clients are refused explicitly.
+* **Windows — both ends verify the other's user.** The pipe name is a deterministic fingerprint of
+  `LYA_HOME`, and any local account may create a name in the named-pipe namespace, so a squatter can
+  own the name before the daemon starts. The access control list cannot prevent that, so it is not
+  relied on alone: the daemon checks every accepted client's token user before serving it — by
+  impersonating the client, falling back to the pipe's own client process only when impersonation is
+  unavailable — and disconnects a stranger without reporting anything to it; a client checks the
+  serving process's token user *before sending a single byte* and refuses anything that is not this
+  user's daemon. Identity is a security identifier compared with `EqualSid`, never a process ID; a
+  process ID is only ever a way to reach a token, and every failure on that path refuses.
+* **Unix — the socket is `0600` inside a `0700` home.** File-system permissions are the access
+  control. There is no name to squat: the socket is a path inside a directory only the owner can
+  traverse. *Verified by code and API contract; the Windows behaviour above is verified on Windows.*
+* A connected client that sends no request within ten seconds is disconnected. Only that client:
+  the daemon, its jobs and every other client are untouched.
+* No credential is persisted, sent or logged. Provider API keys continue to be removed from
+  child-process environments, Git publication is described by identity, remote and branch only — push
+  authentication stays with the machine's own Git configuration — and daemon metadata holds nothing
+  but a process ID, a start time, a protocol version and an endpoint.
 
 ## Safety Model
 
@@ -990,25 +1464,40 @@ repository, never commits and never pushes. Every scheduled job goes through the
 verification, the same snapshot comparison and the same guarded publication as a single `lya run`,
 and repository claims mean two jobs can never reach one working tree at the same time.
 
+Daemon mode changes none of it either. The daemon owns processes, connections and shutdown; it holds
+no job semantics, no control state machine and no recovery rules of its own. A daemon-driven job is
+the same job, under the same claims, with the same guarded publication, and a client can ask it only
+for things a terminal could already ask for. Its endpoint is local, and nothing it stores, sends or
+logs contains a credential.
+
 Lya also avoids giving provider processes unnecessary billing credentials by removing environment-provided API keys from their child-process environments.
 
 These protections reduce accidental autonomous changes, but Lya is experimental software. Run autonomous workflows only in repositories where you understand and accept the risks.
 
 ## Current Limitations
 
-`lya run` drives one job at a time. Concurrent work goes through `lya scheduler`, which is
-non-interactive: it accepts no typed commands while jobs run.
+`lya run` drives one job at a time. Concurrent work goes through `lya scheduler` or the daemon.
+Neither accepts typed commands on one terminal: a concurrent job is controlled by naming it, with
+`lya control <job-id> ...`.
 
-A second `Ctrl+C` force-terminates Lya immediately. That is intentional and safe for job locks and
-repository claims, which the operating system releases on process exit, but it skips Lya's own
-cleanup.
+A second `Ctrl+C` force-terminates Lya immediately. That is intentional and safe for job locks,
+repository claims and the daemon claim, which the operating system releases on process exit, but it
+skips Lya's own cleanup.
+
+Daemon mode is local only, by design: one daemon per `LYA_HOME`, reachable from the machine it runs
+on and from nowhere else.
+
+`lya attach` is observational. It streams events; it does not accept typed commands on the stream.
+
+The daemon does not continue interrupted jobs unless it is started with `--resume-interrupted`.
+Interrupted work is reported and left parked instead.
 
 The following are not implemented yet:
 
-* persistent daemon/service mode;
-* background scheduling and attach/detach;
-* interactive control across several simultaneous jobs;
-* remote administration UI;
+* running the daemon as a system service (`systemd`, `launchd`, a Windows service);
+* remote or multi-machine access of any kind;
+* a web or browser administration interface;
+* typed interactive commands multiplexed across concurrent jobs on one terminal;
 * automatic conflict resolution;
 * GitHub API integration.
 
@@ -1036,9 +1525,12 @@ The following are not implemented yet:
 * [x] Provider process-tree cancellation
 * [x] Bounded multi-project scheduling
 * [x] Repository-level coordination
-* [ ] Daemon/service mode
+* [x] Persistent local daemon mode
+* [x] Background scheduling with attach/detach
+* [x] Per-job remote control through the daemon
+* [ ] Running the daemon as a system service
 * [ ] Remote administration interface
-* [ ] Interactive control across concurrent jobs
+* [ ] Typed interactive commands across concurrent jobs
 * [ ] Additional Supervisor and Executor providers
 * [ ] Stable public API
 

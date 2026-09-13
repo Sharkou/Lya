@@ -189,7 +189,7 @@ fn repository_root(canonical: &Path) -> PathBuf {
 /// Windows file systems compare paths case-insensitively, so the same repository reached through
 /// different letter case must fingerprint identically there. Unix paths are case-sensitive and are
 /// compared exactly.
-fn comparable(root: &Path) -> String {
+pub(crate) fn comparable(root: &Path) -> String {
     let rendered = root.to_string_lossy().into_owned();
     if cfg!(windows) {
         rendered.to_lowercase()
@@ -200,7 +200,7 @@ fn comparable(root: &Path) -> String {
 
 /// FNV-1a, 128 bit. Chosen because it is a handful of lines with no dependency and produces a
 /// stable, platform-independent file name for the same input.
-fn fingerprint(value: &str) -> String {
+pub(crate) fn fingerprint(value: &str) -> String {
     const OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
     let mut hash = OFFSET_BASIS;

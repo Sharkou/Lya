@@ -77,6 +77,25 @@ impl JobStatus {
         }
     }
 
+    /// Whether this terminal status counts as a successful outcome.
+    ///
+    /// One definition for every surface: a single `lya run`, a scheduled job and a daemon-driven job
+    /// must never disagree about whether the same status was a success. A job that is still
+    /// `RUNNING`, or one that was accepted into a queue and never started, is not an outcome at all
+    /// and is therefore not a successful one.
+    pub fn is_successful_outcome(&self) -> bool {
+        matches!(
+            self,
+            Self::Accepted
+                | Self::Published
+                | Self::Paused
+                | Self::WaitingHuman
+                | Self::WaitingClaudeQuota
+                | Self::WaitingOpenAiQuota
+                | Self::Stopped
+        )
+    }
+
     /// A job that a later Lya process may continue. `FAILED`, `STOPPED`, `PUBLISHED`, `ACCEPTED`
     /// and `WAITING_HUMAN` are deliberately excluded: they are terminal for automatic recovery and
     /// need an explicit human decision instead. `QUEUED` is excluded too: it was never started, so

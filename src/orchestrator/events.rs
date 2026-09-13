@@ -19,7 +19,7 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobEvent {
-    pub timestamp_unix_millis: u128,
+    pub timestamp_unix_millis: u64,
     pub job_id: String,
     pub project_name: String,
     pub project_path: PathBuf,
@@ -36,10 +36,7 @@ impl JobEvent {
         kind: JobEventKind,
     ) -> Self {
         Self {
-            timestamp_unix_millis: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
+            timestamp_unix_millis: current_unix_millis(),
             job_id: job_id.into(),
             project_name: project.name.clone(),
             project_path: project.path.clone(),
@@ -769,7 +766,20 @@ fn prefix_lines(rendered: &str, prefix: &str) -> String {
     output
 }
 
-pub(crate) fn format_timestamp(timestamp_unix_millis: u128) -> String {
+/// Milliseconds since the Unix epoch.
+///
+/// 64 bits on purpose: an event is deserialized through serde's buffering — a flattened field or a
+/// tagged enum — and that buffer has no 128-bit integer, so a wider timestamp could be written and
+/// never read back.
+pub(crate) fn current_unix_millis() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn format_timestamp(timestamp_unix_millis: u64) -> String {
     let seconds = (timestamp_unix_millis / 1_000) % 86_400;
     format!(
         "{:02}:{:02}:{:02}",
