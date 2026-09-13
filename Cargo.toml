@@ -2,9 +2,23 @@
 name = "Lya"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+description = "Local-first AI agent and autonomous development orchestrator"
+repository = "https://github.com/Sharkou/Lya"
+readme = "README.md"
+license = "MIT"
+keywords = ["agent", "orchestrator", "automation", "cli", "llm"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "lya"
+
+# The published command is `lya` on every platform. The package keeps its original
+# casing, so this only fixes the executable file name Cargo would otherwise derive
+# from it (`Lya.exe` on Windows, `Lya` elsewhere).
+[[bin]]
+name = "lya"
+path = "src/main.rs"
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
