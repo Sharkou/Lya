@@ -2238,17 +2238,28 @@ async fn attach_to_job(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match client
+    // Whether the daemon opened a live stream or a replay of a finished job. It only decides what
+    // this command *says*; the events are rendered identically either way.
+    let live_stream = match client
         .request(DaemonRequest::Attach {
             job_id: options.job_id.clone(),
             replay: options.replay,
         })
         .await
     {
-        Ok(DaemonResponse::Attached { job_id }) => {
+        Ok(DaemonResponse::Attached { job_id, live }) => {
             if matches!(options.output, RunOutput::Human(_)) {
-                println!("Attached to {job_id}. Ctrl+C detaches; the job keeps running.");
+                if live {
+                    println!("Attached to {job_id}. Ctrl+C detaches; the job keeps running.");
+                } else {
+                    // A finished job is replayed rather than followed, so promising that it keeps
+                    // running would be wrong in both halves of the sentence.
+                    println!(
+                        "Replaying {job_id}. It has finished, so no further events will arrive."
+                    );
+                }
             }
+            live
         }
         Ok(other) => {
             eprintln!(
@@ -2261,7 +2272,7 @@ async fn attach_to_job(arguments: &[String]) -> ExitCode {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
-    }
+    };
 
     let sink: Box<dyn EventSink> = match options.output {
         RunOutput::Json => Box::new(JsonEventSink::new(io::stdout())),
@@ -2281,7 +2292,12 @@ async fn attach_to_job(arguments: &[String]) -> ExitCode {
                 }
                 Ok(Some(DaemonResponse::Detached { job_id, reason })) => {
                     if matches!(options.output, RunOutput::Human(_)) {
-                        println!("Detached from {job_id}: {reason}");
+                        if live_stream {
+                            println!("Detached from {job_id}: {reason}");
+                        } else {
+                            // The replay simply finished; nothing was detached from.
+                            println!("{reason}");
+                        }
                     }
                     break false;
                 }
@@ -2302,10 +2318,14 @@ async fn attach_to_job(arguments: &[String]) -> ExitCode {
     };
     client.close().await;
     if interrupted && matches!(options.output, RunOutput::Human(_)) {
-        println!(
-            "Detached from {}. The job continues under the daemon.",
-            options.job_id
-        );
+        if live_stream {
+            println!(
+                "Detached from {}. The job continues under the daemon.",
+                options.job_id
+            );
+        } else {
+            println!("Stopped replaying {}.", options.job_id);
+        }
     }
     ExitCode::SUCCESS
 }

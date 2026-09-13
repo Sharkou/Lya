@@ -553,6 +553,18 @@ carry — rendered exactly as `lya run` renders them. Exactly one job id is requ
 | `--replay` | show the job's recorded history before the live events |
 | `--verbose` / `--json` | output mode, exactly as `lya run` |
 
+What an attach does depends on whether the job can still emit anything:
+
+| Job | `lya attach <job-id>` |
+| --- | --- |
+| running, paused, waiting or queued | follows live events until you detach |
+| terminal (`ACCEPTED`, `PUBLISHED`, `FAILED`, `STOPPED`, `WAITING_HUMAN`) | replays the recorded history, then exits `0` |
+| never persisted | fails with `UNKNOWN_JOB` |
+
+A finished job needs no `--replay`; it has nothing else to show, and no live subscription is opened
+for it. See [Daemon — attaching to a job that has already
+finished](daemon.md#attaching-to-a-job-that-has-already-finished).
+
 ```bash
 lya attach job-1763040000-4812-0
 lya attach job-1763040000-4812-0 --replay --json
@@ -564,7 +576,8 @@ it and the job continues untouched. Nothing about attaching can pause, stop or s
 runs exactly the same.
 
 The replay is bounded to the most recent events, and an unparseable line — what a crash mid-write
-leaves behind — is skipped rather than failing the attach.
+leaves behind — is skipped rather than failing the attach. A terminal job whose log is missing or
+unreadable still attaches successfully and reports its authoritative status.
 
 ---
 

@@ -329,6 +329,40 @@ The file is appended and synced after each event and is never rewritten as a who
 persistence is **required**: if Lya cannot write or sync an event it stops the job before the next
 Supervisor, Executor or Git action and reports the error.
 
+#### `EXECUTOR_FINISHED` and `total_cost_usd`
+
+`EXECUTOR_FINISHED` carries the fields Claude Code reports in its own JSON envelope, including
+`total_cost_usd`. That number is **provider metadata, preserved verbatim**. Lya does not compute it,
+does not aggregate it, and has no knowledge of how the provider CLI is authenticated or billed — it
+[removes `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`](security.md#provider-credentials) from provider
+child environments, so an authenticated subscription session is the normal case.
+
+So the field is **not evidence that anything was charged, and not evidence that nothing was**. Lya
+will not claim either. `lya run --verbose` and `lya attach --verbose` say so where a person reads it:
+
+```text
+      Claude-reported cost metadata: $0.0794 (not proof of billing)
+```
+
+Authentication and billing belong to the provider CLI and your account with that provider. Check
+them there, not here.
+
+#### Encoding
+
+`events.jsonl` is plain UTF-8 with no byte-order mark, which is what JSON requires and what every
+JSON reader expects. Provider text is stored exactly as the provider produced it — non-ASCII
+characters are neither escaped nor rewritten.
+
+On Windows that matters when you read a log by hand. Windows PowerShell 5.1's `Get-Content` decodes
+a file without a byte-order mark using the legacy ANSI codepage, so an em dash arrives as `â€”` and an
+arrow as `â†’`. The file is fine; the reader needs telling:
+
+```powershell
+Get-Content -Encoding UTF8 "$HOME\.lya\jobs\<job-id>\events.jsonl"
+```
+
+PowerShell 7 and `lya attach` both decode it correctly without help.
+
 The log is observability, never authority. It is not parsed to decide whether Git may write, so a
 malformed older log cannot weaken publication verification. The same event model is independent of
 terminal rendering, which is why `lya attach` can replay and stream it unchanged.

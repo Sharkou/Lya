@@ -312,6 +312,44 @@ was lost looks like a failure. **Check before retrying**, or you will duplicate 
 lya daemon status
 ```
 
+### `lya attach` says the job has finished
+
+That is the intended answer, not an error. A job in a terminal status replays its recorded history
+and exits `0`:
+
+```text
+Replaying job-1763040000-4812-0. It has finished, so no further events will arrive.
+...
+job-1763040000-4812-0 is ACCEPTED; replayed 9 recorded event(s)
+```
+
+You do not need `--replay` for it. If the reason line says `no recorded events were found`, the job
+exists and its status is authoritative — its event log is simply missing, empty or truncated, which
+a crash mid-write can leave behind.
+
+`lya control` against a finished job still reports `JOB_TERMINAL`: observing a finished job is
+harmless, steering one is not.
+
+### Recorded events look like mojibake in PowerShell
+
+Reading a log by hand and seeing `â€”` where an em dash should be, or `â†’` where an arrow should be:
+
+```powershell
+# Windows PowerShell 5.1 decodes a BOM-less file with the legacy ANSI codepage
+Get-Content "$HOME\.lya\jobs\<job-id>\events.jsonl"
+```
+
+The file is correct; the reader is not. `events.jsonl` is plain UTF-8 without a byte-order mark, so
+name the encoding:
+
+```powershell
+Get-Content -Encoding UTF8 "$HOME\.lya\jobs\<job-id>\events.jsonl"
+```
+
+PowerShell 7 defaults to UTF-8 and needs no flag. `lya attach <job-id>` renders the same events
+correctly on any shell, which is usually the easier route. See
+[Autonomous jobs — encoding](autonomous-jobs.md#encoding).
+
 ### `lya attach` detached me by itself
 
 ```text

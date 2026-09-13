@@ -508,7 +508,13 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
                     output.push_str(&detail(&format!("reported turns: {turns}")));
                 }
                 if let Some(total_cost_usd) = total_cost_usd {
-                    output.push_str(&detail(&format!("reported cost: ${total_cost_usd:.4}")));
+                    // Read straight out of Claude Code's own JSON envelope. Lya does not compute
+                    // it, does not know how the provider CLI is authenticated, and so cannot say
+                    // whether anything was charged — the wording has to stop short of claiming it
+                    // either way. See `EXECUTOR_FINISHED` in the events documentation.
+                    output.push_str(&detail(&format!(
+                        "Claude-reported cost metadata: ${total_cost_usd:.4} (not proof of billing)"
+                    )));
                 }
                 output.push_str(&full(final_response));
             } else {
@@ -879,6 +885,183 @@ mod tests {
             Some(1),
             kind,
         )
+    }
+
+    /// Text a provider really produced, with the two characters that showed up as mojibake when a
+    /// recorded log was read back by hand on Windows.
+    const NON_ASCII_REPORT: &str = "em dash: \u{2014}\narrow: \u{2192}\nfixed malformed string literal \u{2014} node --check app.js \u{2192} passed";
+
+    fn executor_finished(report: &str, total_cost_usd: Option<f64>) -> JobEvent {
+        event(JobEventKind::ExecutorFinished {
+            session_id: Some("session-1".to_owned()),
+            final_response: report.to_owned(),
+            exit_code: Some(0),
+            duration_ms: Some(41_000),
+            turns: Some(3),
+            total_cost_usd,
+            usage: None,
+        })
+    }
+
+    /// Non-ASCII provider text survives the recorded log byte for byte.
+    ///
+    /// The file is deliberately plain UTF-8 with no byte-order mark, which is what every JSON
+    /// consumer expects and what `serde_json` produces. This asserts the bytes rather than the
+    /// decoded string, because "it round-trips" and "it is encoded the way it claims" are two
+    /// different claims and only the second one explains a reader showing `\u{00e2}\u{20ac}\u{201d}`.
+    ///
+    /// That mojibake is a *reading* defect, not a writing one: Windows PowerShell 5.1's
+    /// `Get-Content` decodes a BOM-less file with the legacy ANSI codepage, so the three bytes of
+    /// an em dash arrive as three Windows-1252 characters. `Get-Content -Encoding UTF8` shows the
+    /// real text. Nothing here compensates for that by adding a BOM or escaping non-ASCII, because
+    /// either would corrupt the log for every correct consumer in order to flatter one incorrect
+    /// one.
+    #[test]
+    fn recorded_events_keep_non_ascii_provider_text_as_plain_utf8() {
+        let home = temporary_home("utf8-round-trip");
+        let sink = JsonlEventSink::for_job(&home, "job-1");
+        let original = executor_finished(NON_ASCII_REPORT, Some(0.079_407));
+        sink.emit(&original).expect("the event should be recorded");
+
+        let raw = fs::read(sink.path()).expect("the log should be readable");
+        assert_ne!(
+            &raw[..3.min(raw.len())],
+            b"\xef\xbb\xbf",
+            "the log must stay plain UTF-8 with no byte-order mark"
+        );
+        let text = std::str::from_utf8(&raw).expect("the log must be valid UTF-8");
+        // The exact UTF-8 encodings, asserted as bytes: U+2014 is E2 80 94 and U+2192 is E2 86 92.
+        assert!(
+            raw.windows(3).any(|window| window == [0xe2, 0x80, 0x94]),
+            "an em dash should be stored as its UTF-8 bytes"
+        );
+        assert!(
+            raw.windows(3).any(|window| window == [0xe2, 0x86, 0x92]),
+            "an arrow should be stored as its UTF-8 bytes"
+        );
+        assert!(
+            !text.contains("\\u2014") && !text.contains("\\u2192"),
+            "non-ASCII must not be escaped away: {text}"
+        );
+
+        let decoded: JobEvent =
+            serde_json::from_str(text.trim_end()).expect("the line should decode");
+        assert_eq!(decoded, original, "the event should round-trip exactly");
+        match &decoded.kind {
+            JobEventKind::ExecutorFinished { final_response, .. } => {
+                assert_eq!(final_response, NON_ASCII_REPORT);
+                assert!(final_response.contains('\u{2014}') && final_response.contains('\u{2192}'));
+            }
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The same characters survive Lya's own rendering, in every human mode.
+    #[test]
+    fn rendering_keeps_non_ascii_provider_text() {
+        let event = executor_finished(NON_ASCII_REPORT, Some(0.079_407));
+
+        for mode in [HumanRenderMode::Normal, HumanRenderMode::Verbose] {
+            let rendered = render_human(&event, mode, false);
+            assert!(
+                rendered.contains('\u{2014}'),
+                "an em dash should survive {mode:?} rendering: {rendered}"
+            );
+            assert!(
+                rendered.contains('\u{2192}'),
+                "an arrow should survive {mode:?} rendering: {rendered}"
+            );
+            assert!(
+                !rendered.contains('\u{fffd}'),
+                "nothing should be replaced with U+FFFD: {rendered}"
+            );
+        }
+    }
+
+    /// The cost line says whose number it is and what it does not prove.
+    ///
+    /// `total_cost_usd` is parsed straight out of Claude Code's JSON envelope. Lya neither computes
+    /// it nor knows how the provider CLI is authenticated — it removes `ANTHROPIC_API_KEY` from the
+    /// child environment, so a subscription session is the normal case — and it must therefore not
+    /// present the number as a charge. The field itself is preserved untouched for machine readers.
+    #[test]
+    fn the_verbose_cost_line_describes_provider_metadata_rather_than_a_bill() {
+        let event = executor_finished("done", Some(0.079_407));
+
+        let verbose = render_human(&event, HumanRenderMode::Verbose, false);
+        assert!(
+            verbose.contains("Claude-reported cost metadata: $0.0794"),
+            "the cost must be attributed to the provider: {verbose}"
+        );
+        assert!(
+            verbose.contains("not proof of billing"),
+            "the cost must not read as a confirmed charge: {verbose}"
+        );
+        // Normal mode stays quiet about it; only `--verbose` shows provider metadata.
+        let normal = render_human(&event, HumanRenderMode::Normal, false);
+        assert!(!normal.contains("cost"), "{normal}");
+
+        // Absent metadata produces no line at all rather than a zero, which would be a claim.
+        let without = render_human(
+            &executor_finished("done", None),
+            HumanRenderMode::Verbose,
+            false,
+        );
+        assert!(!without.contains("cost"), "{without}");
+    }
+
+    /// A log whose last line was cut off mid-write stays usable.
+    ///
+    /// This is what a crash leaves behind. The complete lines before it must still decode, so a
+    /// reader — including the daemon's replay — can skip the tail rather than reject the file.
+    #[test]
+    fn a_truncated_final_line_leaves_the_earlier_events_readable() {
+        let home = temporary_home("utf8-truncated");
+        let sink = JsonlEventSink::for_job(&home, "job-1");
+        sink.emit(&executor_finished(NON_ASCII_REPORT, Some(0.5)))
+            .expect("the event should be recorded");
+
+        // Append a line that stops in the middle, exactly as an interrupted write would.
+        let mut raw = fs::read(sink.path()).expect("the log should be readable");
+        raw.extend_from_slice(br#"{"timestamp_unix_millis":1,"job_id":"job-1","#);
+        fs::write(sink.path(), &raw).expect("the log should be writable");
+
+        let mut decoded = 0;
+        let mut skipped = 0;
+        let text = String::from_utf8(raw).expect("the log must stay valid UTF-8");
+        for line in text.lines() {
+            match serde_json::from_str::<JobEvent>(line) {
+                Ok(event) => {
+                    decoded += 1;
+                    match &event.kind {
+                        JobEventKind::ExecutorFinished { final_response, .. } => {
+                            assert!(final_response.contains('\u{2014}'));
+                        }
+                        other => panic!("unexpected event kind: {other:?}"),
+                    }
+                }
+                Err(_) => skipped += 1,
+            }
+        }
+        assert_eq!(decoded, 1, "the complete event should still decode");
+        assert_eq!(skipped, 1, "the truncated tail should be the only casualty");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    fn temporary_home(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "lya-events-test-{}-{name}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).expect("the home should be created");
+        home
     }
 
     #[test]

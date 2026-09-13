@@ -590,31 +590,52 @@ impl DaemonState {
         }
     }
 
-    /// Whether a job may be observed live, and why not when it may not.
-    fn may_attach(&self, job_id: &str) -> Result<(), DaemonErrorResponse> {
+    /// How a job may be observed, and why it may not be when it cannot.
+    ///
+    /// A job that exists is always observable. Only two answers are refusals: a job that was never
+    /// persisted, and a store this daemon cannot read.
+    fn may_attach(&self, job_id: &str) -> Result<AttachMode, DaemonErrorResponse> {
         if self.control.sender_for(job_id).is_some() {
-            return Ok(());
+            return Ok(AttachMode::Live);
         }
         match self.store.load_job(job_id) {
             Ok(None) => Err(DaemonErrorResponse::new(
                 DaemonErrorCode::UnknownJob,
                 format!("no persisted job {job_id}"),
             )),
-            Ok(Some(job)) if is_terminal(&job.status) => Err(DaemonErrorResponse::new(
-                DaemonErrorCode::JobTerminal,
-                format!(
-                    "job {job_id} is {} and emits no further events",
-                    job.status.label()
-                ),
-            )),
+            // A finished job used to be refused outright, which made the daemon's own
+            // "watch one with: lya attach <job-id>" a broken instruction the moment the job
+            // outran the person reading it. It has a recorded history and that is worth showing:
+            // the history is replayed and the stream then ends, because a terminal job cannot
+            // emit anything further and waiting for it would hang forever. Persisted state is
+            // consulted only to establish that the job exists and is terminal; what gets shown
+            // comes from the event log, which stays observational.
+            Ok(Some(job)) if is_terminal(&job.status) => Ok(AttachMode::History {
+                status: job.status.label().to_owned(),
+            }),
             // Queued work and work this daemon has not started yet may be watched: the stream opens
             // now and carries events as soon as they exist.
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(_)) => Ok(AttachMode::Live),
             Err(error) => Err(DaemonErrorResponse::new(
                 DaemonErrorCode::Internal,
                 error.to_string(),
             )),
         }
+    }
+}
+
+/// What an attach can actually deliver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachMode {
+    /// The job can still emit events, so the stream stays open and follows them.
+    Live,
+    /// The job has finished. Its recorded history is replayed and the stream ends.
+    History { status: String },
+}
+
+impl AttachMode {
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live)
     }
 }
 
@@ -646,7 +667,11 @@ enum Flow {
     /// Close this connection.
     Close,
     /// Hand the connection over to an event stream.
-    Attach { job_id: String, replay: bool },
+    Attach {
+        job_id: String,
+        replay: bool,
+        mode: AttachMode,
+    },
 }
 
 /// How long a connected client has to send its first frame.
@@ -739,8 +764,13 @@ async fn serve_client(state: Arc<DaemonState>, connection: DaemonConnection) {
         }
     }
 
-    if let Flow::Attach { job_id, replay } = flow {
-        let detach_reason = stream_events(&state, &job_id, replay, reader, writer).await;
+    if let Flow::Attach {
+        job_id,
+        replay,
+        mode,
+    } = flow
+    {
+        let detach_reason = stream_events(&state, &job_id, replay, &mode, reader, writer).await;
         state.emit(DaemonEventKind::JobDetached {
             client_id,
             job_id,
@@ -816,7 +846,7 @@ async fn handle(
             Err(error) => (DaemonResponse::Error { error }, Flow::Continue),
         },
         DaemonRequest::Attach { job_id, replay } => match state.may_attach(&job_id) {
-            Ok(()) => {
+            Ok(mode) => {
                 state.emit(DaemonEventKind::JobAttached {
                     client_id,
                     job_id: job_id.clone(),
@@ -824,8 +854,13 @@ async fn handle(
                 (
                     DaemonResponse::Attached {
                         job_id: job_id.clone(),
+                        live: mode.is_live(),
                     },
-                    Flow::Attach { job_id, replay },
+                    Flow::Attach {
+                        job_id,
+                        replay,
+                        mode,
+                    },
                 )
             }
             Err(error) => (DaemonResponse::Error { error }, Flow::Continue),
@@ -848,16 +883,25 @@ async fn handle(
 /// connection, and the daemon should forget the viewer then rather than at the next event. A client
 /// on an event stream has nothing to say, so anything it does send is ignored.
 ///
+/// A terminal job takes the short path instead: its history is replayed and the stream ends. No
+/// subscription is opened for it, because a job that has finished has no publisher and a viewer
+/// waiting on one would wait for as long as it was willing to.
+///
 /// Nothing here can affect the job: a client that leaves, falls behind or closes mid-frame ends this
 /// stream alone.
 async fn stream_events(
     state: &Arc<DaemonState>,
     job_id: &str,
     replay: bool,
+    mode: &AttachMode,
     mut reader: DaemonReader,
     mut writer: DaemonWriter,
 ) -> String {
     use tokio::sync::broadcast::error::RecvError;
+
+    if let AttachMode::History { status } = mode {
+        return replay_terminal_job(state, job_id, status, writer).await;
+    }
 
     let mut subscription = state.broadcaster.subscribe(job_id);
     let mut guard = ReplayGuard::new();
@@ -930,6 +974,50 @@ async fn stream_events(
             },
         }
     }
+}
+
+/// Replay a finished job's recorded history, then end the stream.
+///
+/// No subscription and no read half: there is no publisher to wait for and nothing a viewer could
+/// say. The reason the stream ends names the job's authoritative status and how much history was
+/// found, so a job whose event log is missing, empty or unreadable still produces a useful answer
+/// instead of silence. Unparseable lines are skipped by [`recorded_events`], which is deliberately
+/// tolerant: a log truncated by a crash is a record, never an authority.
+async fn replay_terminal_job(
+    state: &Arc<DaemonState>,
+    job_id: &str,
+    status: &str,
+    mut writer: DaemonWriter,
+) -> String {
+    let history = recorded_events(state.home.path(), job_id);
+    let recorded = history.len();
+    for event in history {
+        if !write_response(
+            &mut writer,
+            DaemonResponse::Event {
+                event: Box::new(event),
+            },
+        )
+        .await
+        {
+            return "the client closed the stream".to_owned();
+        }
+    }
+    let reason = if recorded == 0 {
+        format!("job {job_id} is {status}; no recorded events were found")
+    } else {
+        format!("job {job_id} is {status}; replayed {recorded} recorded event(s)")
+    };
+    let _ = write_response(
+        &mut writer,
+        DaemonResponse::Detached {
+            job_id: job_id.to_owned(),
+            reason: reason.clone(),
+        },
+    )
+    .await;
+    writer.shutdown().await;
+    reason
 }
 
 #[derive(Debug)]
@@ -1946,15 +2034,13 @@ mod tests {
         let _ = fs::remove_dir_all(project);
     }
 
-    /// Attaching to something that cannot emit events fails with a reason, never silently.
+    /// Attaching to a job that was never persisted still fails with a reason, never silently.
+    ///
+    /// This is the one attach refusal left: a job that does not exist. A job that *does* exist is
+    /// always observable, whether it is still running or already finished.
     #[tokio::test]
-    async fn attaching_to_an_unknown_or_terminal_job_fails_clearly() {
+    async fn attaching_to_an_unknown_job_fails_clearly() {
         let home = home();
-        let project = repository("daemon-attach-refusal");
-        let store = StateStore::at(home.path());
-        let mut finished = JobState::new("finished-job", "project", project.clone(), "done");
-        finished.status = JobStatus::Published;
-        store.save_job(&finished).expect("the job should persist");
         let broadcaster = JobEventBroadcaster::new();
         let (driver, _handles) = TestDriver::new(&home, broadcaster.clone(), &[]);
         let daemon =
@@ -1968,23 +2054,198 @@ mod tests {
             })
             .await
             .expect_err("an unknown job cannot be attached");
-        let terminal = client
-            .request(DaemonRequest::Attach {
-                job_id: "finished-job".to_owned(),
-                replay: false,
-            })
-            .await
-            .expect_err("a finished job cannot be attached");
 
         assert!(
             matches!(&unknown, ClientError::Daemon(error)
                 if error.code == crate::daemon::protocol::DaemonErrorCode::UnknownJob),
             "{unknown}"
         );
+        client.close().await;
+        daemon.stop().await;
+        let _ = fs::remove_dir_all(home.path());
+    }
+
+    /// A finished job replays its recorded history and the stream ends.
+    ///
+    /// The daemon tells people to "watch one with: lya attach <job-id>", and a job that finished
+    /// before they got there used to answer `JOB_TERMINAL`. It has a history worth showing, so it
+    /// shows it. Every terminal status behaves the same way, and none of them waits: a job with no
+    /// publisher left would otherwise hold a viewer open for as long as it was willing to wait.
+    #[tokio::test]
+    async fn a_terminal_job_replays_its_history_and_ends_the_stream() {
+        for status in [
+            JobStatus::Accepted,
+            JobStatus::Published,
+            JobStatus::Failed,
+            JobStatus::Stopped,
+            JobStatus::WaitingHuman,
+        ] {
+            let home = home();
+            let project = repository("daemon-terminal-replay");
+            let store = StateStore::at(home.path());
+            let job_id = format!("finished-{}", status.label().to_lowercase());
+            let mut finished = JobState::new(&job_id, "project", project.clone(), "done");
+            finished.status = status.clone();
+            store.save_job(&finished).expect("the job should persist");
+
+            let recorded =
+                crate::orchestrator::events::JsonlEventSink::for_job(home.path(), &job_id);
+            for message in ["first recorded", "second recorded"] {
+                recorded
+                    .emit(&event(&job_id, message))
+                    .expect("history should be recorded");
+            }
+
+            let broadcaster = JobEventBroadcaster::new();
+            let (driver, _handles) = TestDriver::new(&home, broadcaster.clone(), &[]);
+            let daemon =
+                RunningDaemon::start(&home, driver, broadcaster, DaemonConfig::default()).await;
+            let mut client = daemon.client().await;
+
+            let attached = client
+                .request(DaemonRequest::Attach {
+                    job_id: job_id.clone(),
+                    replay: false,
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("a {} job should be observable: {error}", status.label())
+                });
+            assert!(
+                matches!(&attached, DaemonResponse::Attached { live, .. } if !live),
+                "a finished job is not a live stream: {attached:?}"
+            );
+
+            // The whole exchange has to complete on its own. A terminal attach that waited on a
+            // subscription nobody publishes to would hang here rather than fail.
+            let messages = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut seen = Vec::new();
+                while let Ok(Some(message)) = client.next_message().await {
+                    let done = matches!(message, DaemonResponse::Detached { .. });
+                    seen.push(message);
+                    if done {
+                        break;
+                    }
+                }
+                seen
+            })
+            .await
+            .expect("a terminal replay must finish rather than wait for a live stream");
+
+            let replayed = messages
+                .iter()
+                .filter_map(|message| match message {
+                    DaemonResponse::Event { event } => match &event.kind {
+                        JobEventKind::ControlMessage { message } => Some(message.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replayed,
+                vec!["first recorded".to_owned(), "second recorded".to_owned()],
+                "the recorded history should be replayed in order for {}",
+                status.label()
+            );
+
+            let reason = messages
+                .iter()
+                .find_map(|message| match message {
+                    DaemonResponse::Detached { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                })
+                .expect("the stream should end with a reason");
+            assert!(
+                reason.contains(status.label()) && reason.contains("replayed 2"),
+                "the reason should name the authoritative status and the history size: {reason}"
+            );
+
+            client.close().await;
+            daemon.stop().await;
+            let _ = fs::remove_dir_all(home.path());
+            let _ = fs::remove_dir_all(project);
+        }
+    }
+
+    /// A finished job with no readable history is still answered from authoritative state.
+    ///
+    /// A missing, empty or crash-truncated event log must not make the job look as though it never
+    /// existed, and must not hang. The persisted status is the answer in that case.
+    #[tokio::test]
+    async fn a_terminal_job_without_history_reports_its_persisted_status() {
+        let home = home();
+        let project = repository("daemon-terminal-no-history");
+        let store = StateStore::at(home.path());
+        let mut finished = JobState::new("no-history", "project", project.clone(), "done");
+        finished.status = JobStatus::Failed;
+        store.save_job(&finished).expect("the job should persist");
+        let broadcaster = JobEventBroadcaster::new();
+        let (driver, _handles) = TestDriver::new(&home, broadcaster.clone(), &[]);
+        let daemon =
+            RunningDaemon::start(&home, driver, broadcaster, DaemonConfig::default()).await;
+        let mut client = daemon.client().await;
+
+        let attached = client
+            .request(DaemonRequest::Attach {
+                job_id: "no-history".to_owned(),
+                replay: false,
+            })
+            .await
+            .expect("a job with no history is still a job that exists");
+        assert!(matches!(&attached, DaemonResponse::Attached { live, .. } if !live));
+
+        let reason = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(message)) = client.next_message().await {
+                if let DaemonResponse::Detached { reason, .. } = message {
+                    return reason;
+                }
+            }
+            String::new()
+        })
+        .await
+        .expect("an empty replay must finish rather than wait");
+
         assert!(
-            matches!(&terminal, ClientError::Daemon(error)
+            reason.contains("FAILED") && reason.contains("no recorded events"),
+            "the reason should say what the job is and that nothing was recorded: {reason}"
+        );
+        client.close().await;
+        daemon.stop().await;
+        let _ = fs::remove_dir_all(home.path());
+        let _ = fs::remove_dir_all(project);
+    }
+
+    /// Attach became more permissive; control did not.
+    ///
+    /// Observing a finished job is harmless. Steering one is not, and a command that cannot be
+    /// delivered must still say so rather than reporting a success nothing acted on.
+    #[tokio::test]
+    async fn control_still_refuses_a_terminal_job_that_attach_now_replays() {
+        let home = home();
+        let project = repository("daemon-terminal-control");
+        let store = StateStore::at(home.path());
+        let mut finished = JobState::new("done-job", "project", project.clone(), "done");
+        finished.status = JobStatus::Accepted;
+        store.save_job(&finished).expect("the job should persist");
+        let broadcaster = JobEventBroadcaster::new();
+        let (driver, _handles) = TestDriver::new(&home, broadcaster.clone(), &[]);
+        let daemon =
+            RunningDaemon::start(&home, driver, broadcaster, DaemonConfig::default()).await;
+        let mut client = daemon.client().await;
+
+        let refused = client
+            .request(DaemonRequest::Control {
+                job_id: "done-job".to_owned(),
+                command: ControlRequest::Pause,
+            })
+            .await
+            .expect_err("a finished job cannot be controlled");
+
+        assert!(
+            matches!(&refused, ClientError::Daemon(error)
                 if error.code == crate::daemon::protocol::DaemonErrorCode::JobTerminal),
-            "{terminal}"
+            "{refused}"
         );
         client.close().await;
         daemon.stop().await;

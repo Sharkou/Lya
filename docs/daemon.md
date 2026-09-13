@@ -215,6 +215,39 @@ showed is not repeated when it arrives live. The replay is bounded to the most r
 line the event log cannot parse — what a crash mid-write leaves behind — is skipped rather than
 failing the attach. `events.jsonl` remains a record, never an authority.
 
+### Attaching to a job that has already finished
+
+A job that reached a terminal status — `ACCEPTED`, `PUBLISHED`, `FAILED`, `STOPPED` or
+`WAITING_HUMAN` — is still worth attaching to, and `lya attach <job-id>` replays its recorded
+history and exits:
+
+```text
+Replaying job-1763040000-4812-0. It has finished, so no further events will arrive.
+14:03:21  SUPERVISOR  CLAUDE
+      ...
+job-1763040000-4812-0 is ACCEPTED; replayed 9 recorded event(s)
+```
+
+No `--replay` is needed: a finished job has nothing else to show. The daemon does not open a live
+subscription for it either, because a job with no publisher left would hold the viewer open
+indefinitely.
+
+This is what makes the daemon's own `Watch one with: lya attach <job-id>` hint usable when a short
+job finishes before you get to it. Earlier versions refused such an attach with `JOB_TERMINAL`.
+
+Persisted state is consulted only to establish that the job exists and which terminal status it
+holds; everything shown comes from the event log, which stays observational. If that log is missing,
+empty or truncated by a crash, the attach still succeeds and reports the authoritative status
+instead:
+
+```text
+job-1763039000-3140-0 is FAILED; no recorded events were found
+```
+
+A job that was never persisted is still `UNKNOWN_JOB` — that is the one attach refusal left. And
+this is **attach only**: `lya control` against a finished job still reports `JOB_TERMINAL`, because
+observing a finished job is harmless and steering one is not.
+
 A viewer that stops reading is disconnected on its own, with a reason, and the job is unaffected:
 
 ```text
@@ -341,7 +374,7 @@ tagged payload.
 
 ```text
 {"protocol_version":1,"message":{"request":"ATTACH","job_id":"job-1763040000-4812-0","replay":true}}
-{"protocol_version":1,"message":{"response":"ATTACHED","job_id":"job-1763040000-4812-0"}}
+{"protocol_version":1,"message":{"response":"ATTACHED","job_id":"job-1763040000-4812-0","live":true}}
 ```
 
 The payload is nested rather than merged into the envelope so no payload field can collide with the
@@ -371,6 +404,14 @@ LYA_HOME/daemon/events.jsonl
 One JSON object per line, tagged `daemon_event`, covering the daemon's own life: started, stopping,
 stopped, scheduler started and stopped, work submitted, control delivered, queued work recovered,
 interrupted work parked or resumed.
+
+Both logs are plain UTF-8 with no byte-order mark. On Windows, read them with an explicit encoding —
+Windows PowerShell 5.1 otherwise decodes them with the legacy ANSI codepage and non-ASCII text
+arrives as mojibake:
+
+```powershell
+Get-Content -Encoding UTF8 "$HOME\.lya\daemon\events.jsonl"
+```
 
 Transient per-connection traffic — clients connecting, disconnecting, attaching, detaching, being
 refused — is shown while you watch a foreground daemon and deliberately **not** written to the

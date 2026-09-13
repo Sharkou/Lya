@@ -11,7 +11,7 @@
 //!
 //!   ```text
 //!   {"protocol_version":1,"message":{"request":"ATTACH","job_id":"job-17-4-0","replay":true}}
-//!   {"protocol_version":1,"message":{"response":"ATTACHED","job_id":"job-17-4-0"}}
+//!   {"protocol_version":1,"message":{"response":"ATTACHED","job_id":"job-17-4-0","live":true}}
 //!   ```
 //!
 //!   The payload is nested rather than hoisted into the envelope on purpose: a hoisted payload
@@ -51,6 +51,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// A client cannot make the daemon allocate without bound, and a job event that would exceed it is
 /// a bug in the emitter rather than something to stream.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// An attach is live unless the daemon says otherwise, which is what the field's absence means.
+fn live_by_default() -> bool {
+    true
+}
 
 /// One request, as it travels over the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +141,16 @@ pub enum DaemonResponse {
     /// The attach stream is open. Events follow on the same connection.
     Attached {
         job_id: String,
+        /// Whether live events can still arrive.
+        ///
+        /// `false` for a job that has already reached a terminal status: its recorded history is
+        /// replayed and the stream then ends, because there is nothing further to wait for. The
+        /// client uses this only to say the right thing — the events themselves are identical.
+        ///
+        /// Defaults to `true` so a frame written before this field existed still reads as the live
+        /// attach it could only have been.
+        #[serde(default = "live_by_default")]
+        live: bool,
     },
     /// One job event on an open attach stream.
     Event {
@@ -561,12 +576,30 @@ mod tests {
 
         let frame = encode_response(DaemonResponse::Attached {
             job_id: "job-1".to_owned(),
+            live: true,
         })
         .expect("a response should encode");
         let value: serde_json::Value =
             serde_json::from_slice(&frame).expect("a frame is one JSON object");
         assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(value["message"]["response"], "ATTACHED");
+        assert_eq!(value["message"]["live"], true);
+    }
+
+    /// An `ATTACHED` frame written before `live` existed still reads as the live attach it could
+    /// only have been, so the field is additive rather than a protocol break.
+    #[test]
+    fn an_attached_frame_without_the_live_field_defaults_to_a_live_stream() {
+        let frame = r#"{"protocol_version":1,"message":{"response":"ATTACHED","job_id":"job-1"}}"#;
+        let response = decode_response(frame).expect("the frame should decode");
+
+        assert_eq!(
+            response,
+            DaemonResponse::Attached {
+                job_id: "job-1".to_owned(),
+                live: true,
+            }
+        );
     }
 
     #[test]

@@ -8,6 +8,29 @@ every release as potentially breaking: the CLI and the public API are still movi
 
 ## [Unreleased]
 
+### Changed
+
+* `lya attach <job-id>` now works on a job that has already finished: it replays the recorded
+  history and exits instead of refusing with `JOB_TERMINAL`, which made the daemon's own
+  "Watch one with: lya attach <job-id>" hint unusable for a job that outran the person reading it.
+  A terminal job opens no live subscription, so the command cannot hang waiting for events that
+  will never come, and a job whose event log is missing or truncated still reports its
+  authoritative status. `--replay` is unchanged and still bridges history to live events for a
+  running job. Attach only: `lya control` against a finished job still reports `JOB_TERMINAL`.
+* The verbose Executor line now reads `Claude-reported cost metadata: $0.0794 (not proof of
+  billing)`. `total_cost_usd` is provider metadata parsed from Claude Code's own JSON envelope and
+  is preserved untouched on the event; Lya neither computes it nor knows how the provider CLI is
+  authenticated, so it no longer reads as a confirmed charge.
+* The `ATTACHED` response carries a `live` field saying whether events can still arrive. Additive
+  and defaulted, so the protocol version is unchanged.
+
+### Documentation
+
+* Documented terminal-job attach semantics, `total_cost_usd` as provider metadata, and that
+  `events.jsonl` is plain UTF-8 without a byte-order mark — including the Windows PowerShell 5.1
+  `Get-Content -Encoding UTF8` needed to read it by hand, since 5.1 otherwise decodes it with the
+  legacy ANSI codepage and shows mojibake for text Lya stored correctly.
+
 ## [0.1.1] — 2026-09-13
 
 ### Fixed
