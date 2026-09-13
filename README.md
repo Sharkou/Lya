@@ -359,7 +359,30 @@ recorded as a `USER_INSTRUCTION_REJECTED` event; it is never dropped silently.
 
 `/pause` records a request immediately, then enters `PAUSED` only at a safe boundary. A running Codex/Claude invocation, repository capture, or Git operation is allowed to finish its current safe operation first. While paused, `/status`, `/diff`, `/send`, `/resume`, and `/stop` remain available. `/resume` continues from that exact boundary without repeating a completed provider invocation.
 
-`/stop` prevents new Supervisor, Executor, and publication actions. If Codex or Claude is active, Lya cancels and reaps its child process through the shared process runner, then records a terminal `STOPPED` state after a best-effort repository capture. Lya does not reset working-tree changes made before the stop request. During publication, a stop is observed before each guarded stage; Lya does not begin a later stage after it has observed the request.
+`/stop` prevents new Supervisor, Executor, and publication actions. If Codex or Claude is active, Lya cancels its whole process tree and reaps its own child through the shared process runner, then records a terminal `STOPPED` state after a best-effort repository capture. Lya does not reset working-tree changes made before the stop request. During publication, a stop is observed before each guarded stage; Lya does not begin a later stage after it has observed the request.
+
+### Provider Process-Tree Cancellation
+
+Codex and Claude start helper processes of their own, so cancelling only the process Lya spawned
+would leave those helpers running. Every provider process is therefore claimed by the operating
+system when it starts, and a cancellation or a timeout terminates the claim as a unit:
+
+```text
+Windows   Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+Unix      dedicated process group, signalled with killpg
+```
+
+The direct child is still killed and reaped afterwards, so a cancelled provider never becomes a
+zombie, and captured output finishes instead of waiting on a descendant that inherited the pipe. A
+timeout and a user cancellation stay distinct outcomes; both clean up the same way.
+
+On Windows the claim also covers Lya's own exit: because the job is closed when Lya's handle goes
+away, a second `Ctrl+C` cannot leave a provider tree behind. Anything a provider manages to start
+in the microseconds between the spawn and the assignment is outside the job; Windows offers no way
+to assign a job to a process that is already running.
+
+On Unix the provider no longer shares Lya's foreground process group, so a terminal `Ctrl+C`
+reaches Lya alone and the first interrupt stays a graceful stop that Lya controls.
 
 The first `Ctrl+C` follows the same graceful stop path and prints a second-press warning. A second `Ctrl+C` force-terminates the Lya process after the cancellation signal has already been sent to active child processes.
 
@@ -499,6 +522,21 @@ recorded. A pending Claude correction reuses the persisted Claude session.
 If the repository changed while Lya was not running, Lya does not guess: the job moves to
 `WAITING_HUMAN` with a precise reason.
 
+Persisted state that no continuation can be proven from — a quota wait naming a different operation
+than the one actually owed, a pending operation without the state it needs — is treated the same
+way. The job moves to `WAITING_HUMAN` with the exact reason before the resume returns, so it stops
+being offered to every later `lya resume` as a job that can still be continued. A job that is
+already terminal keeps its own status and is simply refused.
+
+An interrupted publication is one state Lya can always continue: status, phase, pending operation
+and the reviewed snapshot enter persisted state in a single write, so a crash between the `ACCEPT`
+decision and the first Git command leaves either the reviewed iteration or a resumable
+`PUBLISHING` job, never something in between.
+
+A completed Claude run is made durable before Lya reaches its next interruptible boundary. Pausing,
+closing Lya's input, or losing the process the moment Claude returns keeps the session reference
+and the report, and the resumed job continues with a new review instead of re-running Claude.
+
 Resume emits `RESUME_STARTED`, `RESUME_VALIDATED`, `RESUME_REJECTED` and `QUOTA_RETRY_STARTED`
 events into the same `events.jsonl` as the original process. Interactive control and `--json`
 output work exactly as they do for a fresh run.
@@ -512,6 +550,13 @@ reported reason.
 Classification prefers documented structured provider information. Where a CLI documents no
 machine-readable quota signal, Lya falls back to a message heuristic and records that explicitly as
 `PROVIDER_MESSAGE_HEURISTIC`, so a quota decision never looks more precise than it really is.
+
+A quota is recognised once, at the provider boundary, and only in text the provider itself produced
+as a diagnostic: the CLI's standard error, and the structured envelope's own fields on a run the
+CLI flagged as an error. Claude's answer to the task is never classified, and no decision is ever
+re-derived from a rendered error message, which also carries the task, the prompt and that answer.
+A job about rate limiting whose run fails for an unrelated reason therefore stays a normal failure
+instead of parking as an exhausted quota.
 
 `lya resume` retries only the operation that had not completed. The iteration counter is not
 advanced again, and a model action that already finished is never repeated.
@@ -717,6 +762,10 @@ The number of sequential jobs is bounded by:
 
 with a default of 10.
 
+Every job records its own position in the chain in its first authoritative write, before it does
+any work, so a job that is resumed after a crash still counts against the original `--max-jobs`
+budget instead of restarting the count.
+
 A new job starts only after:
 
 * the previous job was accepted;
@@ -754,17 +803,11 @@ These protections reduce accidental autonomous changes, but Lya is experimental 
 
 Lya currently runs jobs sequentially.
 
-Cancelling a provider kills and reaps the Codex or Claude process Lya started, but not the
-processes that CLI started in turn. A provider's child processes can therefore outlive a stop.
-Cancelling the whole provider process tree needs a Windows Job Object and a Unix process group and
-is deliberately kept as a separate, immediately following change.
-
 A second `Ctrl+C` force-terminates Lya immediately. That is intentional and safe for job locks,
 which the operating system releases on process exit, but it skips Lya's own cleanup.
 
 The following are not implemented yet:
 
-* cancellation of a provider's whole process tree;
 * persistent daemon/service mode;
 * background scheduling;
 * parallel jobs;
@@ -794,7 +837,7 @@ The following are not implemented yet:
 * [x] Persisted job/run resume
 * [x] Quota-aware pause and resume
 * [x] Read-only job listing
-* [ ] Provider process-tree cancellation
+* [x] Provider process-tree cancellation
 * [ ] Daemon/service mode
 * [ ] Remote administration interface
 * [ ] Scheduling and parallel execution

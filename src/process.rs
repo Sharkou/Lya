@@ -20,6 +20,10 @@ use tokio::{
     sync::Notify,
 };
 
+mod tree;
+
+use tree::ProcessTree;
+
 #[derive(Clone, Debug)]
 pub struct ProcessCancellation {
     cancelled: Arc<AtomicBool>,
@@ -132,6 +136,7 @@ impl ProcessSpec {
             // control commands, and an inherited handle would let a child consume them.
             command.stdin(Stdio::null());
         }
+        ProcessTree::configure(&mut command);
 
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -140,6 +145,9 @@ impl ProcessSpec {
                 ProcessError::Start(error.to_string())
             }
         })?;
+        // Claimed immediately, so a cancellation or timeout terminates whatever the provider
+        // started rather than only the process Lya spawned.
+        let tree = ProcessTree::attach(&child);
         let mut stdin_task = match (child.stdin.take(), self.stdin.clone()) {
             (Some(mut stdin), Some(input)) => Some(tokio::spawn(async move {
                 stdin
@@ -167,16 +175,16 @@ impl ProcessSpec {
         let status = match (self.timeout, cancellation) {
             (Some(timeout), Some(cancellation)) => tokio::select! {
                 result = child.wait() => result.map_err(|error| ProcessError::Wait(error.to_string()))?,
-                _ = cancellation.cancelled() => return cancelled_child(&mut child, &mut stdin_task, stdout_task, stderr_task).await,
-                _ = tokio::time::sleep(timeout) => return timed_out_child(&mut child, &mut stdin_task, stdout_task, stderr_task, timeout).await,
+                _ = cancellation.cancelled() => return cancelled_child(&mut child, &tree, &mut stdin_task, stdout_task, stderr_task).await,
+                _ = tokio::time::sleep(timeout) => return timed_out_child(&mut child, &tree, &mut stdin_task, stdout_task, stderr_task, timeout).await,
             },
             (Some(timeout), None) => tokio::select! {
                 result = child.wait() => result.map_err(|error| ProcessError::Wait(error.to_string()))?,
-                _ = tokio::time::sleep(timeout) => return timed_out_child(&mut child, &mut stdin_task, stdout_task, stderr_task, timeout).await,
+                _ = tokio::time::sleep(timeout) => return timed_out_child(&mut child, &tree, &mut stdin_task, stdout_task, stderr_task, timeout).await,
             },
             (None, Some(cancellation)) => tokio::select! {
                 result = child.wait() => result.map_err(|error| ProcessError::Wait(error.to_string()))?,
-                _ = cancellation.cancelled() => return cancelled_child(&mut child, &mut stdin_task, stdout_task, stderr_task).await,
+                _ = cancellation.cancelled() => return cancelled_child(&mut child, &tree, &mut stdin_task, stdout_task, stderr_task).await,
             },
             (None, None) => child
                 .wait()
@@ -216,14 +224,12 @@ async fn collect_stdin(
 
 async fn cancelled_child(
     child: &mut tokio::process::Child,
+    tree: &ProcessTree,
     stdin_task: &mut Option<tokio::task::JoinHandle<Result<(), ProcessError>>>,
     stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     stderr_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
 ) -> Result<ProcessOutput, ProcessError> {
-    child
-        .kill()
-        .await
-        .map_err(|error| ProcessError::Wait(error.to_string()))?;
+    terminate_tree_then_reap(child, tree).await?;
     let _ = collect_stdin(stdin_task).await;
     let stdout = String::from_utf8_lossy(&collect_pipe(stdout_task).await?).into_owned();
     let stderr = String::from_utf8_lossy(&collect_pipe(stderr_task).await?).into_owned();
@@ -232,19 +238,35 @@ async fn cancelled_child(
 
 async fn timed_out_child(
     child: &mut tokio::process::Child,
+    tree: &ProcessTree,
     stdin_task: &mut Option<tokio::task::JoinHandle<Result<(), ProcessError>>>,
     stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     stderr_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     timeout: Duration,
 ) -> Result<ProcessOutput, ProcessError> {
-    child
-        .kill()
-        .await
-        .map_err(|error| ProcessError::Wait(error.to_string()))?;
+    terminate_tree_then_reap(child, tree).await?;
     let _ = collect_stdin(stdin_task).await;
     let _ = collect_pipe(stdout_task).await?;
     let _ = collect_pipe(stderr_task).await?;
     Err(ProcessError::Timeout(timeout))
+}
+
+/// Terminate the provider's whole tree, then reap the direct child.
+///
+/// The tree is terminated first on purpose: the direct child must still be unreaped so the
+/// operating system cannot have reused its identity for an unrelated process. Reaping the child
+/// afterwards is what keeps a cancelled or timed-out provider from becoming a zombie, and closing
+/// the descendants' inherited pipe ends is what lets the captured output finish instead of
+/// blocking on a surviving grandchild.
+async fn terminate_tree_then_reap(
+    child: &mut tokio::process::Child,
+    tree: &ProcessTree,
+) -> Result<(), ProcessError> {
+    tree.terminate();
+    child
+        .kill()
+        .await
+        .map_err(|error| ProcessError::Wait(error.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,6 +447,73 @@ mod tests {
         spec.timeout = Some(Duration::from_millis(50));
 
         let error = spec.run().await.expect_err("process should time out");
+
+        assert!(matches!(error, ProcessError::Timeout(_)));
+    }
+
+    /// A child that immediately starts a long-running process of its own.
+    ///
+    /// The descendant inherits the captured stdout pipe, so Lya's own output collection can only
+    /// finish once that descendant is gone. Killing the direct child alone leaves it holding the
+    /// pipe for the full sleep, which is exactly the orphan case these tests must refuse. Both
+    /// commands are ordinary system utilities owned by the test; no installed provider CLI is
+    /// involved.
+    fn spec_with_descendant() -> ProcessSpec {
+        #[cfg(unix)]
+        {
+            let mut spec = ProcessSpec::new("sh");
+            spec.args = vec!["-c".to_owned(), "sleep 30 & wait".to_owned()];
+            spec
+        }
+        #[cfg(windows)]
+        {
+            let mut spec = ProcessSpec::new("cmd.exe");
+            spec.args = vec![
+                "/C".to_owned(),
+                "ping.exe".to_owned(),
+                "-n".to_owned(),
+                "30".to_owned(),
+                "127.0.0.1".to_owned(),
+            ];
+            spec
+        }
+    }
+
+    /// Long enough for the descendant to exist, short enough to keep the test quick. A slower
+    /// start only makes the test weaker, never flaky: the assertions below never require the
+    /// descendant to have appeared.
+    const DESCENDANT_START_ALLOWANCE: Duration = Duration::from_millis(500);
+
+    /// The whole run must finish well inside the descendant's own 30 second lifetime.
+    const TREE_TEST_BUDGET: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn cancellation_terminates_the_whole_process_tree() {
+        let cancellation = ProcessCancellation::new();
+        let mut spec = spec_with_descendant();
+        spec.cancellation = Some(cancellation.clone());
+        let run = tokio::spawn(async move { spec.run().await });
+
+        tokio::time::sleep(DESCENDANT_START_ALLOWANCE).await;
+        cancellation.cancel();
+
+        let error = tokio::time::timeout(TREE_TEST_BUDGET, run)
+            .await
+            .expect("a cancelled process tree must not keep the captured pipes open")
+            .expect("the run task should join")
+            .expect_err("a cancelled child should not succeed");
+        assert!(matches!(error, ProcessError::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_timeout_terminates_the_whole_process_tree() {
+        let mut spec = spec_with_descendant();
+        spec.timeout = Some(DESCENDANT_START_ALLOWANCE);
+
+        let error = tokio::time::timeout(TREE_TEST_BUDGET, spec.run())
+            .await
+            .expect("a timed out process tree must not keep the captured pipes open")
+            .expect_err("a timed out child should not succeed");
 
         assert!(matches!(error, ProcessError::Timeout(_)));
     }

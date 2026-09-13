@@ -192,17 +192,23 @@ impl<R: ProcessRunner> Executor for ClaudeCliExecutor<R> {
 /// Claude Code's documented `--output-format json` envelope carries `is_error` and `subtype`; that
 /// structured signal is preferred. Neither CLI documents a dedicated quota subtype today, so the
 /// message heuristic remains an explicit, recorded fallback rather than a claim of precision.
+///
+/// The heuristic reads only text the provider itself produced as a diagnostic: its standard error,
+/// and — on a failed run whose envelope is explicitly flagged as an error — the envelope's own
+/// message. It never reads a successful envelope's `result`, which holds Claude's answer to the
+/// task and can legitimately discuss rate limits without any quota being exhausted.
 fn classify_failure(exit_code: Option<i32>, stdout: String, stderr: String) -> ExecutorError {
-    if let Some(detail) = structured_quota_detail(&stdout) {
+    let envelope = serde_json::from_str::<ClaudeJsonOutput>(&stdout).ok();
+    if let Some(detail) = structured_quota_detail(envelope.as_ref()) {
         return ExecutorError::QuotaExceeded {
             source: QuotaSource::ProviderStructured,
             detail,
         };
     }
-    if message_indicates_quota(&stderr) || message_indicates_quota(&stdout) {
+    if let Some(detail) = diagnostic_quota_detail(&stderr, envelope.as_ref()) {
         return ExecutorError::QuotaExceeded {
             source: QuotaSource::ProviderMessageHeuristic,
-            detail: quota_detail(&stderr, &stdout),
+            detail,
         };
     }
     ExecutorError::ProcessFailed {
@@ -212,22 +218,32 @@ fn classify_failure(exit_code: Option<i32>, stdout: String, stderr: String) -> E
     }
 }
 
-fn structured_quota_detail(stdout: &str) -> Option<String> {
-    let output = serde_json::from_str::<ClaudeJsonOutput>(stdout).ok()?;
-    let subtype = output.subtype?;
-    if output.is_error == Some(true) && message_indicates_quota(&subtype) {
+fn structured_quota_detail(envelope: Option<&ClaudeJsonOutput>) -> Option<String> {
+    let envelope = envelope?;
+    let subtype = envelope.subtype.as_ref()?;
+    if envelope.is_error == Some(true) && message_indicates_quota(subtype) {
         return Some(format!("Claude reported subtype {subtype}"));
     }
     None
 }
 
-fn quota_detail(stderr: &str, stdout: &str) -> String {
-    let detail = if stderr.trim().is_empty() {
-        stdout.trim()
-    } else {
-        stderr.trim()
-    };
-    detail.lines().take(3).collect::<Vec<_>>().join(" ")
+/// The provider-originated diagnostic fields a quota can be recognised in, in order of preference.
+fn diagnostic_quota_detail(stderr: &str, envelope: Option<&ClaudeJsonOutput>) -> Option<String> {
+    if message_indicates_quota(stderr) {
+        return Some(first_lines(stderr));
+    }
+    let envelope = envelope?;
+    // An envelope flagged `is_error` carries the CLI's own failure message in `result`; the same
+    // field on a run that is not flagged carries Claude's answer and is never inspected.
+    let message = envelope
+        .result
+        .as_ref()
+        .filter(|_| envelope.is_error == Some(true))?;
+    message_indicates_quota(message).then(|| first_lines(message))
+}
+
+fn first_lines(detail: &str) -> String {
+    detail.trim().lines().take(3).collect::<Vec<_>>().join(" ")
 }
 
 impl ExecutorResult {
@@ -384,7 +400,8 @@ mod tests {
 
     use super::{
         ClaudeCliExecutor, Executor, ExecutorError, ExecutorOutputError, ExecutorRequest,
-        ExecutorResult, ExecutorSession, STDIN_TASK_INSTRUCTION, claude_program_from_environment,
+        ExecutorResult, ExecutorSession, QuotaSource, STDIN_TASK_INSTRUCTION, classify_failure,
+        claude_program_from_environment,
     };
     use crate::process::{
         ProcessError, ProcessOutput, ProcessRunner, ProcessSpec, SystemProcessRunner,
@@ -644,5 +661,79 @@ mod tests {
                 .await,
             Err(ExecutorError::Timeout(_))
         ));
+    }
+
+    #[test]
+    fn a_quota_is_recognised_only_in_provider_diagnostics() {
+        let structured = classify_failure(
+            Some(1),
+            serde_json::json!({
+                "is_error": true,
+                "subtype": "rate_limit_exceeded",
+                "result": "Claude AI usage limit reached"
+            })
+            .to_string(),
+            String::new(),
+        );
+        assert!(matches!(
+            structured,
+            ExecutorError::QuotaExceeded {
+                source: QuotaSource::ProviderStructured,
+                ..
+            }
+        ));
+
+        let from_stderr = classify_failure(
+            Some(1),
+            String::new(),
+            "Claude AI usage limit reached; resets at 3pm".to_owned(),
+        );
+        assert!(matches!(
+            from_stderr,
+            ExecutorError::QuotaExceeded {
+                source: QuotaSource::ProviderMessageHeuristic,
+                ..
+            }
+        ));
+
+        // An envelope the CLI itself flagged as an error carries its own failure message.
+        let from_error_envelope = classify_failure(
+            Some(1),
+            serde_json::json!({ "is_error": true, "result": "Claude AI usage limit reached" })
+                .to_string(),
+            String::new(),
+        );
+        assert!(matches!(
+            from_error_envelope,
+            ExecutorError::QuotaExceeded {
+                source: QuotaSource::ProviderMessageHeuristic,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn task_text_about_rate_limits_is_never_read_as_an_exhausted_quota() {
+        // Claude answered about the task and the run failed for an unrelated reason. The answer
+        // is not a provider diagnostic, so it must not classify anything.
+        let answered = classify_failure(
+            Some(1),
+            serde_json::json!({
+                "is_error": false,
+                "subtype": "success",
+                "result": "I added the rate limit middleware and its quota counter."
+            })
+            .to_string(),
+            "error: linker exited with code 1".to_owned(),
+        );
+        assert!(matches!(answered, ExecutorError::ProcessFailed { .. }));
+
+        // The same is true for output that never reached the documented envelope at all.
+        let unstructured = classify_failure(
+            Some(1),
+            "compiling rate limit tests ... failed".to_owned(),
+            "error[E0433]: failed to resolve RateLimiter".to_owned(),
+        );
+        assert!(matches!(unstructured, ExecutorError::ProcessFailed { .. }));
     }
 }

@@ -278,15 +278,15 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
         None
     };
     let job_id = new_job_id();
-    let request = NewJob {
-        job_id: job_id.clone(),
-        project: Project {
+    let request = NewJob::new(
+        job_id.clone(),
+        Project {
             name: project_name(&options.project_path),
             path: options.project_path,
         },
-        task: options.task,
+        options.task,
         private_context,
-    };
+    );
 
     drive_job(
         &home,

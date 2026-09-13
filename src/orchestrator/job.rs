@@ -26,7 +26,7 @@ use super::{
     state::{
         JobPhase, JobState, JobStatus, MAX_ACTIVE_USER_INSTRUCTION_BYTES,
         MAX_ACTIVE_USER_INSTRUCTIONS, PendingOperation, QuotaSource, QuotaWait, RunConfiguration,
-        StateError, StateStore, current_unix_seconds, message_indicates_quota,
+        StateError, StateStore, current_unix_seconds,
     },
     supervisor::{Project, Supervisor, SupervisorDecision, SupervisorError, SupervisorRequest},
 };
@@ -41,6 +41,28 @@ pub struct NewJob {
     pub project: Project,
     pub task: String,
     pub private_context: String,
+    /// Position of this job in its sequential chain. It is part of the request so the very first
+    /// authoritative write of a child job already carries it: `max_jobs` accounting must survive a
+    /// crash between that write and the end of the child's run.
+    pub sequential_index: u32,
+}
+
+impl NewJob {
+    /// The first job of a chain.
+    pub fn new(
+        job_id: impl Into<String>,
+        project: Project,
+        task: impl Into<String>,
+        private_context: impl Into<String>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            project,
+            task: task.into(),
+            private_context: private_context.into(),
+            sequential_index: 0,
+        }
+    }
 }
 
 /// The next thing the loop should do. Derived either from a fresh start or from authoritative
@@ -230,6 +252,7 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
             request.task.clone(),
         );
         job.run = self.run_configuration();
+        job.sequential_index = request.sequential_index;
         job.last_repository_state = Some(initial_repository_state.clone());
         self.persist(&job)?;
         self.emit(
@@ -287,12 +310,20 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         let plan = match ResumePlan::for_job(&job) {
             Ok(plan) => plan,
             Err(rejection) => {
-                self.emit(
-                    &job,
-                    JobEventKind::ResumeRejected {
-                        reason: rejection.to_string(),
-                    },
-                )?;
+                // A terminal status keeps its own semantics: it is already a decided outcome and
+                // is never rewritten. Anything else is persisted state that no continuation can be
+                // proven from, so the job is parked for a human instead of being left advertised
+                // as resumable forever.
+                if matches!(rejection, ResumeRejection::NotResumable { .. }) {
+                    self.emit(
+                        &job,
+                        JobEventKind::ResumeRejected {
+                            reason: rejection.to_string(),
+                        },
+                    )?;
+                } else {
+                    self.wait_for_human(&mut job, rejection.to_string()).await?;
+                }
                 return Err(OrchestrationError::Resume(rejection));
             }
         };
@@ -459,9 +490,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             stage = Stage::Execute;
                         }
                         SupervisorDecision::Accept { .. } => {
-                            job.status = JobStatus::Accepted;
                             job.accepted_repository_state = Some(repository_state.clone());
                             if !self.publisher.is_enabled() {
+                                job.status = JobStatus::Accepted;
                                 job.pending_operation = None;
                                 job.touch();
                                 self.persist(&job)?;
@@ -473,9 +504,11 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                                 )?;
                                 return Ok(job);
                             }
-                            job.pending_operation = Some(PendingOperation::Publication);
-                            job.touch();
-                            self.persist(&job)?;
+                            // Nothing is written here on purpose. `publish` performs the single
+                            // write that records an owed publication, so `ACCEPTED` together with
+                            // a pending publication — a state no resume can continue — is never
+                            // persistable. A crash before that write simply leaves the job at its
+                            // already persisted supervisor review, which resumes safely.
                             stage = Stage::Publish;
                         }
                         SupervisorDecision::Human { reason } => {
@@ -578,20 +611,23 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             return Err(OrchestrationError::Executor(error));
                         }
                     };
-                    if !self.safe_point(&mut job).await? {
-                        return Ok(job);
-                    }
-                    self.emit(&job, executor_event_kind(result.clone()))?;
-                    if let Some(session_id) =
-                        result.session_id.filter(|value| !value.trim().is_empty())
+                    // The completed run is made durable before any interruptible boundary. A
+                    // pause, an input EOF or a crash arriving the instant Claude returned must not
+                    // discard the session and report, and must never make the next process replay
+                    // an execution that already finished.
+                    if let Some(session_id) = result
+                        .session_id
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
                     {
                         job.claude_session_id = Some(session_id);
                     }
-                    job.last_executor_report = Some(result.final_response);
+                    job.last_executor_report = Some(result.final_response.clone());
                     job.phase = JobPhase::Supervisor;
                     job.pending_operation = None;
                     job.touch();
                     self.persist(&job)?;
+                    self.emit(&job, executor_event_kind(result))?;
 
                     repository_state =
                         match RepositoryState::collect(&self.repository_runner, &job.project_path)
@@ -642,6 +678,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 )
                 .await;
         };
+        // The single authoritative write that records an owed publication. Status, phase, pending
+        // operation and the accepted snapshot enter persisted state together, so every state a
+        // crash can leave behind here is one `ResumePlan` can continue.
         job.status = JobStatus::Publishing;
         job.phase = JobPhase::Publisher;
         job.pending_operation = Some(PendingOperation::Publication);
@@ -779,6 +818,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
             },
             task: job.task.clone(),
             private_context: private_context.clone(),
+            // The resumed job keeps the chain position it was persisted with, so a job resumed
+            // after a crash still counts against the original `max_jobs` budget.
+            sequential_index: job.sequential_index,
         };
         let job = self.resume(job, private_context).await?;
         self.continue_sequentially(request, job).await
@@ -826,6 +868,7 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 project: current_request.project,
                 task,
                 private_context: current_request.private_context,
+                sequential_index: sequential_index + 1,
             };
             // A sequential job is a job in its own right, so it gets its own exclusive claim
             // before anything is persisted for it. The caller's lock covers only the job it
@@ -836,13 +879,7 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 .map_err(OrchestrationError::Lock)?;
             // `/send` instructions constrain the job they were given to; a new sequential job
             // starts from the persisted task alone.
-            let mut next = self.run(current_request.clone()).await?;
-            if next.sequential_index != sequential_index + 1 {
-                next.sequential_index = sequential_index + 1;
-                next.touch();
-                self.persist(&next)?;
-            }
-            job = next;
+            job = self.run(current_request.clone()).await?;
         }
     }
 
@@ -1176,22 +1213,24 @@ fn observable_supervisor_prompt(request: &SupervisorRequest) -> String {
     )
 }
 
-/// Prefer the provider's own classification; fall back to the documented message heuristic only
-/// for errors that never reached the structured boundary.
+/// A quota condition is recognised at the provider boundary, where Lya still knows which text came
+/// from the provider's own diagnostics and which text is task or model content.
+///
+/// Nothing is re-classified here from a rendered error: that string carries the task, the prompt
+/// and Claude's own answer, so a normal failure about rate limiting would otherwise be mistaken for
+/// an exhausted quota. A provider failure that is not classified as a quota stays a normal failure.
 fn supervisor_quota(error: &SupervisorError) -> Option<(QuotaSource, String)> {
-    if let SupervisorError::QuotaExceeded { source, detail } = error {
-        return Some((*source, detail.clone()));
+    match error {
+        SupervisorError::QuotaExceeded { source, detail } => Some((*source, detail.clone())),
+        _ => None,
     }
-    let rendered = error.to_string();
-    message_indicates_quota(&rendered).then_some((QuotaSource::ProviderMessageHeuristic, rendered))
 }
 
 fn executor_quota(error: &ExecutorError) -> Option<(QuotaSource, String)> {
-    if let ExecutorError::QuotaExceeded { source, detail } = error {
-        return Some((*source, detail.clone()));
+    match error {
+        ExecutorError::QuotaExceeded { source, detail } => Some((*source, detail.clone())),
+        _ => None,
     }
-    let rendered = error.to_string();
-    message_indicates_quota(&rendered).then_some((QuotaSource::ProviderMessageHeuristic, rendered))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1687,15 +1726,15 @@ mod tests {
     }
 
     fn job_request() -> NewJob {
-        NewJob {
-            job_id: "test-job".to_owned(),
-            project: Project {
+        NewJob::new(
+            "test-job",
+            Project {
                 name: "test-project".to_owned(),
                 path: std::env::temp_dir(),
             },
-            task: "Update hello.txt".to_owned(),
-            private_context: "Private project context.".to_owned(),
-        }
+            "Update hello.txt",
+            "Private project context.",
+        )
     }
 
     fn home(name: &str) -> PathBuf {
@@ -1964,9 +2003,12 @@ mod tests {
             prompt: "Implement.".to_owned(),
             reason: None,
         })]);
-        let executor = FakeExecutor::new(vec![Err(ExecutorError::Process(
-            "Claude rate limit reached".to_owned(),
-        ))]);
+        // The classification itself belongs to the provider boundary; the loop reacts only to a
+        // failure the executor already classified as a quota.
+        let executor = FakeExecutor::new(vec![Err(ExecutorError::QuotaExceeded {
+            source: QuotaSource::ProviderMessageHeuristic,
+            detail: "Claude rate limit reached".to_owned(),
+        })]);
         let directory = home("claude-quota");
         let sink = RecordingEventSink::default();
         let events = sink.events.clone();
@@ -2472,15 +2514,15 @@ mod tests {
         )
         .with_publisher(publisher)
         .with_event_sink(JsonlEventSink::for_job(&state_home, "local-end-to-end"))
-        .run_sequential(NewJob {
-            job_id: "local-end-to-end".to_owned(),
-            project: Project {
+        .run_sequential(NewJob::new(
+            "local-end-to-end",
+            Project {
                 name: "local-end-to-end".to_owned(),
                 path: work.clone(),
             },
-            task: "Add one line containing LYA_PUBLISH_OK to hello.txt and verify it.".to_owned(),
-            private_context: "Test context.".to_owned(),
-        })
+            "Add one line containing LYA_PUBLISH_OK to hello.txt and verify it.",
+            "Test context.",
+        ))
         .await
         .expect("local end-to-end run should succeed");
 
@@ -3636,6 +3678,450 @@ mod tests {
         drop(reclaimed_root);
         drop(reclaimed_child);
 
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    /// Reads persisted state the moment the publisher is asked to publish, which is the first
+    /// moment a crash could leave a job owing a publication.
+    struct StateProbePublisher {
+        store: StateStore,
+        observed: Arc<Mutex<Vec<JobState>>>,
+        results: Arc<Mutex<VecDeque<Result<PublishResult, PublishError>>>>,
+    }
+
+    impl Publisher for StateProbePublisher {
+        fn recover<'a>(
+            &'a self,
+            _request: PublishRecoveryRequest,
+            _progress: &'a mut dyn PublishProgress,
+        ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>>
+        {
+            unreachable!("a fresh publication never takes the recovery path")
+        }
+
+        fn publish<'a>(
+            &'a self,
+            _request: PublishRequest,
+            _progress: &'a mut dyn PublishProgress,
+        ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>>
+        {
+            self.observed.lock().expect("observed lock").push(
+                self.store
+                    .load_job("test-job")
+                    .expect("state should load")
+                    .expect("state should exist"),
+            );
+            let result = self
+                .results
+                .lock()
+                .expect("publisher result lock")
+                .pop_front()
+                .expect("a publisher result should be queued");
+            Box::pin(async move { result })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_owed_publication_is_never_persisted_as_a_state_resume_cannot_continue() {
+        let directory = home("publication-owed-state");
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Publish it".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let publisher = StateProbePublisher {
+            store: store(&directory),
+            observed: observed.clone(),
+            results: Arc::new(Mutex::new(vec![Ok(published_result("Publish it"))].into())),
+        };
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(publisher)
+        .with_publish_configuration(
+            GitPublishConfig::new("Bot", "bot@example.com", "origin", "main")
+                .expect("configuration"),
+        )
+        .run(job_request())
+        .await
+        .expect("the job should publish");
+
+        assert_eq!(result.status, JobStatus::Published);
+        let observed = observed.lock().expect("observed lock");
+        let owed = observed.first().expect("the publisher should have run");
+        assert_eq!(owed.status, JobStatus::Publishing);
+        assert_eq!(owed.pending_operation, Some(PendingOperation::Publication));
+        assert!(owed.accepted_repository_state.is_some());
+        // The window that mattered: this exact persisted state must be continuable.
+        assert!(
+            super::ResumePlan::for_job(owed).is_ok(),
+            "a persisted owed publication must be resumable"
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_job_without_publication_owes_nothing() {
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Accept only".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let directory = home("accepted-owes-nothing");
+
+        let result = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .run(job_request())
+            .await
+            .expect("the job should be accepted");
+
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert_eq!(result.pending_operation, None);
+        let persisted = store(&directory)
+            .load_job("test-job")
+            .expect("state should load")
+            .expect("state should exist");
+        assert_eq!(persisted.status, JobStatus::Accepted);
+        assert_eq!(persisted.pending_operation, None);
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    /// Reads the persisted child job the first time the supervisor is asked about it, which is
+    /// right after the child's first authoritative write and before it has done any work.
+    struct ChildStateProbeSupervisor {
+        store: StateStore,
+        observed: Arc<Mutex<Vec<JobState>>>,
+        decisions: Arc<Mutex<VecDeque<Result<SupervisorDecision, SupervisorError>>>>,
+    }
+
+    impl Supervisor for ChildStateProbeSupervisor {
+        fn decide(
+            &self,
+            request: SupervisorRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<SupervisorDecision, SupervisorError>> + Send + '_>>
+        {
+            if request.task == "second task" {
+                let child = self
+                    .store
+                    .load_all()
+                    .expect("state should load")
+                    .into_iter()
+                    .find(|job| job.job_id != "test-job")
+                    .expect("the child job should be persisted before its first review");
+                self.observed.lock().expect("observed lock").push(child);
+            }
+            let decision = self
+                .decisions
+                .lock()
+                .expect("decision lock")
+                .pop_front()
+                .expect("a supervisor decision should be queued");
+            Box::pin(async move { decision })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sequential_child_carries_its_chain_position_in_its_first_persisted_write() {
+        let directory = home("sequential-index-first-write");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = ChildStateProbeSupervisor {
+            store: store(&directory),
+            observed: observed.clone(),
+            decisions: Arc::new(Mutex::new(
+                vec![
+                    Ok(SupervisorDecision::Accept {
+                        commit_title: "First".to_owned(),
+                        next_prompt: Some("second task".to_owned()),
+                        reason: None,
+                    }),
+                    // The child stops before finishing, standing in for a process that
+                    // disappeared: nothing after its first write may fix its chain position.
+                    Ok(SupervisorDecision::Stop {
+                        reason: "child interrupted".to_owned(),
+                    }),
+                ]
+                .into(),
+            )),
+        };
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(FakePublisher::new(vec![Ok(published_result("First"))]))
+        .with_max_jobs(2)
+        .run_sequential(job_request())
+        .await
+        .expect("the chain should run");
+
+        assert_eq!(result.jobs.len(), 2);
+        let observed = observed.lock().expect("observed lock");
+        assert_eq!(
+            observed
+                .first()
+                .expect("the child should have been observed")
+                .sequential_index,
+            1,
+            "the first authoritative write of a child must already carry its chain position"
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn a_child_resumed_after_a_crash_still_counts_against_max_jobs() {
+        let directory = home("sequential-index-crash-resume");
+        // The child exactly as its own first write persisted it, before it did any work.
+        let mut child = persisted_job(JobStatus::Running, None).await;
+        child.job_id = "child-job".to_owned();
+        child.task = "second task".to_owned();
+        child.iteration = 0;
+        child.sequential_index = 1;
+        child.run.max_jobs = 2;
+        child.run.publish = true;
+        child.run.git = Some(
+            GitPublishConfig::new("Bot", "bot@example.com", "origin", "main")
+                .expect("configuration"),
+        );
+        let child = round_trip(&directory, &child);
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Second".to_owned(),
+            // The resumed child asks for a third job it is no longer allowed to start.
+            next_prompt: Some("third task".to_owned()),
+            reason: None,
+        })]);
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(FakePublisher::new(vec![Ok(published_result("Second"))]))
+        .with_max_jobs(2)
+        .resume_sequential(child, "Private project context.".to_owned())
+        .await
+        .expect("the child should resume");
+
+        assert_eq!(result.jobs.len(), 1);
+        assert_eq!(result.jobs[0].sequential_index, 1);
+        assert!(
+            result.max_jobs_reached,
+            "a resumed child must keep the chain position it was persisted with"
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn a_pause_the_instant_claude_returns_never_discards_its_completed_run() {
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Claude {
+            prompt: "Implement.".to_owned(),
+            reason: None,
+        })]);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let executor_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = BlockingExecutor {
+            started: Mutex::new(Some(started_sender)),
+            release: Mutex::new(Some(release_receiver)),
+            requests: executor_requests.clone(),
+        };
+        let directory = home("pause-right-after-executor");
+        let run_directory = directory.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (paused_sender, paused_receiver) = tokio::sync::oneshot::channel();
+        let (sender, receiver) = ControlReceiver::new();
+        let run = tokio::spawn(async move {
+            AutonomousOrchestrator::new(
+                supervisor,
+                executor,
+                FakeGitRunner { dirty: false },
+                StateStore::new(&LyaHome::from_path(&run_directory)),
+            )
+            .with_control_receiver(receiver)
+            .with_event_sink(PauseSignalSink {
+                events,
+                paused: Mutex::new(Some(paused_sender)),
+            })
+            .run(job_request())
+            .await
+        });
+
+        started_receiver.await.expect("executor should start");
+        sender
+            .send(ControlCommand::Pause)
+            .expect("pause should queue");
+        release_sender
+            .send(claude_result(Some("session-7"), "Completed the work."))
+            .expect("executor should receive result");
+        paused_receiver
+            .await
+            .expect("the pause should happen after the executor returned");
+        // Input ends while paused, exactly as a closed stdin or a vanished shell would.
+        drop(sender);
+        let paused = run
+            .await
+            .expect("job should join")
+            .expect("an input end while paused is not a failure");
+
+        assert_eq!(paused.status, JobStatus::Paused);
+        assert_eq!(paused.claude_session_id.as_deref(), Some("session-7"));
+        assert_eq!(
+            paused.last_executor_report.as_deref(),
+            Some("Completed the work.")
+        );
+        assert_eq!(paused.pending_operation, None);
+        let persisted = store(&directory)
+            .load_job("test-job")
+            .expect("state should load")
+            .expect("state should exist");
+        assert_eq!(persisted.claude_session_id.as_deref(), Some("session-7"));
+        assert_eq!(
+            persisted.last_executor_report.as_deref(),
+            Some("Completed the work.")
+        );
+        assert_eq!(persisted.pending_operation, None);
+        assert_eq!(executor_requests.lock().expect("requests").len(), 1);
+
+        // A later process continues with a new review instead of replaying Claude.
+        let resume_supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Finish".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let resume_supervisor_requests = resume_supervisor.requests.clone();
+        let resume_executor = FakeExecutor::new(vec![]);
+        let resume_executor_requests = resume_executor.requests.clone();
+        let resumed = orchestrator(resume_supervisor, resume_executor, &directory)
+            .resume(persisted, "Private project context.".to_owned())
+            .await
+            .expect("the paused job should resume");
+
+        assert_eq!(resumed.status, JobStatus::Accepted);
+        assert!(
+            resume_executor_requests
+                .lock()
+                .expect("requests")
+                .is_empty(),
+            "a completed execution must never be replayed"
+        );
+        let reviews = resume_supervisor_requests.lock().expect("request lock");
+        assert_eq!(
+            reviews[0].executor_report.as_deref(),
+            Some("Completed the work.")
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn an_inconsistent_job_is_parked_for_a_human_instead_of_staying_resumable() {
+        let directory = home("resume-invalid-state");
+        let mut job = persisted_job(
+            JobStatus::WaitingClaudeQuota,
+            Some(PendingOperation::SupervisorReview),
+        )
+        .await;
+        // A quota wait naming a different operation than the one actually owed: no continuation
+        // can be proven from it without risking a repeated provider call.
+        job.quota_wait = Some(QuotaWait {
+            provider: "Claude".to_owned(),
+            operation: PendingOperation::ExecutorRun,
+            source: QuotaSource::ProviderMessageHeuristic,
+            reason: "Claude rate limit reached".to_owned(),
+            detected_unix_seconds: 100,
+        });
+        let job = round_trip(&directory, &job);
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let error = orchestrator(
+            FakeSupervisor::new(vec![]),
+            FakeExecutor::new(vec![]),
+            &directory,
+        )
+        .with_event_sink(sink)
+        .resume(job, "Private project context.".to_owned())
+        .await
+        .expect_err("an inconsistent job cannot be resumed");
+
+        assert!(matches!(error, OrchestrationError::Resume(_)));
+        let persisted = store(&directory)
+            .load_job("test-job")
+            .expect("state should load")
+            .expect("state should exist");
+        assert_eq!(persisted.status, JobStatus::WaitingHuman);
+        let events = events.lock().expect("event lock");
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            JobEventKind::WaitingForHuman { ref reason }
+                if reason.contains("does not match the pending operation")
+        )));
+        // The job is no longer advertised to the next `lya resume`, however often it runs.
+        assert!(
+            crate::orchestrator::resume::resumable_jobs(&store(&directory))
+                .expect("candidates should load")
+                .is_empty()
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_job_keeps_its_own_status_when_a_resume_is_refused() {
+        let directory = home("resume-terminal-untouched");
+        let job = round_trip(&directory, &persisted_job(JobStatus::Failed, None).await);
+
+        let error = orchestrator(
+            FakeSupervisor::new(vec![]),
+            FakeExecutor::new(vec![]),
+            &directory,
+        )
+        .resume(job, "Private project context.".to_owned())
+        .await
+        .expect_err("a terminal job cannot be resumed");
+
+        assert!(matches!(error, OrchestrationError::Resume(_)));
+        assert_eq!(
+            store(&directory)
+                .load_job("test-job")
+                .expect("state should load")
+                .expect("state should exist")
+                .status,
+            JobStatus::Failed
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn a_failure_about_rate_limits_is_not_mistaken_for_an_exhausted_quota() {
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Claude {
+            prompt: "Implement the rate limit middleware.".to_owned(),
+            reason: None,
+        })]);
+        // A normal failure whose output happens to discuss the task's own subject.
+        let executor = FakeExecutor::new(vec![Err(ExecutorError::ProcessFailed {
+            exit_code: Some(1),
+            stdout: "The rate limit tests do not compile yet.".to_owned(),
+            stderr: "error[E0433]: failed to resolve RateLimiter".to_owned(),
+        })]);
+        let directory = home("quota-false-positive");
+
+        let error = orchestrator(supervisor, executor, &directory)
+            .run(job_request())
+            .await
+            .expect_err("a normal failure should fail the job");
+
+        assert!(matches!(error, OrchestrationError::Executor(_)));
+        let persisted = store(&directory)
+            .load_job("test-job")
+            .expect("state should load")
+            .expect("state should exist");
+        assert_eq!(persisted.status, JobStatus::Failed);
+        assert_eq!(persisted.quota_wait, None);
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
 }
