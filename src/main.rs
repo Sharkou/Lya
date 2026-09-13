@@ -59,9 +59,83 @@ use lya::{
     runtime::Runtime,
 };
 
+/// The version `lya --version` reports.
+///
+/// Taken from the package metadata at compile time, so it cannot drift from `Cargo.toml` and a
+/// release tag check against `Cargo.toml` also checks this.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// One screen of orientation, deliberately not a manual.
+///
+/// Each command already prints its own usage line when it is given something invalid, and the real
+/// documentation lives in `docs/`. Repeating either here would give three places to keep in sync.
+const HELP: &str = "Lya — local-first AI agent and autonomous development orchestrator
+
+Usage:
+  lya <command> [options]
+  lya <prompt>                    one-shot local agent run (needs OLLAMA_MODEL)
+
+Commands:
+  doctor                          check LYA_HOME, context.md, git, codex, claude
+  run <task>                      drive one autonomous job in this terminal
+  resume                          continue a persisted job
+  jobs                            list persisted jobs (read-only)
+  scheduler [<job-file>]          drive several repositories at once
+  daemon start|run|status|stop    manage the local background daemon
+  submit <task>                   hand work to a running daemon
+  attach <job-id>                 watch one daemon-owned job live
+  control <job-id> <command>      pause/resume/stop/status/diff/send, per job
+  supervisor <task>               one Supervisor decision, for diagnostics
+  executor <prompt>               one Executor invocation, for diagnostics
+
+Options:
+  -h, --help                      print this help
+  -V, --version                   print the version
+
+Common job options (run, scheduler, submit):
+  --project <path>                the Git working tree to drive (default: .)
+  --max-iterations <count>        Supervisor reviews per job (default: 10)
+  --max-jobs <count>              jobs per sequential chain (default: 10)
+  --browser                       pass the browser capability to the Executor
+  --publish                       enable guarded Git commit and push
+  --verbose | --json              human or machine-readable output
+
+Environment:
+  LYA_HOME                        private state directory (default: ~/.lya)
+
+Pass an invalid option to any command to see that command's own usage line.
+Documentation: https://github.com/Sharkou/Lya/blob/main/docs/README.md";
+
+/// Whether the invocation asks for the help text.
+///
+/// Only the first argument is inspected, exactly like command dispatch: `lya run --help` stays a
+/// `lya run` invocation, and `run`'s own parser reports the unknown option with `run`'s usage.
+fn help_requested(arguments: &[String]) -> bool {
+    arguments
+        .first()
+        .is_some_and(|argument| matches!(argument.as_str(), "-h" | "--help"))
+}
+
+/// Whether the invocation asks for the version, under the same first-argument rule as help.
+fn version_requested(arguments: &[String]) -> bool {
+    arguments
+        .first()
+        .is_some_and(|argument| matches!(argument.as_str(), "-V" | "--version"))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    // Before dispatch, so neither can be shadowed by a command name, and before anything reads the
+    // environment: `--help` and `--version` must answer on a machine that is not configured yet.
+    if help_requested(&arguments) {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
+    if version_requested(&arguments) {
+        println!("lya {VERSION}");
+        return ExitCode::SUCCESS;
+    }
     if arguments
         .first()
         .is_some_and(|argument| argument == "doctor")
@@ -2399,17 +2473,105 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ControlRequest, ExecutorSession, InterruptAction, RunOutput, SubmitWork,
-        control_acknowledgement, interactive_enabled, interrupt_action, job_status_succeeded,
-        parse_attach_arguments, parse_control_arguments, parse_daemon_arguments,
-        parse_executor_arguments, parse_jobs_arguments, parse_resume_arguments,
-        parse_run_arguments, parse_scheduler_arguments, parse_submit_arguments,
-        request_graceful_stop, start_control,
+        ControlRequest, ExecutorSession, HELP, InterruptAction, RunOutput, SubmitWork, VERSION,
+        control_acknowledgement, help_requested, interactive_enabled, interrupt_action,
+        job_status_succeeded, parse_attach_arguments, parse_control_arguments,
+        parse_daemon_arguments, parse_executor_arguments, parse_jobs_arguments,
+        parse_resume_arguments, parse_run_arguments, parse_scheduler_arguments,
+        parse_submit_arguments, request_graceful_stop, start_control, version_requested,
     };
     use lya::orchestrator::{
         control::{ControlCommand, ControlReceiver},
         state::JobStatus,
     };
+
+    fn owned(arguments: &[&str]) -> Vec<String> {
+        arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn help_and_version_are_recognised_in_both_spellings() {
+        for flag in ["-h", "--help"] {
+            assert!(
+                help_requested(&owned(&[flag])),
+                "{flag} should ask for help"
+            );
+            assert!(!version_requested(&owned(&[flag])));
+        }
+        for flag in ["-V", "--version"] {
+            assert!(
+                version_requested(&owned(&[flag])),
+                "{flag} should ask for the version"
+            );
+            assert!(!help_requested(&owned(&[flag])));
+        }
+    }
+
+    #[test]
+    fn help_and_version_are_only_recognised_as_the_first_argument() {
+        // `lya run --help` stays a `lya run` invocation, so `run`'s own parser reports the unknown
+        // option together with `run`'s usage line.
+        let arguments = owned(&["run", "--help"]);
+        assert!(!help_requested(&arguments));
+        assert!(parse_run_arguments(&arguments[1..]).is_err());
+
+        assert!(!version_requested(&owned(&["jobs", "--version"])));
+        assert!(!help_requested(&[]));
+        assert!(!version_requested(&[]));
+        // Lowercase `-v` is not a version flag anywhere in Lya, and must not be treated as one.
+        assert!(!version_requested(&owned(&["-v"])));
+        assert!(!help_requested(&owned(&["-v"])));
+    }
+
+    #[test]
+    fn version_comes_from_package_metadata() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            format!("lya {VERSION}"),
+            format!("lya {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(
+            VERSION.split('.').count() >= 3,
+            "the package version should be semantic: {VERSION}"
+        );
+    }
+
+    #[test]
+    fn help_names_every_dispatched_command_and_stays_one_screen() {
+        for command in [
+            "doctor",
+            "supervisor",
+            "executor",
+            "run",
+            "resume",
+            "jobs",
+            "scheduler",
+            "daemon",
+            "submit",
+            "attach",
+            "control",
+        ] {
+            assert!(
+                HELP.contains(command),
+                "help should name the {command} command"
+            );
+        }
+        assert!(HELP.contains("--help"));
+        assert!(HELP.contains("--version"));
+        // Orientation, not a manual: it has to stay readable on one terminal screen.
+        assert!(
+            HELP.lines().count() <= 48,
+            "help grew to {} lines; move detail into docs/ instead",
+            HELP.lines().count()
+        );
+        assert!(
+            HELP.lines().all(|line| line.len() <= 100),
+            "every help line should fit a narrow terminal"
+        );
+    }
 
     #[test]
     fn parses_executor_options_and_preserves_prompt_words() {
