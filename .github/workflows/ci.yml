@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One run per ref. A new push supersedes an in-flight run for the same branch,
+# but never cancels a run on `main`.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI build is never debugged interactively; skipping debug info is a large win.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Formatting is platform-independent, so it runs once rather than three times.
+  format:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - run: cargo fmt --check
+
+  # A native matrix on purpose: much of Lya is platform-specific — named pipes and
+  # DACLs against Unix sockets, LockFileEx against flock, job objects against process
+  # groups — and only a real runner on each platform compiles and exercises those
+  # paths. Cross-compilation would type-check them at best.
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x86_64
+          - os: windows-latest
+            name: Windows x86_64
+          - os: macos-latest
+            name: macOS arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        id: rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          echo "version=$(rustc --version | tr ' ()' '---')" >> "$GITHUB_OUTPUT"
+
+      - name: Show versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          git --version
+
+      # Keyed on the toolchain as well as the lockfile, so a Rust upgrade does not
+      # restore artifacts built by the previous compiler.
+      - name: Cache cargo registry and build directory
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.rust.outputs.version }}-
+
+      - name: cargo check
+        run: cargo check --all-targets --locked
+
+      # The suite is provider-free: Codex and Claude are never invoked, and every
+      # provider interaction goes through a stubbed process runner. It does drive the
+      # real `git` executable against temporary repositories, passing identity per
+      # command, so no global Git configuration is needed or touched. No repository
+      # secret is used by any job in this workflow.
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  # A single required check for branch protection, so the matrix can grow or shrink
+  # without reconfiguring the rule.
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [format, test]
+    if: always()
+    steps:
+      - name: Verify every job succeeded
+        run: |
+          echo "format: ${{ needs.format.result }}"
+          echo "test:   ${{ needs.test.result }}"
+          test "${{ needs.format.result }}" = "success"
+          test "${{ needs.test.result }}" = "success"

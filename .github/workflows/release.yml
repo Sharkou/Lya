@@ -1,0 +1,249 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Nothing is built or published until the tag and the crate version agree. This is
+  # the only thing standing between `Cargo.toml` and a tag drifting apart, so it runs
+  # first and on its own.
+  verify:
+    name: Verify tag matches Cargo version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare tag with Cargo.toml version
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # First `version = "..."` under [package]; the crate has no workspace members.
+          crate="$(sed -n '/^\[package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p}' Cargo.toml | head -n 1)"
+
+          if [ -z "$crate" ]; then
+            echo "::error::Could not read [package] version from Cargo.toml"
+            exit 1
+          fi
+
+          echo "tag:            $tag"
+          echo "Cargo.toml:     $crate"
+
+          if [ "$tag" != "v$crate" ]; then
+            echo "::error::Tag $tag does not match Cargo.toml version $crate (expected tag v$crate). Nothing was built or published."
+            exit 1
+          fi
+
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  # Every archive is built natively on its own operating system and architecture.
+  # Nothing is cross-compiled and nothing is emulated, so a published asset always
+  # corresponds to a real build on that platform.
+  build:
+    name: ${{ matrix.asset }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-x86_64
+            binary: lya.exe
+            archive: zip
+          # Deliberately not `ubuntu-latest`: an older glibc links against more
+          # distributions. These binaries are not static.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x86_64
+            binary: lya
+            archive: tar.gz
+          # Apple silicon: `macos-latest` is arm64, and pinning the major keeps the
+          # architecture explicit rather than following a label that may move.
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+            binary: lya
+            archive: tar.gz
+          # Intel macOS, built natively. `macos-13` was the old x86_64 image and has
+          # been retired; `macos-15-intel` is the current GitHub-hosted Intel runner.
+          # This artifact is never cross-compiled.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
+            binary: lya
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          # The runner's own target; naming it explicitly means a runner-image
+          # architecture change fails the build instead of quietly producing an
+          # artifact that does not match the asset name.
+          rustup target add ${{ matrix.target }}
+          rustc --version --verbose
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The archive carries LICENSE because the MIT notice must accompany a
+      # distributed copy, and README.md so an unpacked archive can point at the docs.
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/staging
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/staging/
+          cp LICENSE README.md dist/staging/
+          ls -l dist/staging
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="lya-${{ needs.verify.outputs.version }}-${{ matrix.asset }}.tar.gz"
+          chmod 0755 "dist/staging/${{ matrix.binary }}"
+          tar -czf "dist/$name" -C dist/staging "${{ matrix.binary }}" LICENSE README.md
+          echo "Packaged dist/$name"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "lya-${{ needs.verify.outputs.version }}-${{ matrix.asset }}.zip"
+          Compress-Archive -Path "dist/staging/*" -DestinationPath "dist/$name"
+          Write-Host "Packaged dist/$name"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: lya-${{ matrix.asset }}
+          path: dist/lya-*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Runs only after every build job succeeded, so a partial release can never be
+  # published: an asset is never uploaded for a platform that did not build.
+  release:
+    name: Publish GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # create the release and upload assets
+      id-token: write          # mint the Sigstore OIDC token for the attestation
+      attestations: write      # persist the attestation
+      artifact-metadata: write # actions/attest creates an artifact storage record
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download every built archive
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name 'lya-*' -exec cp {} dist/ \;
+          ls -l dist
+
+      # One implementation, on one platform, for every digest — rather than each
+      # runner hashing its own archive with its own tool.
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum lya-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Official GitHub action, and the one GitHub now points new implementations at.
+      # With no predicate, sbom-path or predicate-path input it generates a SLSA build
+      # provenance attestation, which is exactly what the retired
+      # `attest-build-provenance` wrapper produced.
+      #
+      # The subject is the checksums file this job just generated, so one call covers
+      # every archive and the digests being attested are the same digests users verify.
+      # SHA256SUMS.txt is still produced independently, above, and is published whether
+      # or not this step succeeds.
+      #
+      # Non-blocking on purpose: attestation needs a public repository, or GitHub
+      # Advanced Security on a private one, so on a private repository this step fails
+      # and must not fail the release. No signing secret is involved — Sigstore signs
+      # with the workflow's own OIDC identity.
+      - name: Attest build provenance
+        id: attest
+        continue-on-error: true
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+
+      - name: Report attestation outcome
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.attest.outcome }}" = "success" ]; then
+            echo "Build provenance attested."
+          else
+            echo "::notice::Build provenance was not attested (expected on a private repository without GitHub Advanced Security). The release is unaffected."
+          fi
+
+      # `gh release create` is official GitHub tooling, preinstalled on the runner; no
+      # third-party release action is used. `--generate-notes` lets GitHub derive the
+      # notes from the commits since the previous tag, and the body stays editable
+      # afterwards. `--verify-tag` refuses to invent a tag that does not exist.
+      - name: Create the release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify.outputs.version }}"
+          # A tag such as v0.2.0-rc.1 is published as a pre-release.
+          prerelease=""
+          case "$version" in
+            *-*) prerelease="--prerelease" ;;
+          esac
+
+          gh release create "$version" \
+            --title "Lya $version" \
+            --generate-notes \
+            --verify-tag \
+            $prerelease \
+            dist/*
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### Lya ${{ needs.verify.outputs.version }}"
+            echo
+            echo "Binaries are **unsigned**: Windows is not code-signed and macOS is not notarized."
+            echo "Verify downloads against \`SHA256SUMS.txt\`."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
