@@ -375,6 +375,70 @@ This visibility records the exchange Lya is legitimately allowed to know: the sa
 
 Lya currently does not log an actual Codex or Claude model identifier. Both CLIs support model selection, but the structured Codex decision and Claude JSON result contracts used by Lya do not reliably report which model executed a request. Lya will add model metadata only when it is available through a documented structured provider contract.
 
+## Inspecting Jobs
+
+Persisted jobs can be listed without resuming anything:
+
+```bash
+cargo run -- jobs
+```
+
+```text
+JOB                     PROJECT       STATUS                PHASE       ITER  UPDATED  RESUMABLE
+job-1789250000-4242-0   PixelCreator  WAITING_OPENAI_QUOTA  SUPERVISOR  3     4m ago   yes
+job-1789240000-4242-0   Lya           ACCEPTED              PUBLISHER   1     2h ago   no
+```
+
+Jobs are listed most recently updated first, then by job ID.
+
+`lya jobs` is strictly read-only. It reads authoritative per-job state and changes nothing: no job
+state is written, no legacy `state.json` is migrated, no job lock is taken, no Supervisor or
+Executor is invoked and no Git command is run.
+
+Restrict the listing to the jobs `lya resume` would actually continue:
+
+```bash
+cargo run -- jobs --resumable
+```
+
+The verdict comes from the same resume logic `lya resume` uses, so the two cannot disagree. A job
+whose status looks resumable but whose persisted state is inconsistent is listed as not resumable
+together with the exact reason.
+
+Machine-readable output prints one JSON object on stdout; diagnostics stay on stderr:
+
+```bash
+cargo run -- jobs --json
+```
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "job-1789250000-4242-0",
+      "project_name": "PixelCreator",
+      "status": "WAITING_OPENAI_QUOTA",
+      "phase": "SUPERVISOR",
+      "iteration": 3,
+      "created_unix_seconds": 1789249000,
+      "last_updated_unix_seconds": 1789250000,
+      "resumable": true,
+      "continuation": "SUPERVISOR_REVIEW",
+      "blocked_reason": null
+    }
+  ],
+  "unreadable": [],
+  "legacy_state_file": null
+}
+```
+
+`--json` and `--resumable` compose.
+
+A job whose `state.json` is corrupt or unreadable never disappears from the listing. Healthy jobs
+are still listed; the unreadable ones are reported individually with their error, in human and JSON
+output alike, and `lya jobs` exits with a failure status. Lya does not modify, repair or archive
+them.
+
 ## Resuming Jobs
 
 A job that was paused, parked on a provider quota, or interrupted by a process exit can be
@@ -389,7 +453,8 @@ cargo run -- resume --job job-1789250000-4242-0
 ```
 
 Without `--job`, Lya resumes only when exactly one job can be resumed. Otherwise it lists the
-candidates and asks for an explicit choice.
+candidates and asks for an explicit choice. `lya jobs --resumable` shows the same candidates
+without starting anything.
 
 Resumable states are `RUNNING`, `PAUSED`, `PUBLISHING`, `WAITING_CLAUDE_QUOTA` and
 `WAITING_OPENAI_QUOTA`. `FAILED`, `STOPPED`, `PUBLISHED`, `ACCEPTED` and `WAITING_HUMAN` are
@@ -728,6 +793,7 @@ The following are not implemented yet:
 * [x] Interactive job control
 * [x] Persisted job/run resume
 * [x] Quota-aware pause and resume
+* [x] Read-only job listing
 * [ ] Provider process-tree cancellation
 * [ ] Daemon/service mode
 * [ ] Remote administration interface

@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod events;
 pub mod executor;
 pub mod home;
+pub mod inventory;
 pub mod job;
 pub mod lock;
 pub mod publisher;

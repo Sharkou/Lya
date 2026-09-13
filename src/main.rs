@@ -18,11 +18,12 @@ use lya::{
         },
         executor::{ClaudeCliExecutor, Executor, ExecutorRequest, ExecutorSession},
         home::LyaHome,
+        inventory::JobInventory,
         job::{AutonomousOrchestrator, NewJob, OrchestrationError, RunResult, new_job_id},
         lock::JobLock,
         publisher::{GitPublishConfig, GitPublisher, Publisher},
         resume::{ResumeRejection, resumable_jobs, select_job},
-        state::{JobState, JobStatus, StateStore},
+        state::{JobState, JobStatus, StateStore, current_unix_seconds},
         supervisor::{
             CodexCliSupervisor, Project, Supervisor, SupervisorRequest,
             load_required_private_context,
@@ -65,6 +66,9 @@ async fn main() -> ExitCode {
         .is_some_and(|argument| argument == "resume")
     {
         return resume_autonomous_job(&arguments[1..]).await;
+    }
+    if arguments.first().is_some_and(|argument| argument == "jobs") {
+        return list_jobs(&arguments[1..]);
     }
 
     let model = match env::var("OLLAMA_MODEL") {
@@ -374,6 +378,75 @@ async fn resume_autonomous_job(arguments: &[String]) -> ExitCode {
         JobAction::Resume(Box::new(job), private_context),
     )
     .await
+}
+
+/// Lists persisted jobs.
+///
+/// Strictly read-only: no legacy migration, no job lock, no provider call and no Git command. It
+/// deliberately does not go through [`prepare_home`], which writes.
+fn list_jobs(arguments: &[String]) -> ExitCode {
+    let options = match parse_jobs_arguments(arguments) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{error}\nUsage: lya jobs [--resumable] [--json]");
+            return ExitCode::FAILURE;
+        }
+    };
+    let home = match LyaHome::resolve() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("Could not resolve Lya home: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = StateStore::new(&home);
+    let inventory = match JobInventory::collect(&store) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            eprintln!("Could not read persisted job state: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let inventory = if options.resumable_only {
+        inventory.only_resumable()
+    } else {
+        inventory
+    };
+
+    if options.json {
+        match serde_json::to_string_pretty(&inventory.to_json()) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => {
+                eprintln!("Could not render the job listing: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        println!("{}", inventory.render(current_unix_seconds()));
+    }
+
+    if inventory.unreadable.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        // Corruption is never reported only in passing: it also fails the command.
+        eprintln!(
+            "{} persisted job(s) could not be read; they were left untouched.",
+            inventory.unreadable.len()
+        );
+        ExitCode::FAILURE
+    }
+}
+
+fn parse_jobs_arguments(arguments: &[String]) -> Result<JobsOptions, String> {
+    let mut options = JobsOptions::default();
+    for argument in arguments {
+        match argument.as_str() {
+            "--resumable" => options.resumable_only = true,
+            "--json" => options.json = true,
+            argument => return Err(format!("unknown jobs option: {argument}")),
+        }
+    }
+    Ok(options)
 }
 
 /// Explains why a named job cannot be resumed, and otherwise lists what is available.
@@ -689,6 +762,12 @@ enum RunOutput {
     Json,
 }
 
+#[derive(Debug, Default)]
+struct JobsOptions {
+    resumable_only: bool,
+    json: bool,
+}
+
 #[derive(Debug)]
 struct ResumeOptions {
     job_id: Option<String>,
@@ -845,8 +924,8 @@ fn run_doctor() -> ExitCode {
 mod tests {
     use super::{
         ExecutorSession, InterruptAction, RunOutput, interactive_enabled, interrupt_action,
-        parse_executor_arguments, parse_resume_arguments, parse_run_arguments,
-        request_graceful_stop, start_control,
+        parse_executor_arguments, parse_jobs_arguments, parse_resume_arguments,
+        parse_run_arguments, request_graceful_stop, start_control,
     };
     use lya::orchestrator::control::{ControlCommand, ControlReceiver};
 
@@ -965,6 +1044,21 @@ mod tests {
         assert!(parse_resume_arguments(&["--job".to_owned()]).is_err());
         assert!(parse_resume_arguments(&["--nope".to_owned()]).is_err());
         assert!(parse_resume_arguments(&["--verbose".to_owned(), "--json".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_jobs_options_and_composes_the_filters() {
+        let options = parse_jobs_arguments(&[]).expect("a bare listing should parse");
+        assert!(!options.resumable_only);
+        assert!(!options.json);
+
+        let options = parse_jobs_arguments(&["--resumable".to_owned(), "--json".to_owned()])
+            .expect("filters should compose");
+        assert!(options.resumable_only);
+        assert!(options.json);
+
+        assert!(parse_jobs_arguments(&["--delete".to_owned()]).is_err());
+        assert!(parse_jobs_arguments(&["job-1".to_owned()]).is_err());
     }
 
     #[tokio::test]

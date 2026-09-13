@@ -300,6 +300,16 @@ impl LegacyMigration {
     }
 }
 
+/// One entry of the persisted job directory.
+///
+/// A job whose `state.json` is corrupt or unreadable keeps its place in the listing as an explicit
+/// error instead of disappearing from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobEntry {
+    Loaded(Box<JobState>),
+    Unreadable { job_id: String, error: String },
+}
+
 /// Per-job persistent state under `LYA_HOME/jobs/<job-id>/state.json`.
 ///
 /// Every job owns its own file so two Lya processes working on different jobs never rewrite each
@@ -371,6 +381,45 @@ impl StateStore {
             jobs.insert(job.job_id.clone(), job);
         }
         Ok(jobs.into_values().collect())
+    }
+
+    /// Every entry in the persisted job directory, ordered by job ID.
+    ///
+    /// Only a failure to enumerate the directory itself is an error here: a single job whose
+    /// `state.json` cannot be read is reported as [`JobEntry::Unreadable`] instead of hiding every
+    /// healthy job behind it. Nothing is written, moved or repaired.
+    pub fn load_all_entries(&self) -> Result<Vec<JobEntry>, StateError> {
+        let directory = self.jobs_directory();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StateError::Read(error.to_string())),
+        };
+        let mut found = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| StateError::Read(error.to_string()))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let directory_name = entry.file_name().to_string_lossy().into_owned();
+            match read_job(&path.join("state.json")) {
+                Ok(Some(job)) => {
+                    found.insert(job.job_id.clone(), JobEntry::Loaded(Box::new(job)));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    found.insert(
+                        directory_name.clone(),
+                        JobEntry::Unreadable {
+                            job_id: directory_name,
+                            error: error.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(found.into_values().collect())
     }
 
     /// Move an existing `LYA_HOME/state.json` into the per-job layout. A per-job file that already
@@ -593,6 +642,31 @@ mod tests {
             .expect_err("invalid JSON should fail");
 
         assert!(error.to_string().contains("invalid JSON"));
+        fs::remove_dir_all(directory).expect("home should be removed");
+    }
+
+    #[test]
+    fn entry_listing_reports_a_corrupt_job_without_hiding_the_healthy_ones() {
+        let directory = home();
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+        store
+            .save_job(&job("healthy", JobStatus::Paused))
+            .expect("healthy job should save");
+        let broken = store.job_state_path("broken").expect("path");
+        fs::create_dir_all(broken.parent().expect("parent")).expect("directory should be created");
+        fs::write(&broken, "not JSON").expect("corrupt state should be written");
+
+        let entries = store.load_all_entries().expect("entries should load");
+
+        assert_eq!(entries.len(), 2);
+        let super::JobEntry::Unreadable { job_id, error } = &entries[0] else {
+            panic!("the corrupt job should be reported as unreadable");
+        };
+        assert_eq!(job_id, "broken");
+        assert!(error.contains("invalid JSON"));
+        assert!(matches!(&entries[1], super::JobEntry::Loaded(job) if job.job_id == "healthy"));
+        // The strict loader keeps its existing all-or-nothing contract.
+        assert!(store.load_all().is_err());
         fs::remove_dir_all(directory).expect("home should be removed");
     }
 
