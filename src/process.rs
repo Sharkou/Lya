@@ -518,6 +518,144 @@ mod tests {
         assert!(matches!(error, ProcessError::Timeout(_)));
     }
 
+    /// What a Windows console application can say about its own console.
+    ///
+    /// `GetConsoleWindow` answers "is there a window", and `GetConsoleProcessList` answers the
+    /// stronger question "am I attached to a console at all" — it fails, returning zero, for a
+    /// process with none. Both are asked because a console without a window would still be a
+    /// console whose control events could terminate a provider.
+    #[cfg(windows)]
+    fn console_state() -> (bool, Vec<u32>) {
+        use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+
+        let window = !unsafe { GetConsoleWindow() }.is_null();
+        // Asked twice: the first call reports how many processes share this console, the second
+        // reads them. Zero means this process is attached to no console at all.
+        let mut probe = [0u32; 1];
+        let needed = unsafe { GetConsoleProcessList(probe.as_mut_ptr(), 1) };
+        if needed == 0 {
+            return (window, Vec::new());
+        }
+        let mut owners = vec![0u32; needed as usize];
+        let written = unsafe { GetConsoleProcessList(owners.as_mut_ptr(), needed) };
+        owners.truncate(written.min(needed) as usize);
+        (window, owners)
+    }
+
+    /// The child half of [`a_spawned_child_has_no_console_of_its_own`].
+    ///
+    /// Ignored by default and inert unless the parent asks for it, exactly like the other
+    /// cross-process helpers in this crate: it is driven by a parent test, not run on its own.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process helper, driven by the Windows console-attachment test"]
+    fn console_probe() {
+        if env::var("LYA_TEST_CONSOLE_PROBE").is_err() {
+            return;
+        }
+        let (window, owners) = console_state();
+        // One marker line, because the test harness writes lines of its own around it.
+        println!(
+            "LYA_CONSOLE_PROBE window={} owners={}",
+            u8::from(window),
+            owners
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    /// A process Lya spawns must have no console, whatever console Lya itself has.
+    ///
+    /// This is the invariant behind two real Windows failures, and it is asserted by *asking the
+    /// child*, not by inspecting creation flags:
+    ///
+    /// * a detached daemon has no console, so Windows would create a brand-new one — with a
+    ///   visible window — for every provider call;
+    /// * a foreground run has the terminal's console, which the child would inherit, so a `Ctrl+C`
+    ///   meant for Lya would terminate the provider directly with `STATUS_CONTROL_C_EXIT`.
+    ///
+    /// The child is spawned through [`ProcessSpec::run`], so it travels the same path `codex`,
+    /// `claude` and `git` do and proves the policy those inherit. No provider CLI is involved.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_spawned_child_has_no_console_of_its_own() {
+        let executable = env::current_exe().expect("the test binary should have a path");
+        let mut spec = ProcessSpec::new(executable);
+        spec.args = vec![
+            "--exact".to_owned(),
+            "process::tests::console_probe".to_owned(),
+            "--ignored".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        spec.env
+            .insert("LYA_TEST_CONSOLE_PROBE".to_owned(), "1".to_owned());
+
+        let output = spec.run().await.expect("the probe should run");
+        assert_eq!(
+            output.exit_code,
+            Some(0),
+            "the probe should pass:\n{}\n{}",
+            output.stdout,
+            output.stderr
+        );
+
+        let reported = output
+            .stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("LYA_CONSOLE_PROBE "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the probe should report its console state:\n{}\n{}",
+                    output.stdout, output.stderr
+                )
+            })
+            .to_owned();
+
+        let (parent_window, parent_owners) = console_state();
+        println!(
+            "parent pid={} window={parent_window} owners={parent_owners:?}",
+            std::process::id()
+        );
+        println!("child {reported}");
+
+        let (window, owners) = reported
+            .split_once(' ')
+            .expect("the probe line should carry both fields");
+        let owners = owners
+            .strip_prefix("owners=")
+            .expect("the probe line should name its console owners");
+        let owners = owners
+            .split(',')
+            .filter(|pid| !pid.is_empty())
+            .map(|pid| pid.parse::<u32>().expect("a console owner is a process id"))
+            .collect::<Vec<_>>();
+
+        // No window: nothing can flash up, whether or not Lya itself has a console. This is the
+        // part that was visibly wrong under the daemon.
+        assert_eq!(
+            window, "window=0",
+            "a spawned child must have no console window"
+        );
+
+        // Not on Lya's console: a console control event aimed at Lya, or at the shell that started
+        // it, is delivered to the processes attached to *that* console. The child must not be one
+        // of them, or a `Ctrl+C` would terminate the provider behind Lya's back with
+        // `STATUS_CONTROL_C_EXIT`. `CREATE_NO_WINDOW` gives the child a windowless console of its
+        // own, so the two sets must be disjoint.
+        assert!(
+            !owners.contains(&std::process::id()),
+            "a spawned child must not share Lya's console: child owners {owners:?} include this process"
+        );
+        for owner in &parent_owners {
+            assert!(
+                !owners.contains(owner),
+                "a spawned child must not share Lya's console: {owner} is on both"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cancellation_kills_and_reaps_a_child_without_becoming_a_timeout() {
         #[cfg(unix)]

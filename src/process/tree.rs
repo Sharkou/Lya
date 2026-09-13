@@ -8,6 +8,11 @@
 //! * Windows assigns the child to a Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`;
 //! * Unix puts the child in its own process group and signals the whole group.
 //!
+//! Each platform also configures the child *before* it is spawned so that it never shares a
+//! console or a process group with Lya. That is what keeps a `Ctrl+C` meant for Lya from
+//! terminating a provider directly, and on Windows it is also what stops a console window from
+//! appearing — see each platform's `ProcessTree::configure`.
+//!
 //! Both claims are taken for every spawned process, so a cancellation never has to decide whether
 //! the tree is worth claiming. Platform code stays in this module; [`super::ProcessSpec::run`] only
 //! configures, attaches and terminates.
@@ -25,10 +30,13 @@ mod windows_tree {
     use tokio::process::{Child, Command};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
-        System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject,
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject,
+            },
+            Threading::CREATE_NO_WINDOW,
         },
     };
 
@@ -54,9 +62,51 @@ mod windows_tree {
     }
 
     impl ProcessTree {
-        /// Nothing has to be configured before spawning on Windows: the job claim is taken on the
-        /// spawned process itself.
-        pub fn configure(_command: &mut Command) {}
+        /// Give the child a console of its own, without a window.
+        ///
+        /// Every process Lya spawns — `codex`, `claude`, `git` — is a non-interactive console
+        /// application whose standard streams are already redirected to pipes or to null. Leaving
+        /// its console to Windows' default goes wrong in both directions, and both are the same
+        /// defect: the child ends up on a console Lya does not own, whose control events terminate
+        /// it.
+        ///
+        /// * **From a detached daemon there is no console to inherit, so Windows creates one.** The
+        ///   daemon is started with `DETACHED_PROCESS` and therefore has no console at all, and
+        ///   "the system creates a new console when it starts a console process". That console has
+        ///   a *visible window*, and so does one for every console descendant the provider starts —
+        ///   windows flashing up on a machine where nobody asked for a terminal. Whatever then
+        ///   closes or tears down such a console delivers `CTRL_CLOSE_EVENT`/`CTRL_C_EVENT` to the
+        ///   processes on it, whose default handling exits them with `STATUS_CONTROL_C_EXIT`
+        ///   (`0xC000013A`) — a provider killed mid-run by a console Lya never intended it to have.
+        /// * **From a terminal the child inherits Lya's own console.** A `Ctrl+C` meant for Lya is
+        ///   then delivered to the provider too, so the provider dies behind Lya's back instead of
+        ///   Lya deciding when a provider is cancelled. Unix has never had this problem, because
+        ///   the child gets its own process group below.
+        ///
+        /// `CREATE_NO_WINDOW` fixes both. Measured rather than assumed: the child is attached to a
+        /// console, but to a *private* one holding only itself — its console process list is
+        /// disjoint from Lya's — and that console has no window. So nothing can appear on screen,
+        /// and a control event aimed at Lya's console or at the launching shell's console reaches
+        /// only the processes attached to *that* console, which never include the provider. The
+        /// provider keeps a console of its own, which is what a console application expects to have.
+        ///
+        /// Deliberately *only* this flag:
+        ///
+        /// * `CREATE_NEW_PROCESS_GROUP` adds nothing here. It exists so `GenerateConsoleCtrlEvent`
+        ///   can address a group, and Lya cancels through the Job Object below rather than by
+        ///   signalling a console. Windows also documents it as disabling `CTRL+C` for everything
+        ///   in the new group, which is the provider's own business and not Lya's to change.
+        /// * `DETACHED_PROCESS` and `CREATE_NEW_CONSOLE` must never be combined with this flag:
+        ///   Windows documents `CREATE_NO_WINDOW` as *ignored* alongside either. `DETACHED_PROCESS`
+        ///   would leave the child free to allocate its own visible console later, and
+        ///   `CREATE_NEW_CONSOLE` asks for exactly the window this is removing.
+        ///
+        /// This is orthogonal to the Job Object claim: creation flags do not affect
+        /// `AssignProcessToJobObject`, which is taken on the spawned process immediately after this
+        /// command runs, so whole-tree cancellation and timeouts are unchanged.
+        pub fn configure(command: &mut Command) {
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
 
         /// Claim the spawned process and its future descendants.
         ///

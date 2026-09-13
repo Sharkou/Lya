@@ -35,3 +35,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `GetConsoleWindow` / `GetConsoleProcessList`, so a test can prove a spawned
+# provider-style child really has no console instead of asserting that a creation
+# flag appears in the source. Test-only: the shipped binary does not grow.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
