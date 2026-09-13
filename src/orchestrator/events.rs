@@ -112,6 +112,25 @@ pub enum JobEventKind {
     UserInstructionApplied {
         instruction: String,
     },
+    UserInstructionRejected {
+        instruction: String,
+        reason: String,
+    },
+    ResumeStarted {
+        status: String,
+        pending_operation: Option<String>,
+    },
+    ResumeValidated {
+        continuation: String,
+        head: String,
+    },
+    ResumeRejected {
+        reason: String,
+    },
+    QuotaRetryStarted {
+        provider: String,
+        operation: String,
+    },
     StatusReported {
         status: String,
         phase: String,
@@ -570,6 +589,66 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
             if mode == HumanRenderMode::Verbose {
                 output.push_str(&full(instruction));
             }
+        }
+        JobEventKind::UserInstructionRejected {
+            instruction,
+            reason,
+        } => {
+            output.push_str(&format!(
+                "{timestamp}  {}
+",
+                heading("CONTROL")
+            ));
+            output.push_str(&detail(&format!("instruction refused: {reason}")));
+            output.push_str(&detail(&truncate(instruction, 360)));
+        }
+        JobEventKind::ResumeStarted {
+            status,
+            pending_operation,
+        } => {
+            output.push_str(&format!(
+                "{timestamp}  {}
+",
+                heading("RESUME")
+            ));
+            output.push_str(&detail(&format!(
+                "persisted status: {status}; pending operation: {}",
+                pending_operation.as_deref().unwrap_or("none")
+            )));
+        }
+        JobEventKind::ResumeValidated { continuation, head } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}
+",
+                heading("RESUME"),
+                style("validated", "32", color)
+            ));
+            output.push_str(&detail(&format!(
+                "continuing at {continuation}; HEAD {}",
+                short_sha(head)
+            )));
+        }
+        JobEventKind::ResumeRejected { reason } => {
+            output.push_str(&format!(
+                "{timestamp}  {}  {}
+",
+                heading("RESUME"),
+                style("rejected", "31", color)
+            ));
+            output.push_str(&detail(reason));
+        }
+        JobEventKind::QuotaRetryStarted {
+            provider,
+            operation,
+        } => {
+            output.push_str(&format!(
+                "{timestamp}  {}
+",
+                heading("RESUME")
+            ));
+            output.push_str(&detail(&format!(
+                "retrying {operation} after the {provider} quota wait"
+            )));
         }
         JobEventKind::StatusReported {
             status,

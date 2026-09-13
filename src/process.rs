@@ -127,6 +127,10 @@ impl ProcessSpec {
         }
         if self.stdin.is_some() {
             command.stdin(Stdio::piped());
+        } else {
+            // A child never inherits Lya's own standard input: Lya reads it for interactive
+            // control commands, and an inherited handle would let a child consume them.
+            command.stdin(Stdio::null());
         }
 
         let mut child = command.spawn().map_err(|error| {
@@ -410,8 +414,14 @@ mod tests {
     async fn reports_timeout() {
         #[cfg(unix)]
         let mut spec = spec("sleep", &["2"]);
+        // `ping` waits without reading standard input, unlike `timeout.exe`, which refuses to run
+        // at all when its input is redirected.
         #[cfg(windows)]
-        let mut spec = spec("timeout.exe", &["/T", "2", "/NOBREAK"]);
+        let mut spec = {
+            let mut spec = ProcessSpec::new("ping.exe");
+            spec.args = vec!["-n".to_owned(), "3".to_owned(), "127.0.0.1".to_owned()];
+            spec
+        };
         spec.timeout = Some(Duration::from_millis(50));
 
         let error = spec.run().await.expect_err("process should time out");
@@ -424,7 +434,11 @@ mod tests {
         #[cfg(unix)]
         let mut spec = spec("sleep", &["2"]);
         #[cfg(windows)]
-        let mut spec = spec("cmd.exe", &["/C", "timeout /T 2 /NOBREAK > NUL"]);
+        let mut spec = {
+            let mut spec = ProcessSpec::new("ping.exe");
+            spec.args = vec!["-n".to_owned(), "3".to_owned(), "127.0.0.1".to_owned()];
+            spec
+        };
         let cancellation = ProcessCancellation::new();
         cancellation.cancel();
         spec.cancellation = Some(cancellation);

@@ -113,7 +113,9 @@ mod tests {
     #[cfg(unix)]
     const TIMEOUT_COMMAND: &str = "sleep 1";
     #[cfg(windows)]
-    const TIMEOUT_COMMAND: &str = "timeout.exe /T 1 /NOBREAK";
+    // `ping` waits without reading standard input; `timeout.exe` refuses to run when its input
+    // is redirected, which it always is for a child started by Lya.
+    const TIMEOUT_COMMAND: &str = "ping.exe -n 3 127.0.0.1";
 
     #[test]
     fn captures_successful_command_stdout() {

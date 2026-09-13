@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize, ser::SerializeMap};
 use crate::process::{ProcessError, ProcessSpec};
 pub use crate::process::{ProcessRunner, SystemProcessRunner};
 
-use super::{context::PrivateContext, home::LyaHome};
+use super::{
+    context::PrivateContext,
+    home::LyaHome,
+    state::{QuotaSource, message_indicates_quota},
+};
 
 /// Stable rules for a supervisor decision. Dynamic project data is supplied separately.
 pub const SUPERVISOR_SYSTEM_PROMPT: &str = r#"You are the supervisor of an autonomous software-development loop.
@@ -453,14 +457,25 @@ impl<R: ProcessRunner> Supervisor for CodexCliSupervisor<R> {
                 .await
                 .map_err(SupervisorError::from_process_error)?;
             if output.exit_code != Some(0) {
-                return Err(SupervisorError::ProcessFailed {
-                    exit_code: output.exit_code,
-                    stderr: output.stderr,
-                });
+                return Err(classify_failure(output.exit_code, output.stderr));
             }
             self.read_decision()
         })
     }
+}
+
+/// Classify a failed Codex run at the provider boundary.
+///
+/// `codex exec` reports a structured decision only on success; it documents no machine-readable
+/// quota signal, so quota detection here is explicitly the recorded message heuristic.
+fn classify_failure(exit_code: Option<i32>, stderr: String) -> SupervisorError {
+    if message_indicates_quota(&stderr) {
+        return SupervisorError::QuotaExceeded {
+            source: QuotaSource::ProviderMessageHeuristic,
+            detail: stderr.trim().lines().take(3).collect::<Vec<_>>().join(" "),
+        };
+    }
+    SupervisorError::ProcessFailed { exit_code, stderr }
 }
 
 fn render_prompt(request: &SupervisorRequest) -> String {
@@ -495,6 +510,10 @@ pub enum SupervisorError {
         stderr: String,
     },
     Timeout(Duration),
+    QuotaExceeded {
+        source: QuotaSource,
+        detail: String,
+    },
     Process(String),
     InvalidOutput(String),
     InvalidDecision(DecisionError),
@@ -532,6 +551,11 @@ impl fmt::Display for SupervisorError {
                 formatter,
                 "Codex timed out after {} seconds",
                 timeout.as_secs_f64()
+            ),
+            Self::QuotaExceeded { source, detail } => write!(
+                formatter,
+                "OpenAI quota is exhausted ({}): {detail}",
+                source.label()
             ),
             Self::Process(error) => write!(formatter, "Codex process error: {error}"),
             Self::InvalidOutput(error) => write!(formatter, "invalid Codex output: {error}"),

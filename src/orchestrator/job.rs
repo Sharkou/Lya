@@ -16,14 +16,22 @@ use super::{
         executor_event_kind, supervisor_event_fields,
     },
     executor::{Executor, ExecutorError, ExecutorRequest, ExecutorSession},
-    publisher::{PublishError, PublishProgress, PublishRequest, PublishStage, Publisher},
+    lock::{JobLock, LockError},
+    publisher::{
+        GitPublishConfig, PublishError, PublishProgress, PublishRecoveryRequest, PublishRequest,
+        PublishResult, PublishStage, Publisher,
+    },
     repository::{RepositoryError, RepositoryState},
-    state::{JobPhase, JobState, JobStatus, StateError, StateStore},
+    resume::{ResumeContinuation, ResumePlan, ResumeRejection},
+    state::{
+        JobPhase, JobState, JobStatus, MAX_ACTIVE_USER_INSTRUCTION_BYTES,
+        MAX_ACTIVE_USER_INSTRUCTIONS, PendingOperation, QuotaSource, QuotaWait, RunConfiguration,
+        StateError, StateStore, current_unix_seconds, message_indicates_quota,
+    },
     supervisor::{Project, Supervisor, SupervisorDecision, SupervisorError, SupervisorRequest},
 };
 
-pub const DEFAULT_MAX_ITERATIONS: u32 = 10;
-pub const DEFAULT_MAX_JOBS: u32 = 10;
+pub use super::state::{DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_JOBS};
 
 static NEXT_JOB_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -33,6 +41,18 @@ pub struct NewJob {
     pub project: Project,
     pub task: String,
     pub private_context: String,
+}
+
+/// The next thing the loop should do. Derived either from a fresh start or from authoritative
+/// persisted state at resume; never reconstructed from the event log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// `fresh` distinguishes a new iteration from retrying a review that was already counted.
+    Supervise {
+        fresh: bool,
+    },
+    Execute,
+    Publish,
 }
 
 pub struct AutonomousOrchestrator<S, E, R = SystemProcessRunner, P = (), N = NoopEventSink> {
@@ -45,6 +65,7 @@ pub struct AutonomousOrchestrator<S, E, R = SystemProcessRunner, P = (), N = Noo
     max_iterations: u32,
     max_jobs: u32,
     browser: bool,
+    publish_configuration: Option<GitPublishConfig>,
     control: ControlReceiver,
 }
 
@@ -60,6 +81,7 @@ impl<S, E, R> AutonomousOrchestrator<S, E, R, (), NoopEventSink> {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_jobs: DEFAULT_MAX_JOBS,
             browser: false,
+            publish_configuration: None,
             control: ControlReceiver::disabled(),
         }
     }
@@ -81,6 +103,13 @@ impl<S, E, R, P, N> AutonomousOrchestrator<S, E, R, P, N> {
         self
     }
 
+    /// Records the Git configuration a later process needs to continue publication. It carries no
+    /// secrets: push authentication stays with the machine's own Git setup.
+    pub fn with_publish_configuration(mut self, configuration: GitPublishConfig) -> Self {
+        self.publish_configuration = Some(configuration);
+        self
+    }
+
     pub fn with_publisher<Q>(self, publisher: Q) -> AutonomousOrchestrator<S, E, R, Q, N> {
         AutonomousOrchestrator {
             supervisor: self.supervisor,
@@ -92,6 +121,7 @@ impl<S, E, R, P, N> AutonomousOrchestrator<S, E, R, P, N> {
             max_iterations: self.max_iterations,
             max_jobs: self.max_jobs,
             browser: self.browser,
+            publish_configuration: self.publish_configuration,
             control: self.control,
         }
     }
@@ -107,6 +137,7 @@ impl<S, E, R, P, N> AutonomousOrchestrator<S, E, R, P, N> {
             max_iterations: self.max_iterations,
             max_jobs: self.max_jobs,
             browser: self.browser,
+            publish_configuration: self.publish_configuration,
             control: self.control,
         }
     }
@@ -120,7 +151,17 @@ impl<S, E, R, P, N> AutonomousOrchestrator<S, E, R, P, N> {
 impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
     AutonomousOrchestrator<S, E, R, P, N>
 {
-    pub async fn run(&self, request: NewJob) -> Result<JobState, OrchestrationError> {
+    fn run_configuration(&self) -> RunConfiguration {
+        RunConfiguration {
+            max_iterations: self.max_iterations,
+            max_jobs: self.max_jobs,
+            browser: self.browser,
+            publish: self.publisher.is_enabled(),
+            git: self.publish_configuration.clone(),
+        }
+    }
+
+    fn validate_request(&self, request: &NewJob) -> Result<(), OrchestrationError> {
         if request.task.trim().is_empty() {
             return Err(OrchestrationError::InvalidTransition(
                 "a job task cannot be empty".to_owned(),
@@ -146,6 +187,11 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 "max jobs must be greater than zero".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    pub async fn run(&self, request: NewJob) -> Result<JobState, OrchestrationError> {
+        self.validate_request(&request)?;
 
         let initial_repository_state =
             match RepositoryState::collect(&self.repository_runner, &request.project.path).await {
@@ -178,11 +224,13 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         }
 
         let mut job = JobState::new(
-            request.job_id,
+            request.job_id.clone(),
             request.project.name.clone(),
             request.project.path.clone(),
             request.task.clone(),
         );
+        job.run = self.run_configuration();
+        job.last_repository_state = Some(initial_repository_state.clone());
         self.persist(&job)?;
         self.emit(
             &job,
@@ -196,81 +244,280 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 summary: RepositorySummary::from(&initial_repository_state),
             },
         )?;
-        let mut repository_state = initial_repository_state;
 
+        self.drive(
+            job,
+            &request.project,
+            &request.private_context,
+            initial_repository_state,
+            Stage::Supervise { fresh: true },
+        )
+        .await
+    }
+
+    /// Continue a job persisted by an earlier process.
+    ///
+    /// Reality is compared against authoritative job state before any provider call or Git write.
+    /// Anything that cannot be proven parks the job in `WAITING_HUMAN` with a precise reason.
+    pub async fn resume(
+        &self,
+        job: JobState,
+        private_context: String,
+    ) -> Result<JobState, OrchestrationError> {
+        if private_context.trim().is_empty() {
+            return Err(OrchestrationError::InvalidTransition(
+                "private context cannot be empty".to_owned(),
+            ));
+        }
+        let project = Project {
+            name: job.project_name.clone(),
+            path: job.project_path.clone(),
+        };
+        let mut job = job;
+        self.emit(
+            &job,
+            JobEventKind::ResumeStarted {
+                status: job.status.label().to_owned(),
+                pending_operation: job
+                    .pending_operation
+                    .map(|operation| operation.label().to_owned()),
+            },
+        )?;
+
+        let plan = match ResumePlan::for_job(&job) {
+            Ok(plan) => plan,
+            Err(rejection) => {
+                self.emit(
+                    &job,
+                    JobEventKind::ResumeRejected {
+                        reason: rejection.to_string(),
+                    },
+                )?;
+                return Err(OrchestrationError::Resume(rejection));
+            }
+        };
+
+        let repository_state =
+            match RepositoryState::collect(&self.repository_runner, &job.project_path).await {
+                Ok(state) => state,
+                Err(error) => {
+                    self.emit(
+                        &job,
+                        JobEventKind::ResumeRejected {
+                            reason: error.to_string(),
+                        },
+                    )?;
+                    return Err(OrchestrationError::Repository(error));
+                }
+            };
+
+        // Publication recovery proves its own invariants against the accepted snapshot, including
+        // a staged index or an existing commit, so it is not required to match the last capture.
+        if plan.continuation != ResumeContinuation::Publication {
+            match &job.last_repository_state {
+                Some(persisted) if persisted == &repository_state => {}
+                Some(_) => {
+                    let reason = format!(
+                        "the repository at {} changed while Lya was not running; resume cannot continue safely",
+                        job.project_path.display()
+                    );
+                    return self.wait_for_human(&mut job, reason).await;
+                }
+                None => {
+                    return self
+                        .wait_for_human(
+                            &mut job,
+                            "no repository snapshot was persisted for this job, so an unchanged repository cannot be proven".to_owned(),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        let stage = match plan.continuation {
+            ResumeContinuation::Fresh => Stage::Supervise { fresh: true },
+            ResumeContinuation::Supervisor => Stage::Supervise { fresh: false },
+            ResumeContinuation::Executor => Stage::Execute,
+            ResumeContinuation::Publication => Stage::Publish,
+        };
+        self.emit(
+            &job,
+            JobEventKind::ResumeValidated {
+                continuation: plan.continuation.label().to_owned(),
+                head: repository_state.head.clone(),
+            },
+        )?;
+        if let Some(quota) = &job.quota_wait {
+            self.emit(
+                &job,
+                JobEventKind::QuotaRetryStarted {
+                    provider: quota.provider.clone(),
+                    operation: quota.operation.label().to_owned(),
+                },
+            )?;
+        }
+        job.quota_wait = None;
+        job.status = JobStatus::Running;
+        job.touch();
+        self.persist(&job)?;
+
+        self.drive(job, &project, &private_context, repository_state, stage)
+            .await
+    }
+
+    async fn drive(
+        &self,
+        mut job: JobState,
+        project: &Project,
+        private_context: &str,
+        mut repository_state: RepositoryState,
+        mut stage: Stage,
+    ) -> Result<JobState, OrchestrationError> {
         loop {
             if !self.safe_point(&mut job).await? {
                 return Ok(job);
             }
-            if job.iteration >= self.max_iterations {
-                self.fail(
-                    &mut job,
-                    format!(
-                        "autonomous job reached its iteration limit of {}",
-                        self.max_iterations
-                    ),
-                )?;
-                return Err(OrchestrationError::IterationLimit {
-                    limit: self.max_iterations,
-                });
-            }
-
-            job.phase = JobPhase::Supervisor;
-            job.iteration += 1;
-            let supervisor_request = SupervisorRequest {
-                private_context: request.private_context.clone(),
-                project: request.project.clone(),
-                task: request.task.clone(),
-                phase: Some("supervisor review".to_owned()),
-                iteration: job.iteration,
-                executor_report: job.last_executor_report.clone(),
-                repository_state: Some(repository_state.render_for_supervisor()),
-                user_instructions: job.applied_user_instructions.clone(),
-                cancellation: Some(self.control.cancellation()),
-            };
-            self.emit(
-                &job,
-                JobEventKind::SupervisorStarted {
-                    prompt: observable_supervisor_prompt(&supervisor_request),
-                },
-            )?;
-            let decision = match self.supervisor.decide(supervisor_request).await {
-                Ok(decision) => decision,
-                Err(error) => {
-                    if !self.safe_point(&mut job).await? {
-                        return Ok(job);
+            match stage {
+                Stage::Supervise { fresh } => {
+                    if fresh {
+                        let limit = job.run.max_iterations;
+                        if job.iteration >= limit {
+                            self.fail(
+                                &mut job,
+                                format!("autonomous job reached its iteration limit of {limit}"),
+                            )?;
+                            return Err(OrchestrationError::IterationLimit { limit });
+                        }
+                        job.iteration += 1;
                     }
-                    if is_quota_error(&error.to_string()) {
-                        self.wait_for_quota(&mut job, "OpenAI", error.to_string())?;
-                        return Ok(job);
-                    }
-                    self.fail(&mut job, error.to_string())?;
-                    return Err(OrchestrationError::Supervisor(error));
-                }
-            };
-            if !self.safe_point(&mut job).await? {
-                return Ok(job);
-            }
-            job.last_supervisor_decision = Some(decision.clone());
-            let (action, reason, prompt, commit_title, next_prompt) =
-                supervisor_event_fields(&decision);
-            self.emit(
-                &job,
-                JobEventKind::SupervisorFinished {
-                    action,
-                    reason,
-                    prompt,
-                    commit_title,
-                    next_prompt,
-                },
-            )?;
-
-            match decision {
-                SupervisorDecision::Claude { prompt, .. } => {
-                    job.phase = JobPhase::Executor;
+                    job.status = JobStatus::Running;
+                    job.phase = JobPhase::Supervisor;
+                    job.pending_operation = Some(PendingOperation::SupervisorReview);
                     job.touch();
                     self.persist(&job)?;
 
+                    let supervisor_request = SupervisorRequest {
+                        private_context: private_context.to_owned(),
+                        project: project.clone(),
+                        task: job.task.clone(),
+                        phase: Some("supervisor review".to_owned()),
+                        iteration: job.iteration,
+                        executor_report: job.last_executor_report.clone(),
+                        repository_state: Some(repository_state.render_for_supervisor()),
+                        user_instructions: job.applied_user_instructions.clone(),
+                        cancellation: Some(self.control.cancellation()),
+                    };
+                    self.emit(
+                        &job,
+                        JobEventKind::SupervisorStarted {
+                            prompt: observable_supervisor_prompt(&supervisor_request),
+                        },
+                    )?;
+                    let decision = match self.supervisor.decide(supervisor_request).await {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            if !self.safe_point(&mut job).await? {
+                                return Ok(job);
+                            }
+                            if let Some((source, detail)) = supervisor_quota(&error) {
+                                self.wait_for_quota(
+                                    &mut job,
+                                    "OpenAI",
+                                    PendingOperation::SupervisorReview,
+                                    source,
+                                    detail,
+                                )?;
+                                return Ok(job);
+                            }
+                            self.fail(&mut job, error.to_string())?;
+                            return Err(OrchestrationError::Supervisor(error));
+                        }
+                    };
+                    if !self.safe_point(&mut job).await? {
+                        return Ok(job);
+                    }
+                    job.last_supervisor_decision = Some(decision.clone());
+                    let (action, reason, prompt, commit_title, next_prompt) =
+                        supervisor_event_fields(&decision);
+                    self.emit(
+                        &job,
+                        JobEventKind::SupervisorFinished {
+                            action,
+                            reason,
+                            prompt,
+                            commit_title,
+                            next_prompt,
+                        },
+                    )?;
+
+                    match decision {
+                        SupervisorDecision::Claude { .. } => {
+                            job.phase = JobPhase::Executor;
+                            job.pending_operation = Some(PendingOperation::ExecutorRun);
+                            job.touch();
+                            self.persist(&job)?;
+                            stage = Stage::Execute;
+                        }
+                        SupervisorDecision::Accept { .. } => {
+                            job.status = JobStatus::Accepted;
+                            job.accepted_repository_state = Some(repository_state.clone());
+                            if !self.publisher.is_enabled() {
+                                job.pending_operation = None;
+                                job.touch();
+                                self.persist(&job)?;
+                                self.emit(
+                                    &job,
+                                    JobEventKind::JobFinished {
+                                        status: "ACCEPTED".to_owned(),
+                                    },
+                                )?;
+                                return Ok(job);
+                            }
+                            job.pending_operation = Some(PendingOperation::Publication);
+                            job.touch();
+                            self.persist(&job)?;
+                            stage = Stage::Publish;
+                        }
+                        SupervisorDecision::Human { reason } => {
+                            job.status = JobStatus::WaitingHuman;
+                            job.pending_operation = None;
+                            job.touch();
+                            self.persist(&job)?;
+                            self.emit(&job, JobEventKind::WaitingForHuman { reason })?;
+                            self.emit(
+                                &job,
+                                JobEventKind::JobFinished {
+                                    status: "WAITING_HUMAN".to_owned(),
+                                },
+                            )?;
+                            return Ok(job);
+                        }
+                        SupervisorDecision::Stop { reason } => {
+                            job.status = JobStatus::Stopped;
+                            job.pending_operation = None;
+                            job.touch();
+                            self.persist(&job)?;
+                            self.emit(&job, JobEventKind::Stopped { reason })?;
+                            self.emit(
+                                &job,
+                                JobEventKind::JobFinished {
+                                    status: "STOPPED".to_owned(),
+                                },
+                            )?;
+                            return Ok(job);
+                        }
+                    }
+                }
+                Stage::Execute => {
+                    let Some(SupervisorDecision::Claude { prompt, .. }) =
+                        job.last_supervisor_decision.clone()
+                    else {
+                        let error =
+                            "executor work was requested without a recorded Claude decision"
+                                .to_owned();
+                        self.fail(&mut job, error.clone())?;
+                        return Err(OrchestrationError::InvalidTransition(error));
+                    };
                     let session = match (&job.last_executor_report, &job.claude_session_id) {
                         (Some(_), Some(session_id)) if !session_id.trim().is_empty() => {
                             ExecutorSession::Resume(session_id.clone())
@@ -280,14 +527,20 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             self.fail(&mut job, error.clone())?;
                             return Err(OrchestrationError::InvalidTransition(error));
                         }
-                        (None, _) => ExecutorSession::New,
+                        (None, _) => match &job.claude_session_id {
+                            // A resumed job with a known session continues that exact session.
+                            Some(session_id) if !session_id.trim().is_empty() => {
+                                ExecutorSession::Resume(session_id.clone())
+                            }
+                            _ => ExecutorSession::New,
+                        },
                     };
                     let executor_request = ExecutorRequest {
                         project_name: job.project_name.clone(),
                         project_path: job.project_path.clone(),
                         prompt,
                         session,
-                        browser: self.browser,
+                        browser: job.run.browser,
                         timeout: None,
                         user_instructions: job.applied_user_instructions.clone(),
                         cancellation: Some(self.control.cancellation()),
@@ -311,8 +564,14 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                             if !self.safe_point(&mut job).await? {
                                 return Ok(job);
                             }
-                            if is_quota_error(&error.to_string()) {
-                                self.wait_for_quota(&mut job, "Claude", error.to_string())?;
+                            if let Some((source, detail)) = executor_quota(&error) {
+                                self.wait_for_quota(
+                                    &mut job,
+                                    "Claude",
+                                    PendingOperation::ExecutorRun,
+                                    source,
+                                    detail,
+                                )?;
                                 return Ok(job);
                             }
                             self.fail(&mut job, error.to_string())?;
@@ -330,21 +589,23 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                     }
                     job.last_executor_report = Some(result.final_response);
                     job.phase = JobPhase::Supervisor;
+                    job.pending_operation = None;
                     job.touch();
                     self.persist(&job)?;
 
-                    repository_state = match RepositoryState::collect(
-                        &self.repository_runner,
-                        &request.project.path,
-                    )
-                    .await
-                    {
-                        Ok(state) => state,
-                        Err(error) => {
-                            self.fail(&mut job, error.to_string())?;
-                            return Err(OrchestrationError::Repository(error));
-                        }
-                    };
+                    repository_state =
+                        match RepositoryState::collect(&self.repository_runner, &job.project_path)
+                            .await
+                        {
+                            Ok(state) => state,
+                            Err(error) => {
+                                self.fail(&mut job, error.to_string())?;
+                                return Err(OrchestrationError::Repository(error));
+                            }
+                        };
+                    job.last_repository_state = Some(repository_state.clone());
+                    job.touch();
+                    self.persist(&job)?;
                     self.emit(
                         &job,
                         JobEventKind::RepositoryCaptured {
@@ -354,146 +615,142 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                     if !self.safe_point(&mut job).await? {
                         return Ok(job);
                     }
+                    stage = Stage::Supervise { fresh: true };
                 }
-                SupervisorDecision::Accept { commit_title, .. } => {
-                    job.status = JobStatus::Accepted;
-                    job.accepted_repository_state = Some(repository_state.clone());
-                    job.touch();
-                    self.persist(&job)?;
-                    if !self.publisher.is_enabled() {
-                        self.emit(
-                            &job,
-                            JobEventKind::JobFinished {
-                                status: "ACCEPTED".to_owned(),
-                            },
-                        )?;
-                        return Ok(job);
-                    }
+                Stage::Publish => return self.publish(job).await,
+            }
+        }
+    }
 
-                    if !self.safe_point(&mut job).await? {
-                        return Ok(job);
-                    }
+    async fn publish(&self, mut job: JobState) -> Result<JobState, OrchestrationError> {
+        let Some(accepted_repository_state) = job.accepted_repository_state.clone() else {
+            return self
+                .wait_for_human(
+                    &mut job,
+                    "publication was requested without a persisted accepted repository snapshot"
+                        .to_owned(),
+                )
+                .await;
+        };
+        let Some(SupervisorDecision::Accept { commit_title, .. }) =
+            job.last_supervisor_decision.clone()
+        else {
+            return self
+                .wait_for_human(
+                    &mut job,
+                    "publication was requested without a recorded ACCEPT decision".to_owned(),
+                )
+                .await;
+        };
+        job.status = JobStatus::Publishing;
+        job.phase = JobPhase::Publisher;
+        job.pending_operation = Some(PendingOperation::Publication);
+        job.touch();
+        self.persist(&job)?;
+        self.emit(
+            &job,
+            JobEventKind::PublishStarted {
+                commit_title: commit_title.clone(),
+            },
+        )?;
 
-                    job.status = JobStatus::Publishing;
-                    job.phase = JobPhase::Publisher;
-                    job.touch();
-                    self.persist(&job)?;
-                    self.emit(
-                        &job,
-                        JobEventKind::PublishStarted {
-                            commit_title: commit_title.clone(),
-                        },
-                    )?;
-                    let publish = {
-                        let mut progress = JobPublicationProgress {
-                            job: &mut job,
-                            state_store: &self.state_store,
-                            event_sink: &self.event_sink,
-                            control: &self.control,
-                        };
-                        self.publisher
-                            .publish(
-                                PublishRequest {
-                                    project_path: progress.job.project_path.clone(),
-                                    accepted_repository_state: repository_state,
-                                    commit_title,
-                                },
-                                &mut progress,
-                            )
-                            .await
-                    };
-                    match publish {
-                        Ok(result) => {
-                            job.publish_result = Some(result);
-                            if !self.safe_point(&mut job).await? {
-                                return Ok(job);
-                            }
-                            let post_commit_state = match RepositoryState::collect(
-                                &self.repository_runner,
-                                &job.project_path,
-                            )
-                            .await
-                            {
-                                Ok(state) => state,
-                                Err(error) => {
-                                    self.fail(&mut job, error.to_string())?;
-                                    return Err(OrchestrationError::Repository(error));
-                                }
-                            };
-                            if !post_commit_state.is_clean() {
-                                let error = format!(
-                                    "working tree is not clean after publishing: {}",
-                                    job.project_path.display()
-                                );
-                                self.fail(&mut job, error)?;
-                                return Err(OrchestrationError::PostCommitWorkingTreeDirty(
-                                    job.project_path.clone(),
-                                ));
-                            }
-                            job.status = JobStatus::Published;
-                            job.touch();
-                            self.persist(&job)?;
-                            self.emit(
-                                &job,
-                                JobEventKind::RepositoryCaptured {
-                                    summary: RepositorySummary::from(&post_commit_state),
-                                },
-                            )?;
-                            self.emit(
-                                &job,
-                                JobEventKind::Published {
-                                    result: job
-                                        .publish_result
-                                        .clone()
-                                        .expect("publish result was stored"),
-                                },
-                            )?;
-                            self.emit(
-                                &job,
-                                JobEventKind::JobFinished {
-                                    status: "PUBLISHED".to_owned(),
-                                },
-                            )?;
-                            return Ok(job);
-                        }
-                        Err(error) => {
-                            if !self.safe_point(&mut job).await? {
-                                return Ok(job);
-                            }
-                            if let PublishError::PushRejected(result) = &error {
-                                job.publish_result = Some(result.clone());
-                            }
-                            self.fail(&mut job, error.to_string())?;
-                            return Err(OrchestrationError::Publish(error));
-                        }
-                    }
-                }
-                SupervisorDecision::Human { reason } => {
-                    job.status = JobStatus::WaitingHuman;
-                    job.touch();
-                    self.persist(&job)?;
-                    self.emit(&job, JobEventKind::WaitingForHuman { reason })?;
-                    self.emit(
-                        &job,
-                        JobEventKind::JobFinished {
-                            status: "WAITING_HUMAN".to_owned(),
-                        },
-                    )?;
+        // A recorded stage or commit means a previous process was already inside the guarded
+        // sequence, so recovery must prove what exists before anything else happens.
+        let recovering = job.publish_stage.is_some() || job.publish_result.is_some();
+        let publish = {
+            let mut progress = JobPublicationProgress {
+                job: &mut job,
+                state_store: &self.state_store,
+                event_sink: &self.event_sink,
+                control: &self.control,
+            };
+            if recovering {
+                let request = PublishRecoveryRequest {
+                    project_path: progress.job.project_path.clone(),
+                    accepted_repository_state,
+                    commit_title,
+                    recorded_stage: progress.job.publish_stage.clone(),
+                    recorded_result: progress.job.publish_result.clone(),
+                };
+                self.publisher.recover(request, &mut progress).await
+            } else {
+                let request = PublishRequest {
+                    project_path: progress.job.project_path.clone(),
+                    accepted_repository_state,
+                    commit_title,
+                };
+                self.publisher.publish(request, &mut progress).await
+            }
+        };
+
+        match publish {
+            Ok(result) => {
+                job.publish_result = Some(result);
+                if !self.safe_point(&mut job).await? {
                     return Ok(job);
                 }
-                SupervisorDecision::Stop { reason } => {
-                    job.status = JobStatus::Stopped;
-                    job.touch();
-                    self.persist(&job)?;
-                    self.emit(&job, JobEventKind::Stopped { reason })?;
-                    self.emit(
-                        &job,
-                        JobEventKind::JobFinished {
-                            status: "STOPPED".to_owned(),
-                        },
-                    )?;
+                let post_commit_state = match RepositoryState::collect(
+                    &self.repository_runner,
+                    &job.project_path,
+                )
+                .await
+                {
+                    Ok(state) => state,
+                    Err(error) => {
+                        self.fail(&mut job, error.to_string())?;
+                        return Err(OrchestrationError::Repository(error));
+                    }
+                };
+                if !post_commit_state.is_clean() {
+                    let error = format!(
+                        "working tree is not clean after publishing: {}",
+                        job.project_path.display()
+                    );
+                    self.fail(&mut job, error)?;
+                    return Err(OrchestrationError::PostCommitWorkingTreeDirty(
+                        job.project_path.clone(),
+                    ));
+                }
+                job.status = JobStatus::Published;
+                job.pending_operation = None;
+                job.last_repository_state = Some(post_commit_state.clone());
+                job.touch();
+                self.persist(&job)?;
+                self.emit(
+                    &job,
+                    JobEventKind::RepositoryCaptured {
+                        summary: RepositorySummary::from(&post_commit_state),
+                    },
+                )?;
+                self.emit(
+                    &job,
+                    JobEventKind::Published {
+                        result: job
+                            .publish_result
+                            .clone()
+                            .expect("publish result was stored"),
+                    },
+                )?;
+                self.emit(
+                    &job,
+                    JobEventKind::JobFinished {
+                        status: "PUBLISHED".to_owned(),
+                    },
+                )?;
+                Ok(job)
+            }
+            Err(error) => {
+                if !self.safe_point(&mut job).await? {
                     return Ok(job);
                 }
+                if let PublishError::RecoveryAmbiguous(_) = &error {
+                    return self.wait_for_human(&mut job, error.to_string()).await;
+                }
+                if let PublishError::PushRejected(result) = &error {
+                    job.publish_result = Some(result.clone());
+                }
+                self.fail(&mut job, error.to_string())?;
+                Err(OrchestrationError::Publish(error))
             }
         }
     }
@@ -504,16 +761,39 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 "max jobs must be greater than zero".to_owned(),
             ));
         }
-        let mut jobs = Vec::new();
+        let job = self.run(request.clone()).await?;
+        self.continue_sequentially(request, job).await
+    }
+
+    /// Resume one persisted job and then continue its sequential chain.
+    pub async fn resume_sequential(
+        &self,
+        job: JobState,
+        private_context: String,
+    ) -> Result<RunResult, OrchestrationError> {
+        let request = NewJob {
+            job_id: job.job_id.clone(),
+            project: Project {
+                name: job.project_name.clone(),
+                path: job.project_path.clone(),
+            },
+            task: job.task.clone(),
+            private_context: private_context.clone(),
+        };
+        let job = self.resume(job, private_context).await?;
+        self.continue_sequentially(request, job).await
+    }
+
+    async fn continue_sequentially(
+        &self,
+        request: NewJob,
+        first: JobState,
+    ) -> Result<RunResult, OrchestrationError> {
         let mut current_request = request;
+        let mut jobs = Vec::new();
+        let mut job = first;
         loop {
-            if jobs.len() as u32 >= self.max_jobs {
-                return Ok(RunResult {
-                    jobs,
-                    max_jobs_reached: true,
-                });
-            }
-            let job = self.run(current_request.clone()).await?;
+            let sequential_index = job.sequential_index;
             let next_prompt = match &job.last_supervisor_decision {
                 Some(SupervisorDecision::Accept {
                     next_prompt: Some(next_prompt),
@@ -521,6 +801,7 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                 }) if job.status == JobStatus::Published => Some(next_prompt.clone()),
                 _ => None,
             };
+            let max_jobs = job.run.max_jobs;
             jobs.push(job);
             if self.control.stop_requested() {
                 return Ok(RunResult {
@@ -534,20 +815,40 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
                     max_jobs_reached: false,
                 });
             };
+            if sequential_index + 1 >= max_jobs {
+                return Ok(RunResult {
+                    jobs,
+                    max_jobs_reached: true,
+                });
+            }
             current_request = NewJob {
                 job_id: new_job_id(),
                 project: current_request.project,
                 task,
                 private_context: current_request.private_context,
             };
+            // A sequential job is a job in its own right, so it gets its own exclusive claim
+            // before anything is persisted for it. The caller's lock covers only the job it
+            // named; without this a second process could drive or resume this child while this
+            // process is still working on it. The claim is released at the end of this iteration,
+            // once the child has finished and is no longer being driven.
+            let _child_lock = JobLock::acquire(&self.state_store, &current_request.job_id)
+                .map_err(OrchestrationError::Lock)?;
+            // `/send` instructions constrain the job they were given to; a new sequential job
+            // starts from the persisted task alone.
+            let mut next = self.run(current_request.clone()).await?;
+            if next.sequential_index != sequential_index + 1 {
+                next.sequential_index = sequential_index + 1;
+                next.touch();
+                self.persist(&next)?;
+            }
+            job = next;
         }
     }
 
     fn persist(&self, job: &JobState) -> Result<(), OrchestrationError> {
-        let mut state = self.state_store.load().map_err(OrchestrationError::State)?;
-        state.upsert(job.clone());
         self.state_store
-            .save(&state)
+            .save_job(job)
             .map_err(OrchestrationError::State)
     }
 
@@ -574,7 +875,7 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         )?;
         loop {
             let Some(command) = self.control.next().await else {
-                self.control_stop_without_command(job)?;
+                self.leave_paused_for_a_later_process(job)?;
                 return Ok(false);
             };
             self.handle_control_command(job, command).await?;
@@ -606,6 +907,16 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
             ControlCommand::Resume => {}
             ControlCommand::Stop => self.emit(job, JobEventKind::StopRequested)?,
             ControlCommand::Send(instruction) => {
+                if let Some(reason) = instruction_budget_refusal(job, &instruction) {
+                    self.emit(
+                        job,
+                        JobEventKind::UserInstructionRejected {
+                            instruction,
+                            reason,
+                        },
+                    )?;
+                    return Ok(());
+                }
                 job.pending_user_instructions.push(instruction.clone());
                 job.touch();
                 self.persist(job)?;
@@ -614,8 +925,8 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
             ControlCommand::Status => self.emit(
                 job,
                 JobEventKind::StatusReported {
-                    status: job_status_label(&job.status).to_owned(),
-                    phase: job_phase_label(&job.phase).to_owned(),
+                    status: job.status.label().to_owned(),
+                    phase: job.phase.label().to_owned(),
                     claude_session_id: job.claude_session_id.clone(),
                     publish_stage: job.publish_stage.clone(),
                     pause_requested: self.control.pause_requested(),
@@ -660,6 +971,7 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         if let Ok(state) =
             RepositoryState::collect(&self.repository_runner, &job.project_path).await
         {
+            job.last_repository_state = Some(state.clone());
             self.emit(
                 job,
                 JobEventKind::RepositoryCaptured {
@@ -675,8 +987,9 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
             JobEventKind::Stopped {
                 reason: match &job.publish_result {
                     Some(result) => format!(
-                        "stopped by user after publication completed at {}; repository changes were preserved",
-                        result.commit_sha
+                        "stopped by user with local commit {} recorded as {}; repository changes were preserved",
+                        result.commit_sha,
+                        push_status_label(&result.push_status)
                     ),
                     None => "stopped by user; repository changes were preserved".to_owned(),
                 },
@@ -690,20 +1003,28 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         )
     }
 
-    fn control_stop_without_command(&self, job: &mut JobState) -> Result<(), OrchestrationError> {
-        job.status = JobStatus::Stopped;
+    /// Input ended while the job was paused. Nobody asked to stop, so the job stays `PAUSED` and
+    /// remains resumable by a later process; only an explicit `/stop` or Ctrl+C is terminal.
+    fn leave_paused_for_a_later_process(
+        &self,
+        job: &mut JobState,
+    ) -> Result<(), OrchestrationError> {
+        job.status = JobStatus::Paused;
         job.touch();
         self.persist(job)?;
         self.emit(
             job,
-            JobEventKind::Stopped {
-                reason: "interactive control channel closed while paused".to_owned(),
+            JobEventKind::ControlMessage {
+                message: format!(
+                    "input ended while paused; the job stays resumable with: lya resume --job {}",
+                    job.job_id
+                ),
             },
         )?;
         self.emit(
             job,
             JobEventKind::JobFinished {
-                status: "STOPPED".to_owned(),
+                status: "PAUSED".to_owned(),
             },
         )
     }
@@ -753,10 +1074,36 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         self.emit(job, JobEventKind::Failed { error })
     }
 
+    async fn wait_for_human(
+        &self,
+        job: &mut JobState,
+        reason: String,
+    ) -> Result<JobState, OrchestrationError> {
+        job.status = JobStatus::WaitingHuman;
+        job.touch();
+        self.persist(job)?;
+        self.emit(
+            job,
+            JobEventKind::ResumeRejected {
+                reason: reason.clone(),
+            },
+        )?;
+        self.emit(job, JobEventKind::WaitingForHuman { reason })?;
+        self.emit(
+            job,
+            JobEventKind::JobFinished {
+                status: "WAITING_HUMAN".to_owned(),
+            },
+        )?;
+        Ok(job.clone())
+    }
+
     fn wait_for_quota(
         &self,
         job: &mut JobState,
         provider: &str,
+        operation: PendingOperation,
+        source: QuotaSource,
         reason: String,
     ) -> Result<(), OrchestrationError> {
         job.status = if provider == "Claude" {
@@ -764,6 +1111,14 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         } else {
             JobStatus::WaitingOpenAiQuota
         };
+        job.pending_operation = Some(operation);
+        job.quota_wait = Some(QuotaWait {
+            provider: provider.to_owned(),
+            operation,
+            source,
+            reason: reason.clone(),
+            detected_unix_seconds: current_unix_seconds(),
+        });
         job.touch();
         self.persist(job)?;
         self.emit(
@@ -776,14 +1131,32 @@ impl<S: Supervisor, E: Executor, R: ProcessRunner, P: Publisher, N: EventSink>
         self.emit(
             job,
             JobEventKind::JobFinished {
-                status: match job.status {
-                    JobStatus::WaitingClaudeQuota => "WAITING_CLAUDE_QUOTA",
-                    JobStatus::WaitingOpenAiQuota => "WAITING_OPENAI_QUOTA",
-                    _ => unreachable!(),
-                }
-                .to_owned(),
+                status: job.status.label().to_owned(),
             },
         )
+    }
+}
+
+fn instruction_budget_refusal(job: &JobState, instruction: &str) -> Option<String> {
+    if job.active_instruction_count() >= MAX_ACTIVE_USER_INSTRUCTIONS {
+        return Some(format!(
+            "this job already holds the maximum of {MAX_ACTIVE_USER_INSTRUCTIONS} active instructions"
+        ));
+    }
+    let total = job.active_instruction_bytes() + instruction.len();
+    if total > MAX_ACTIVE_USER_INSTRUCTION_BYTES {
+        return Some(format!(
+            "active instructions would reach {total} bytes, above the {MAX_ACTIVE_USER_INSTRUCTION_BYTES} byte limit for one job"
+        ));
+    }
+    None
+}
+
+fn push_status_label(status: &super::publisher::PushStatus) -> &'static str {
+    match status {
+        super::publisher::PushStatus::Pending => "committed but not pushed",
+        super::publisher::PushStatus::Pushed => "pushed",
+        super::publisher::PushStatus::Rejected => "rejected by the remote",
     }
 }
 
@@ -803,32 +1176,22 @@ fn observable_supervisor_prompt(request: &SupervisorRequest) -> String {
     )
 }
 
-fn is_quota_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("quota") || error.contains("rate limit") || error.contains("rate_limit")
+/// Prefer the provider's own classification; fall back to the documented message heuristic only
+/// for errors that never reached the structured boundary.
+fn supervisor_quota(error: &SupervisorError) -> Option<(QuotaSource, String)> {
+    if let SupervisorError::QuotaExceeded { source, detail } = error {
+        return Some((*source, detail.clone()));
+    }
+    let rendered = error.to_string();
+    message_indicates_quota(&rendered).then_some((QuotaSource::ProviderMessageHeuristic, rendered))
 }
 
-fn job_status_label(status: &JobStatus) -> &'static str {
-    match status {
-        JobStatus::Running => "RUNNING",
-        JobStatus::Paused => "PAUSED",
-        JobStatus::WaitingClaudeQuota => "WAITING_CLAUDE_QUOTA",
-        JobStatus::WaitingOpenAiQuota => "WAITING_OPENAI_QUOTA",
-        JobStatus::WaitingHuman => "WAITING_HUMAN",
-        JobStatus::Accepted => "ACCEPTED",
-        JobStatus::Publishing => "PUBLISHING",
-        JobStatus::Published => "PUBLISHED",
-        JobStatus::Failed => "FAILED",
-        JobStatus::Stopped => "STOPPED",
+fn executor_quota(error: &ExecutorError) -> Option<(QuotaSource, String)> {
+    if let ExecutorError::QuotaExceeded { source, detail } = error {
+        return Some((*source, detail.clone()));
     }
-}
-
-fn job_phase_label(phase: &JobPhase) -> &'static str {
-    match phase {
-        JobPhase::Supervisor => "SUPERVISOR",
-        JobPhase::Executor => "EXECUTOR",
-        JobPhase::Publisher => "PUBLISHER",
-    }
+    let rendered = error.to_string();
+    message_indicates_quota(&rendered).then_some((QuotaSource::ProviderMessageHeuristic, rendered))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,9 +1209,15 @@ impl Publisher for () {
         &'a self,
         _request: PublishRequest,
         _progress: &'a mut dyn PublishProgress,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<super::publisher::PublishResult, PublishError>> + Send + 'a>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>> {
+        Box::pin(async { Err(PublishError::PublishingDisabled) })
+    }
+
+    fn recover<'a>(
+        &'a self,
+        _request: PublishRecoveryRequest,
+        _progress: &'a mut dyn PublishProgress,
+    ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>> {
         Box::pin(async { Err(PublishError::PublishingDisabled) })
     }
 }
@@ -860,18 +1229,14 @@ struct JobPublicationProgress<'a> {
     control: &'a ControlReceiver,
 }
 
-impl PublishProgress for JobPublicationProgress<'_> {
-    fn record(&mut self, stage: PublishStage) -> Result<(), PublishError> {
-        self.job.publish_stage = Some(stage.clone());
-        self.job.touch();
-        let mut state = self
-            .state_store
-            .load()
-            .map_err(|error| PublishError::ProgressPersistence(error.to_string()))?;
-        state.upsert(self.job.clone());
+impl JobPublicationProgress<'_> {
+    fn persist(&self) -> Result<(), PublishError> {
         self.state_store
-            .save(&state)
-            .map_err(|error| PublishError::ProgressPersistence(error.to_string()))?;
+            .save_job(self.job)
+            .map_err(|error| PublishError::ProgressPersistence(error.to_string()))
+    }
+
+    fn emit(&self, kind: JobEventKind) -> Result<(), PublishError> {
         let project = Project {
             name: self.job.project_name.clone(),
             path: self.job.project_path.clone(),
@@ -881,9 +1246,24 @@ impl PublishProgress for JobPublicationProgress<'_> {
                 &self.job.job_id,
                 &project,
                 Some(self.job.iteration),
-                JobEventKind::PublishStageChanged { stage },
+                kind,
             ))
             .map_err(|error| PublishError::ProgressPersistence(error.to_string()))
+    }
+}
+
+impl PublishProgress for JobPublicationProgress<'_> {
+    fn record(&mut self, stage: PublishStage) -> Result<(), PublishError> {
+        self.job.publish_stage = Some(stage.clone());
+        self.job.touch();
+        self.persist()?;
+        self.emit(JobEventKind::PublishStageChanged { stage })
+    }
+
+    fn record_commit(&mut self, result: &PublishResult) -> Result<(), PublishError> {
+        self.job.publish_result = Some(result.clone());
+        self.job.touch();
+        self.persist()
     }
 
     fn stop_requested(&self) -> bool {
@@ -897,7 +1277,7 @@ pub fn new_job_id() -> String {
         .unwrap_or_default()
         .as_secs();
     let sequence = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
-    format!("job-{seconds}-{sequence}")
+    format!("job-{seconds}-{}-{sequence}", std::process::id())
 }
 
 #[derive(Debug)]
@@ -909,7 +1289,9 @@ pub enum OrchestrationError {
     RepositoryDirty(PathBuf),
     PostCommitWorkingTreeDirty(PathBuf),
     Publish(PublishError),
+    Resume(ResumeRejection),
     State(StateError),
+    Lock(LockError),
     IterationLimit { limit: u32 },
     InvalidTransition(String),
 }
@@ -932,7 +1314,9 @@ impl fmt::Display for OrchestrationError {
                 path.display()
             ),
             Self::Publish(error) => write!(formatter, "publication error: {error}"),
+            Self::Resume(error) => write!(formatter, "cannot resume job: {error}"),
             Self::State(error) => write!(formatter, "state error: {error}"),
+            Self::Lock(error) => write!(formatter, "job lock error: {error}"),
             Self::IterationLimit { limit } => write!(
                 formatter,
                 "autonomous job reached its iteration limit of {limit}"
@@ -950,7 +1334,9 @@ impl Error for OrchestrationError {
             Self::Executor(error) => Some(error),
             Self::Repository(error) => Some(error),
             Self::Publish(error) => Some(error),
+            Self::Resume(error) => Some(error),
             Self::State(error) => Some(error),
+            Self::Lock(error) => Some(error),
             _ => None,
         }
     }
@@ -976,12 +1362,17 @@ mod tests {
             events::{EventSink, JobEvent, JobEventKind, JsonlEventSink},
             executor::{Executor, ExecutorError, ExecutorRequest, ExecutorResult, ExecutorSession},
             home::LyaHome,
+            lock::JobLock,
             publisher::{
-                GitPublishConfig, GitPublisher, PublishError, PublishProgress, PublishRequest,
-                PublishResult, PublishStage, Publisher, PushStatus,
+                GitPublishConfig, GitPublisher, PublishError, PublishProgress,
+                PublishRecoveryRequest, PublishRequest, PublishResult, PublishStage, Publisher,
+                PushStatus,
             },
             repository::RepositoryState,
-            state::{JobStatus, StateStore},
+            state::{
+                DEFAULT_MAX_JOBS, JobState, JobStatus, MAX_ACTIVE_USER_INSTRUCTIONS,
+                PendingOperation, QuotaSource, QuotaWait, StateStore,
+            },
             supervisor::{
                 Project, Supervisor, SupervisorDecision, SupervisorError, SupervisorRequest,
             },
@@ -1203,6 +1594,7 @@ mod tests {
     struct FakePublisher {
         results: Arc<Mutex<VecDeque<Result<PublishResult, PublishError>>>>,
         requests: Arc<Mutex<Vec<PublishRequest>>>,
+        recoveries: Arc<Mutex<Vec<PublishRecoveryRequest>>>,
     }
 
     impl FakePublisher {
@@ -1210,11 +1602,30 @@ mod tests {
             Self {
                 results: Arc::new(Mutex::new(results.into())),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                recoveries: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
 
     impl Publisher for FakePublisher {
+        fn recover<'a>(
+            &'a self,
+            request: PublishRecoveryRequest,
+            progress: &'a mut dyn PublishProgress,
+        ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>>
+        {
+            self.recoveries
+                .lock()
+                .expect("publisher recovery lock")
+                .push(request.clone());
+            let publish_request = PublishRequest {
+                project_path: request.project_path,
+                accepted_repository_state: request.accepted_repository_state,
+                commit_title: request.commit_title,
+            };
+            self.publish(publish_request, progress)
+        }
+
         fn publish<'a>(
             &'a self,
             request: PublishRequest,
@@ -1356,9 +1767,9 @@ mod tests {
             2
         );
         let stored = StateStore::new(&LyaHome::from_path(&directory))
-            .load()
+            .load_job(&result.job_id)
             .expect("state should load");
-        assert_eq!(stored.jobs.get(&result.job_id), Some(&result));
+        assert_eq!(stored, Some(result.clone()));
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
 
@@ -1482,15 +1893,10 @@ mod tests {
 
         assert!(matches!(error, OrchestrationError::InvalidTransition(_)));
         let stored = StateStore::new(&LyaHome::from_path(&directory))
-            .load()
+            .load_all()
             .expect("state should load");
         assert_eq!(
-            stored
-                .jobs
-                .values()
-                .next()
-                .expect("job should persist")
-                .status,
+            stored.first().expect("job should persist").status,
             JobStatus::Failed
         );
         fs::remove_dir_all(directory).expect("test home should be removed");
@@ -1613,16 +2019,10 @@ mod tests {
         assert!(matches!(error, OrchestrationError::Event(_)));
         assert!(requests.lock().expect("supervisor request lock").is_empty());
         let state = StateStore::new(&LyaHome::from_path(&directory))
-            .load()
-            .expect("state should load");
-        assert_eq!(
-            state
-                .jobs
-                .get("test-job")
-                .expect("job should persist")
-                .status,
-            JobStatus::Failed
-        );
+            .load_job("test-job")
+            .expect("state should load")
+            .expect("job should persist");
+        assert_eq!(state.status, JobStatus::Failed);
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
 
@@ -1646,15 +2046,10 @@ mod tests {
             OrchestrationError::IterationLimit { limit: 1 }
         ));
         let stored = StateStore::new(&LyaHome::from_path(&directory))
-            .load()
+            .load_all()
             .expect("state should load");
         assert_eq!(
-            stored
-                .jobs
-                .values()
-                .next()
-                .expect("job should persist")
-                .status,
+            stored.first().expect("job should persist").status,
             JobStatus::Failed
         );
         fs::remove_dir_all(directory).expect("test home should be removed");
@@ -1677,15 +2072,10 @@ mod tests {
 
         assert!(matches!(error, OrchestrationError::Executor(_)));
         let stored = StateStore::new(&LyaHome::from_path(&directory))
-            .load()
+            .load_all()
             .expect("state should load");
         assert_eq!(
-            stored
-                .jobs
-                .values()
-                .next()
-                .expect("job should persist")
-                .status,
+            stored.first().expect("job should persist").status,
             JobStatus::Failed
         );
         fs::remove_dir_all(directory).expect("test home should be removed");
@@ -1705,15 +2095,10 @@ mod tests {
 
         assert!(matches!(error, OrchestrationError::Supervisor(_)));
         let stored = StateStore::new(&LyaHome::from_path(&directory))
-            .load()
+            .load_all()
             .expect("state should load");
         assert_eq!(
-            stored
-                .jobs
-                .values()
-                .next()
-                .expect("job should persist")
-                .status,
+            stored.first().expect("job should persist").status,
             JobStatus::Failed
         );
         fs::remove_dir_all(directory).expect("test home should be removed");
@@ -2443,6 +2828,814 @@ mod tests {
                 .expect("publish requests")
                 .is_empty()
         );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    // --- Milestone 8: crash-safe resume -------------------------------------------------------
+
+    async fn fake_repository_state() -> RepositoryState {
+        RepositoryState::collect(&FakeGitRunner { dirty: false }, &std::env::temp_dir())
+            .await
+            .expect("fake repository state should collect")
+    }
+
+    /// A job as a previous process would have persisted it just before the process disappeared.
+    async fn persisted_job(status: JobStatus, operation: Option<PendingOperation>) -> JobState {
+        let mut job = JobState::new(
+            "test-job",
+            "test-project",
+            std::env::temp_dir(),
+            "Update hello.txt",
+        );
+        job.status = status;
+        job.pending_operation = operation;
+        job.iteration = 1;
+        job.last_repository_state = Some(fake_repository_state().await);
+        job
+    }
+
+    fn store(directory: &PathBuf) -> StateStore {
+        StateStore::new(&LyaHome::from_path(directory))
+    }
+
+    /// Persists the job, then reloads it exactly the way a new process would.
+    fn round_trip(directory: &PathBuf, job: &JobState) -> JobState {
+        let store = store(directory);
+        store.save_job(job).expect("job should persist");
+        store
+            .load_job(&job.job_id)
+            .expect("job should reload")
+            .expect("job should exist")
+    }
+
+    /// Persisted status, pending operation and iteration as seen from inside a provider call.
+    type ObservedState = (JobStatus, Option<PendingOperation>, u32);
+
+    struct StateProbeSupervisor {
+        store: StateStore,
+        observed: Arc<Mutex<Vec<ObservedState>>>,
+        decisions: Arc<Mutex<VecDeque<Result<SupervisorDecision, SupervisorError>>>>,
+        requests: Arc<Mutex<Vec<SupervisorRequest>>>,
+    }
+
+    impl Supervisor for StateProbeSupervisor {
+        fn decide(
+            &self,
+            request: SupervisorRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<SupervisorDecision, SupervisorError>> + Send + '_>>
+        {
+            let persisted = self
+                .store
+                .load_job("test-job")
+                .expect("state should load")
+                .expect("state should exist");
+            self.observed.lock().expect("observed lock").push((
+                persisted.status.clone(),
+                persisted.pending_operation,
+                persisted.iteration,
+            ));
+            self.requests.lock().expect("request lock").push(request);
+            let decision = self
+                .decisions
+                .lock()
+                .expect("decision lock")
+                .pop_front()
+                .expect("a supervisor decision should be queued");
+            Box::pin(async move { decision })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_configuration_and_pending_operation_are_persisted_before_each_provider_call() {
+        let directory = home("persisted-run-configuration");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = StateProbeSupervisor {
+            store: store(&directory),
+            observed: observed.clone(),
+            decisions: Arc::new(Mutex::new(
+                vec![Ok(SupervisorDecision::Accept {
+                    commit_title: "Persisted".to_owned(),
+                    next_prompt: None,
+                    reason: None,
+                })]
+                .into(),
+            )),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_max_iterations(7)
+        .with_browser(true)
+        .run(job_request())
+        .await
+        .expect("job should finish");
+
+        assert_eq!(
+            observed.lock().expect("observed lock").as_slice(),
+            [(
+                JobStatus::Running,
+                Some(PendingOperation::SupervisorReview),
+                1
+            )]
+        );
+        let stored = store(&directory)
+            .load_job("test-job")
+            .expect("state should load")
+            .expect("job should persist");
+        assert_eq!(stored.run.max_iterations, 7);
+        assert_eq!(stored.run.max_jobs, DEFAULT_MAX_JOBS);
+        assert!(stored.run.browser);
+        assert!(!stored.run.publish);
+        assert_eq!(stored.run.git, None);
+        assert_eq!(stored.pending_operation, None);
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert!(stored.last_repository_state.is_some());
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn input_ending_while_paused_keeps_the_job_resumable() {
+        let directory = home("paused-on-input-end");
+        let supervisor = FakeSupervisor::new(vec![]);
+        let requests = supervisor.requests.clone();
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+        let (sender, receiver) = ControlReceiver::new();
+        sender
+            .send(ControlCommand::Pause)
+            .expect("pause should queue");
+        // Dropping the sender is what happens when Lya's input ends without an explicit stop.
+        drop(sender);
+
+        let result = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .with_control_receiver(receiver)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("a paused job is a normal outcome");
+
+        assert_eq!(result.status, JobStatus::Paused);
+        assert!(requests.lock().expect("request lock").is_empty());
+        assert_eq!(
+            store(&directory)
+                .load_job("test-job")
+                .expect("state should load")
+                .expect("job should persist")
+                .status,
+            JobStatus::Paused
+        );
+        assert!(
+            events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    JobEventKind::JobFinished { ref status } if status == "PAUSED"
+                ))
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_continues_a_paused_job_without_repeating_a_counted_iteration() {
+        let directory = home("resume-paused");
+        let job = round_trip(
+            &directory,
+            &persisted_job(JobStatus::Paused, Some(PendingOperation::SupervisorReview)).await,
+        );
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Finish the paused job".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let requests = supervisor.requests.clone();
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let result = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .with_event_sink(sink)
+            .resume(job, "Private project context.".to_owned())
+            .await
+            .expect("a paused job should resume");
+
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert_eq!(result.iteration, 1);
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].iteration, 1);
+        let events = events.lock().expect("event lock");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, JobEventKind::ResumeStarted { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            JobEventKind::ResumeValidated { ref continuation, .. } if continuation == "SUPERVISOR_REVIEW"
+        )));
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_retries_the_executor_after_a_claude_quota_wait_and_reuses_the_session() {
+        let directory = home("resume-claude-quota");
+        let mut job = persisted_job(
+            JobStatus::WaitingClaudeQuota,
+            Some(PendingOperation::ExecutorRun),
+        )
+        .await;
+        job.claude_session_id = Some("session-1".to_owned());
+        job.last_supervisor_decision = Some(SupervisorDecision::Claude {
+            prompt: "Implement the change.".to_owned(),
+            reason: None,
+        });
+        job.quota_wait = Some(QuotaWait {
+            provider: "Claude".to_owned(),
+            operation: PendingOperation::ExecutorRun,
+            source: QuotaSource::ProviderMessageHeuristic,
+            reason: "Claude rate limit reached".to_owned(),
+            detected_unix_seconds: 100,
+        });
+        let job = round_trip(&directory, &job);
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Finish after the quota wait".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let supervisor_requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![Ok(claude_result(Some("session-1"), "Retried."))]);
+        let executor_requests = executor.requests.clone();
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let result = orchestrator(supervisor, executor, &directory)
+            .with_event_sink(sink)
+            .resume(job, "Private project context.".to_owned())
+            .await
+            .expect("a quota wait should resume");
+
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert_eq!(result.quota_wait, None);
+        let executor_requests = executor_requests.lock().expect("request lock");
+        assert_eq!(executor_requests.len(), 1);
+        assert_eq!(
+            executor_requests[0].session,
+            ExecutorSession::Resume("session-1".to_owned())
+        );
+        assert_eq!(executor_requests[0].prompt, "Implement the change.");
+        // The interrupted review is not repeated; the next review is the one after the retry.
+        let supervisor_requests = supervisor_requests.lock().expect("request lock");
+        assert_eq!(supervisor_requests.len(), 1);
+        assert_eq!(supervisor_requests[0].iteration, 2);
+        assert!(
+            events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    JobEventKind::QuotaRetryStarted { ref provider, ref operation }
+                        if provider == "Claude" && operation == "EXECUTOR_RUN"
+                ))
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_retries_the_supervisor_after_an_openai_quota_wait() {
+        let directory = home("resume-openai-quota");
+        let mut job = persisted_job(
+            JobStatus::WaitingOpenAiQuota,
+            Some(PendingOperation::SupervisorReview),
+        )
+        .await;
+        job.iteration = 2;
+        job.quota_wait = Some(QuotaWait {
+            provider: "OpenAI".to_owned(),
+            operation: PendingOperation::SupervisorReview,
+            source: QuotaSource::ProviderMessageHeuristic,
+            reason: "Codex quota exhausted".to_owned(),
+            detected_unix_seconds: 100,
+        });
+        let job = round_trip(&directory, &job);
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Finish after the OpenAI wait".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let requests = supervisor.requests.clone();
+
+        let result = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .resume(job, "Private project context.".to_owned())
+            .await
+            .expect("a quota wait should resume");
+
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert_eq!(result.iteration, 2);
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].iteration, 2);
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_a_repository_that_changed_while_lya_was_not_running() {
+        let directory = home("resume-diverged");
+        let mut job =
+            persisted_job(JobStatus::Paused, Some(PendingOperation::SupervisorReview)).await;
+        let mut stale = fake_repository_state().await;
+        stale.head = "0000000".to_owned();
+        job.last_repository_state = Some(stale);
+        let job = round_trip(&directory, &job);
+        let supervisor = FakeSupervisor::new(vec![]);
+        let requests = supervisor.requests.clone();
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let result = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .with_event_sink(sink)
+            .resume(job, "Private project context.".to_owned())
+            .await
+            .expect("a diverged repository is a waiting state, not an error");
+
+        assert_eq!(result.status, JobStatus::WaitingHuman);
+        assert!(requests.lock().expect("request lock").is_empty());
+        assert!(events.lock().expect("event lock").iter().any(|event| matches!(
+            event.kind,
+            JobEventKind::ResumeRejected { ref reason } if reason.contains("changed while Lya was not running")
+        )));
+        assert_eq!(
+            store(&directory)
+                .load_job("test-job")
+                .expect("state should load")
+                .expect("job should persist")
+                .status,
+            JobStatus::WaitingHuman
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_a_job_without_a_persisted_repository_snapshot() {
+        let directory = home("resume-no-snapshot");
+        let mut job =
+            persisted_job(JobStatus::Paused, Some(PendingOperation::SupervisorReview)).await;
+        job.last_repository_state = None;
+        let job = round_trip(&directory, &job);
+        let supervisor = FakeSupervisor::new(vec![]);
+        let requests = supervisor.requests.clone();
+
+        let result = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .resume(job, "Private project context.".to_owned())
+            .await
+            .expect("an unprovable repository is a waiting state");
+
+        assert_eq!(result.status, JobStatus::WaitingHuman);
+        assert!(requests.lock().expect("request lock").is_empty());
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn instructions_and_the_accepted_snapshot_survive_a_restart() {
+        let directory = home("resume-instructions");
+        let mut job =
+            persisted_job(JobStatus::Paused, Some(PendingOperation::SupervisorReview)).await;
+        job.applied_user_instructions = vec![
+            "Keep the public format stable.".to_owned(),
+            "Add tests for edge cases.".to_owned(),
+        ];
+        job.accepted_repository_state = Some(fake_repository_state().await);
+        let job = round_trip(&directory, &job);
+        assert_eq!(
+            job.applied_user_instructions,
+            [
+                "Keep the public format stable.",
+                "Add tests for edge cases."
+            ]
+        );
+        assert!(job.accepted_repository_state.is_some());
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Claude {
+                prompt: "Continue the work.".to_owned(),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Finish the resumed job".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let supervisor_requests = supervisor.requests.clone();
+        let executor = FakeExecutor::new(vec![Ok(claude_result(Some("session-2"), "Done."))]);
+        let executor_requests = executor.requests.clone();
+
+        let result = orchestrator(supervisor, executor, &directory)
+            .resume(job, "Private project context.".to_owned())
+            .await
+            .expect("the resumed job should finish");
+
+        assert_eq!(result.status, JobStatus::Accepted);
+        assert_eq!(
+            supervisor_requests.lock().expect("request lock")[0].user_instructions,
+            [
+                "Keep the public format stable.",
+                "Add tests for edge cases."
+            ]
+        );
+        assert_eq!(
+            executor_requests.lock().expect("request lock")[0].user_instructions,
+            [
+                "Keep the public format stable.",
+                "Add tests for edge cases."
+            ]
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_appends_to_the_same_event_log_and_keeps_it_valid_json() {
+        let directory = home("resume-events");
+        let sink = JsonlEventSink::for_job(&directory, "test-job");
+        let log_path = sink.path().to_owned();
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Human {
+            reason: "Decide the API first.".to_owned(),
+        })]);
+        orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("first process should finish");
+        let first_lines = fs::read_to_string(&log_path)
+            .expect("event log should exist")
+            .lines()
+            .count();
+
+        let job = round_trip(
+            &directory,
+            &persisted_job(JobStatus::Paused, Some(PendingOperation::SupervisorReview)).await,
+        );
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Finish".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .with_event_sink(JsonlEventSink::for_job(&directory, "test-job"))
+            .resume(job, "Private project context.".to_owned())
+            .await
+            .expect("second process should finish");
+
+        let content = fs::read_to_string(&log_path).expect("event log should exist");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert!(
+            lines.len() > first_lines,
+            "resume must append to the existing log"
+        );
+        for line in &lines {
+            let event: serde_json::Value =
+                serde_json::from_str(line).expect("every line stays valid JSON");
+            assert_eq!(event["job_id"], "test-job");
+            assert!(event["event"].is_string());
+        }
+        assert!(
+            lines[first_lines..]
+                .iter()
+                .any(|line| line.contains("RESUME_STARTED"))
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_terminal_jobs() {
+        let directory = home("resume-terminal");
+        for status in [JobStatus::Published, JobStatus::Stopped, JobStatus::Failed] {
+            let job = round_trip(&directory, &persisted_job(status.clone(), None).await);
+            let supervisor = FakeSupervisor::new(vec![]);
+            let requests = supervisor.requests.clone();
+
+            let error = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+                .resume(job, "Private project context.".to_owned())
+                .await
+                .expect_err("a terminal job must not resume");
+
+            assert!(matches!(error, OrchestrationError::Resume(_)));
+            assert!(requests.lock().expect("request lock").is_empty());
+        }
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    async fn interrupted_publication_job(
+        directory: &PathBuf,
+        stage: Option<PublishStage>,
+    ) -> JobState {
+        let mut job =
+            persisted_job(JobStatus::Publishing, Some(PendingOperation::Publication)).await;
+        job.run.publish = true;
+        job.run.git = Some(
+            GitPublishConfig::new("Test Bot", "bot@example.com", "origin", "main")
+                .expect("configuration should be valid"),
+        );
+        job.accepted_repository_state = Some(fake_repository_state().await);
+        job.last_supervisor_decision = Some(SupervisorDecision::Accept {
+            commit_title: "Finish publishing".to_owned(),
+            next_prompt: None,
+            reason: None,
+        });
+        job.publish_stage = stage;
+        round_trip(directory, &job)
+    }
+
+    #[tokio::test]
+    async fn resume_sends_an_interrupted_publication_through_the_recovery_path() {
+        let directory = home("resume-publication");
+        let job = interrupted_publication_job(&directory, Some(PublishStage::Committing)).await;
+        let publisher = FakePublisher::new(vec![Ok(published_result("Finish publishing"))]);
+        let recoveries = publisher.recoveries.clone();
+        let requests = publisher.requests.clone();
+
+        let result = AutonomousOrchestrator::new(
+            FakeSupervisor::new(vec![]),
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(publisher)
+        .resume(job, "Private project context.".to_owned())
+        .await
+        .expect("an interrupted publication should recover");
+
+        assert_eq!(result.status, JobStatus::Published);
+        let recoveries = recoveries.lock().expect("recovery lock");
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(recoveries[0].recorded_stage, Some(PublishStage::Committing));
+        assert_eq!(recoveries[0].commit_title, "Finish publishing");
+        // The recovery entry point is used instead of a fresh publication.
+        assert_eq!(requests.lock().expect("request lock").len(), 1);
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn resume_hands_a_recorded_commit_to_the_publisher_for_proof() {
+        let directory = home("resume-recorded-commit");
+        let mut job = interrupted_publication_job(&directory, Some(PublishStage::Committed)).await;
+        job.publish_result = Some(PublishResult {
+            commit_sha: "abcdef1".to_owned(),
+            commit_title: "Finish publishing".to_owned(),
+            remote: "origin".to_owned(),
+            branch: "main".to_owned(),
+            push_status: PushStatus::Pending,
+        });
+        let job = round_trip(&directory, &job);
+        let publisher = FakePublisher::new(vec![Ok(published_result("Finish publishing"))]);
+        let recoveries = publisher.recoveries.clone();
+
+        let result = AutonomousOrchestrator::new(
+            FakeSupervisor::new(vec![]),
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(publisher)
+        .resume(job, "Private project context.".to_owned())
+        .await
+        .expect("a recorded commit should resume at push");
+
+        assert_eq!(result.status, JobStatus::Published);
+        let recoveries = recoveries.lock().expect("recovery lock");
+        assert_eq!(
+            recoveries[0]
+                .recorded_result
+                .as_ref()
+                .expect("the recorded commit must reach the publisher")
+                .commit_sha,
+            "abcdef1"
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_publication_recovery_parks_the_job_for_a_human() {
+        let directory = home("resume-ambiguous-publication");
+        let job = interrupted_publication_job(&directory, Some(PublishStage::Committing)).await;
+        let publisher = FakePublisher::new(vec![Err(PublishError::RecoveryAmbiguous(
+            "HEAD is not the recorded commit".to_owned(),
+        ))]);
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+
+        let result = AutonomousOrchestrator::new(
+            FakeSupervisor::new(vec![]),
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(publisher)
+        .with_event_sink(sink)
+        .resume(job, "Private project context.".to_owned())
+        .await
+        .expect("an ambiguous recovery is a waiting state, not an error");
+
+        assert_eq!(result.status, JobStatus::WaitingHuman);
+        assert_eq!(
+            store(&directory)
+                .load_job("test-job")
+                .expect("state should load")
+                .expect("job should persist")
+                .status,
+            JobStatus::WaitingHuman
+        );
+        assert!(events.lock().expect("event lock").iter().any(|event| matches!(
+            event.kind,
+            JobEventKind::WaitingForHuman { ref reason } if reason.contains("cannot be recovered safely")
+        )));
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn user_instructions_are_bounded_and_refusals_are_explicit() {
+        let directory = home("instruction-budget");
+        let supervisor = FakeSupervisor::new(vec![Ok(SupervisorDecision::Accept {
+            commit_title: "Bounded".to_owned(),
+            next_prompt: None,
+            reason: None,
+        })]);
+        let supervisor_requests = supervisor.requests.clone();
+        let sink = RecordingEventSink::default();
+        let events = sink.events.clone();
+        let (sender, receiver) = ControlReceiver::new();
+        for index in 0..(MAX_ACTIVE_USER_INSTRUCTIONS + 2) {
+            sender
+                .send(ControlCommand::Send(format!("instruction {index}")))
+                .expect("instruction should queue");
+        }
+
+        let result = orchestrator(supervisor, FakeExecutor::new(vec![]), &directory)
+            .with_control_receiver(receiver)
+            .with_event_sink(sink)
+            .run(job_request())
+            .await
+            .expect("job should finish");
+
+        assert_eq!(
+            result.applied_user_instructions.len(),
+            MAX_ACTIVE_USER_INSTRUCTIONS
+        );
+        assert_eq!(
+            supervisor_requests.lock().expect("request lock")[0]
+                .user_instructions
+                .len(),
+            MAX_ACTIVE_USER_INSTRUCTIONS
+        );
+        let events = events.lock().expect("event lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, JobEventKind::UserInstructionRejected { .. }))
+                .count(),
+            2
+        );
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    #[tokio::test]
+    async fn a_sequential_next_job_never_inherits_the_previous_job_instructions() {
+        let directory = home("instructions-not-inherited");
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Accept {
+                commit_title: "First".to_owned(),
+                next_prompt: Some("second task".to_owned()),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Second".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let requests = supervisor.requests.clone();
+        let publisher = FakePublisher::new(vec![
+            Ok(published_result("First")),
+            Ok(published_result("Second")),
+        ]);
+        let (sender, receiver) = ControlReceiver::new();
+        sender
+            .send(ControlCommand::Send("Only for the first job.".to_owned()))
+            .expect("instruction should queue");
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(publisher)
+        .with_control_receiver(receiver)
+        .run_sequential(job_request())
+        .await
+        .expect("both jobs should run");
+
+        assert_eq!(result.jobs.len(), 2);
+        let requests = requests.lock().expect("request lock");
+        assert_eq!(requests[0].user_instructions, ["Only for the first job."]);
+        assert!(requests[1].user_instructions.is_empty());
+        assert!(result.jobs[1].applied_user_instructions.is_empty());
+        assert_eq!(result.jobs[1].sequential_index, 1);
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
+
+    /// Tries to claim the job that emitted each event, exactly the way an independent Lya process
+    /// would. Every attempt happens while the orchestrator is still driving that job.
+    struct LockProbeEventSink {
+        home: PathBuf,
+        attempts: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    impl EventSink for LockProbeEventSink {
+        fn emit(&self, event: &JobEvent) -> Result<(), super::EventSinkError> {
+            let claimed = JobLock::acquire(&StateStore::at(&self.home), &event.job_id).is_ok();
+            self.attempts
+                .lock()
+                .expect("attempt lock")
+                .push((event.job_id.clone(), claimed));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sequential_child_job_cannot_be_claimed_by_a_second_process() {
+        let directory = home("sequential-child-lock");
+        let caller_store = store(&directory);
+        // Exactly the claim `lya run` holds for the job it was asked to start. It covers that job
+        // only, so the sequential child has to be claimed by the orchestrator itself.
+        let root_lock =
+            JobLock::acquire(&caller_store, "test-job").expect("root job should be claimed");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Accept {
+                commit_title: "First".to_owned(),
+                next_prompt: Some("second task".to_owned()),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Second".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let publisher = FakePublisher::new(vec![
+            Ok(published_result("First")),
+            Ok(published_result("Second")),
+        ]);
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            FakeExecutor::new(vec![]),
+            FakeGitRunner { dirty: false },
+            store(&directory),
+        )
+        .with_publisher(publisher)
+        .with_event_sink(LockProbeEventSink {
+            home: directory.clone(),
+            attempts: attempts.clone(),
+        })
+        .run_sequential(job_request())
+        .await
+        .expect("both jobs should run");
+
+        assert_eq!(result.jobs.len(), 2);
+        let child_id = result.jobs[1].job_id.clone();
+        assert_ne!(child_id, "test-job");
+
+        let recorded = attempts.lock().expect("attempt lock").clone();
+        assert!(
+            recorded.iter().any(|(job_id, _)| job_id == &child_id),
+            "the probe must have run while the sequential child was being driven"
+        );
+        assert!(
+            recorded.iter().all(|(_, claimed)| !claimed),
+            "a job being driven must never be claimable by a second owner: {recorded:?}"
+        );
+
+        // The child's claim is released once it stops being driven, and releasing it never
+        // released the root claim either.
+        assert!(
+            JobLock::acquire(&caller_store, "test-job").is_err(),
+            "the caller's claim on the root job must outlive the sequential chain"
+        );
+        drop(root_lock);
+        let reclaimed_root = JobLock::acquire(&caller_store, "test-job")
+            .expect("the root job should be claimable again");
+        let reclaimed_child = JobLock::acquire(&caller_store, &child_id)
+            .expect("the sequential child should be claimable once it is no longer driven");
+        drop(reclaimed_root);
+        drop(reclaimed_child);
+
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
 }

@@ -41,9 +41,10 @@ Lya
     │   └── Git
     └── Local State
         ├── context.md
-        ├── state.json
         └── jobs/
             └── <job-id>/
+                ├── state.json
+                ├── lock.json
                 ├── events.jsonl
                 └── Supervisor artifacts
 ```
@@ -54,7 +55,7 @@ The components are intentionally separated:
 * the **Executor** performs development work;
 * Lya independently inspects the repository instead of trusting executor reports;
 * the **Publisher** can commit and push only changes that match the reviewed repository state;
-* persistent state is stored locally so long-running orchestration can later support pause/resume workflows.
+* persistent state is stored locally per job, so an interrupted run can be continued by a later process.
 
 The current development workflow uses Codex as the Supervisor and Claude Code as the Executor, but the architecture is designed so implementations can be replaced without rewriting the orchestration core.
 
@@ -124,11 +125,42 @@ The directory currently contains data such as:
 ```text
 ~/.lya/
 ├── context.md
-├── state.json
 └── jobs/
+    └── <job-id>/
+        ├── state.json
+        ├── lock.json
+        ├── events.jsonl
+        └── supervisor-decision*.json
 ```
 
 `context.md` provides private user/project context to the Supervisor.
+
+Each job owns its own `state.json`, written atomically through a unique temporary file, a
+synchronised write and a rename. Two Lya processes working on different jobs therefore never
+rewrite each other's state.
+
+### Migration From The Single State File
+
+Earlier versions stored every job in one `LYA_HOME/state.json`. On the next `lya run` or
+`lya resume`, Lya moves those jobs into the per-job layout and renames the old file to
+`state.json.migrated-<unix-seconds>`. Nothing is deleted, and a per-job file that already exists is
+never overwritten.
+
+### Job Locks
+
+While a Lya process drives a job it holds an exclusive operating-system lock on
+`LYA_HOME/jobs/<job-id>/lock.json`. A second process that tries to run or resume the same job is
+refused instead of corrupting shared state.
+
+The claim is the OS lock itself, never the presence of the file and never a recorded process ID:
+Windows uses a `LockFileEx` lock, Linux and macOS use `flock(2)`. On all three the kernel releases
+the lock when the process exits, including a crash or a forced kill, so an abandoned lock file can
+never make a job permanently unresumable. The file body records the owning job, process ID and
+acquisition time for diagnostics only; because nothing reads it to decide ownership, process-ID
+reuse cannot grant a claim.
+
+A released lock keeps its file on purpose. Deleting a locked path would let another process lock a
+fresh file under the same name and believe it owns the same job.
 
 **Important:** "private" means that this file is kept outside the project repository. Its relevant content is sent to the configured Supervisor when a request is made. Do not store credentials, API keys, passwords, or other secrets in it.
 
@@ -319,17 +351,131 @@ When `lya run` is attached to an interactive terminal, Lya accepts line-oriented
 
 `/send <instruction>` queues the complete instruction in order, acknowledges it immediately, persists it in job state, and applies it at the next safe model turn. Lya includes applied instructions in both the relevant Codex review and Claude execution prompts; it never attempts to inject text into a model process already generating. Queued and applied instructions are recorded in `events.jsonl`.
 
+An instruction is a constraint for the rest of the current job. It is not one-turn-only, and it is
+never carried into a sequential next job, which starts from its own task alone. To keep prompts
+bounded, one job holds at most **16 active instructions** totalling at most **8 KiB**. An
+instruction beyond either limit is refused explicitly, with the reason reported in the terminal and
+recorded as a `USER_INSTRUCTION_REJECTED` event; it is never dropped silently.
+
 `/pause` records a request immediately, then enters `PAUSED` only at a safe boundary. A running Codex/Claude invocation, repository capture, or Git operation is allowed to finish its current safe operation first. While paused, `/status`, `/diff`, `/send`, `/resume`, and `/stop` remain available. `/resume` continues from that exact boundary without repeating a completed provider invocation.
 
 `/stop` prevents new Supervisor, Executor, and publication actions. If Codex or Claude is active, Lya cancels and reaps its child process through the shared process runner, then records a terminal `STOPPED` state after a best-effort repository capture. Lya does not reset working-tree changes made before the stop request. During publication, a stop is observed before each guarded stage; Lya does not begin a later stage after it has observed the request.
 
 The first `Ctrl+C` follows the same graceful stop path and prints a second-press warning. A second `Ctrl+C` force-terminates the Lya process after the cancellation signal has already been sent to active child processes.
 
-`--json` is intentionally non-interactive: it never starts a stdin command reader and stdout remains valid `JobEvent` JSONL for scripts. Redirected non-TTY runs are also non-interactive.
+Graceful termination is always armed. Human mode, `--verbose`, `--json`, redirected output and
+non-TTY runs all route the first termination signal through the same stop semantics. Only the
+line-oriented command reader is restricted: `--json` never starts a stdin reader, so its stdout
+remains valid `JobEvent` JSONL for scripts, and redirected non-TTY runs accept no typed commands.
+
+If Lya's input simply ends while a job is paused, nobody asked to stop, so the job stays `PAUSED`
+and remains resumable. Only an explicit `/stop` or `Ctrl+C` reaches the terminal `STOPPED` state.
 
 This visibility records the exchange Lya is legitimately allowed to know: the safe review request it sends Codex, Codex's structured decision and explicit reason, the prompt Lya sends Claude, Claude's final response/report, and subsequent repository state. Hidden model chain-of-thought is not available and is never claimed or logged. The same event model is intentionally independent of terminal rendering so a later daemon or web UI can subscribe to it.
 
 Lya currently does not log an actual Codex or Claude model identifier. Both CLIs support model selection, but the structured Codex decision and Claude JSON result contracts used by Lya do not reliably report which model executed a request. Lya will add model metadata only when it is available through a documented structured provider contract.
+
+## Resuming Jobs
+
+A job that was paused, parked on a provider quota, or interrupted by a process exit can be
+continued by a later Lya process:
+
+```bash
+cargo run -- resume
+```
+
+```bash
+cargo run -- resume --job job-1789250000-4242-0
+```
+
+Without `--job`, Lya resumes only when exactly one job can be resumed. Otherwise it lists the
+candidates and asks for an explicit choice.
+
+Resumable states are `RUNNING`, `PAUSED`, `PUBLISHING`, `WAITING_CLAUDE_QUOTA` and
+`WAITING_OPENAI_QUOTA`. `FAILED`, `STOPPED`, `PUBLISHED`, `ACCEPTED` and `WAITING_HUMAN` are
+terminal for automatic recovery and are refused.
+
+Resume reads authoritative job state. The event log stays observability-only and is never parsed to
+decide what may happen next.
+
+Before any provider call or Git write, Lya:
+
+1. loads the persisted job;
+2. validates it structurally and semantically;
+3. confirms the project path is still the expected Git repository;
+4. captures the current repository state;
+5. compares reality against the persisted snapshot;
+6. determines the exact continuation point;
+7. only then contacts a provider or touches Git.
+
+Each job persists the run configuration it needs, so a restarted shell does not have to export the
+original environment variables again:
+
+```text
+project identity and path
+task
+max iterations / max jobs / sequential position
+browser flag
+publication enabled
+Git identity, remote and branch
+Claude session ID
+iteration, phase, status and pending operation
+accepted repository snapshot
+publication stage and recorded commit
+active user instructions
+```
+
+No secret is ever persisted. Push authentication stays with the machine's own Git configuration.
+
+Lya records exactly one pending operation per job: the single external action it still owes. A
+resumed job continues at that operation and never replays a provider call that is already durably
+recorded. A pending Claude correction reuses the persisted Claude session.
+
+If the repository changed while Lya was not running, Lya does not guess: the job moves to
+`WAITING_HUMAN` with a precise reason.
+
+Resume emits `RESUME_STARTED`, `RESUME_VALIDATED`, `RESUME_REJECTED` and `QUOTA_RETRY_STARTED`
+events into the same `events.jsonl` as the original process. Interactive control and `--json`
+output work exactly as they do for a fresh run.
+
+### Quota Waiting
+
+A provider quota is a parked, resumable state rather than a dead end. Lya records which provider
+was exhausted, the operation that still needs to run, how the condition was classified and the
+reported reason.
+
+Classification prefers documented structured provider information. Where a CLI documents no
+machine-readable quota signal, Lya falls back to a message heuristic and records that explicitly as
+`PROVIDER_MESSAGE_HEURISTIC`, so a quota decision never looks more precise than it really is.
+
+`lya resume` retries only the operation that had not completed. The iteration counter is not
+advanced again, and a model action that already finished is never repeated.
+
+Lya never falls back to a paid API to work around a subscription quota.
+
+### Recovering An Interrupted Publication
+
+Publication is recovered only when the state can be proven safe.
+
+If no commit was recorded, Lya proves `HEAD` never moved, then either restarts the guarded sequence
+or, when the index already holds exactly the accepted change, continues at the commit step.
+
+If a commit was recorded, Lya verifies that:
+
+```text
+the commit is recorded in authoritative job state
+HEAD is exactly that commit
+its only parent is the accepted snapshot HEAD
+the commit carries the accepted commit title
+the commit contains exactly the accepted paths
+the working tree is clean
+the configured branch and remote still match
+```
+
+Only then does publication continue at the push, without creating a second commit.
+
+Anything ambiguous — including a commit that exists without authoritative state — moves the job to
+`WAITING_HUMAN` and leaves Git untouched. Lya never resets or rewrites history to recover.
 
 ## Repository Review
 
@@ -407,6 +553,16 @@ verify clean working tree
 If the repository changes between review and publication, Lya refuses to publish it.
 
 The staged content is also checked against the reviewed state before the commit is created.
+
+As soon as a commit exists it is recorded in authoritative job state with its SHA, publication
+stage, remote, branch and push state, before any further step. A stop between the commit and the
+push therefore leaves enough state for a later process to know exactly what exists and to continue
+at the push.
+
+The commit and its record are still two separate steps, so a crash in between can leave a commit
+that no persisted state describes. That case is detected rather than assumed away: the next resume
+finds that `HEAD` moved without an authoritative commit record, stops, and parks the job in
+`WAITING_HUMAN` for a person to resolve.
 
 Lya does **not** automatically:
 
@@ -517,6 +673,14 @@ The Publisher does not use an LLM.
 
 Before publication, Lya checks that what Git is about to commit is the same repository state the Supervisor reviewed.
 
+A commit is recorded in authoritative job state as soon as it exists, but the commit and its record
+are two separate steps: a crash between them can leave a commit that no persisted state describes.
+Lya does not paper over that window. On the next resume it sees that `HEAD` moved without an
+authoritative commit record, refuses to continue automatically, and parks the job in
+`WAITING_HUMAN`. It never creates a second commit, never pushes, and never rewrites history to
+recover. An interrupted publication is only continued when every invariant can be proven against
+the live repository.
+
 Lya also avoids giving provider processes unnecessary billing credentials by removing environment-provided API keys from their child-process environments.
 
 These protections reduce accidental autonomous changes, but Lya is experimental software. Run autonomous workflows only in repositories where you understand and accept the risks.
@@ -525,15 +689,21 @@ These protections reduce accidental autonomous changes, but Lya is experimental 
 
 Lya currently runs jobs sequentially.
 
-Pausing and resuming works only while the current `lya` process is still running. Restart recovery after process exit is not implemented yet. Daemon/service mode, remote control, web UI, parallel jobs, and multi-project scheduling are future work.
+Cancelling a provider kills and reaps the Codex or Claude process Lya started, but not the
+processes that CLI started in turn. A provider's child processes can therefore outlive a stop.
+Cancelling the whole provider process tree needs a Windows Job Object and a Unix process group and
+is deliberately kept as a separate, immediately following change.
+
+A second `Ctrl+C` force-terminates Lya immediately. That is intentional and safe for job locks,
+which the operating system releases on process exit, but it skips Lya's own cleanup.
 
 The following are not implemented yet:
 
-* automatic resume after process restart;
-* quota-aware pause and resume;
+* cancellation of a provider's whole process tree;
 * persistent daemon/service mode;
 * background scheduling;
 * parallel jobs;
+* multi-project scheduling;
 * remote administration UI;
 * automatic conflict resolution;
 * GitHub API integration.
@@ -555,8 +725,10 @@ The following are not implemented yet:
 * [x] Guarded Git commit and push
 * [x] Sequential multi-job runs
 * [x] Structured job events and live CLI output
-* [ ] Persisted job/run resume
-* [ ] Quota-aware pause and resume
+* [x] Interactive job control
+* [x] Persisted job/run resume
+* [x] Quota-aware pause and resume
+* [ ] Provider process-tree cancellation
 * [ ] Daemon/service mode
 * [ ] Remote administration interface
 * [ ] Scheduling and parallel execution

@@ -18,9 +18,11 @@ use lya::{
         },
         executor::{ClaudeCliExecutor, Executor, ExecutorRequest, ExecutorSession},
         home::LyaHome,
-        job::{AutonomousOrchestrator, NewJob, new_job_id},
-        publisher::{GitPublishConfig, GitPublisher},
-        state::JobStatus,
+        job::{AutonomousOrchestrator, NewJob, OrchestrationError, RunResult, new_job_id},
+        lock::JobLock,
+        publisher::{GitPublishConfig, GitPublisher, Publisher},
+        resume::{ResumeRejection, resumable_jobs, select_job},
+        state::{JobState, JobStatus, StateStore},
         supervisor::{
             CodexCliSupervisor, Project, Supervisor, SupervisorRequest,
             load_required_private_context,
@@ -57,6 +59,12 @@ async fn main() -> ExitCode {
     }
     if arguments.first().is_some_and(|argument| argument == "run") {
         return run_autonomous_job(&arguments[1..]).await;
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "resume")
+    {
+        return resume_autonomous_job(&arguments[1..]).await;
     }
 
     let model = match env::var("OLLAMA_MODEL") {
@@ -100,6 +108,129 @@ async fn main() -> ExitCode {
     }
 }
 
+type JobOrchestrator<P> = AutonomousOrchestrator<
+    CodexCliSupervisor<SystemProcessRunner>,
+    ClaudeCliExecutor<SystemProcessRunner>,
+    SystemProcessRunner,
+    P,
+    CompositeEventSink,
+>;
+
+enum JobAction {
+    Start(Box<NewJob>),
+    Resume(Box<JobState>, String),
+}
+
+async fn execute_job_action<P: Publisher>(
+    orchestrator: JobOrchestrator<P>,
+    action: JobAction,
+) -> Result<RunResult, OrchestrationError> {
+    match action {
+        JobAction::Start(request) => orchestrator.run_sequential(*request).await,
+        JobAction::Resume(job, private_context) => {
+            orchestrator.resume_sequential(*job, private_context).await
+        }
+    }
+}
+
+fn event_sink(home: &LyaHome, job_id: &str, output: &RunOutput) -> CompositeEventSink {
+    match output {
+        RunOutput::Json => CompositeEventSink::new(vec![
+            Box::new(JsonlEventSink::for_job(home.path(), job_id)),
+            Box::new(JsonEventSink::new(io::stdout())),
+        ]),
+        RunOutput::Human(mode) => CompositeEventSink::new(vec![
+            Box::new(JsonlEventSink::for_job(home.path(), job_id)),
+            Box::new(HumanEventSink::stdout(*mode)),
+        ]),
+    }
+}
+
+/// Moves any legacy `LYA_HOME/state.json` into the per-job layout before jobs are read or written.
+fn prepare_home(home: &LyaHome) -> Result<StateStore, String> {
+    let store = StateStore::new(home);
+    let report = store
+        .migrate_legacy()
+        .map_err(|error| format!("could not migrate existing job state: {error}"))?;
+    if !report.is_empty() {
+        eprintln!(
+            "Migrated {} job(s) from state.json into per-job state; {} already existed.",
+            report.migrated.len(),
+            report.kept_existing.len()
+        );
+    }
+    Ok(store)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_job(
+    home: &LyaHome,
+    store: &StateStore,
+    job_id: &str,
+    output: RunOutput,
+    publish: Option<GitPublishConfig>,
+    browser: bool,
+    max_iterations: u32,
+    max_jobs: u32,
+    action: JobAction,
+) -> ExitCode {
+    let _lock = match JobLock::acquire(store, job_id) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let control = start_control(&output);
+    let sink = event_sink(home, job_id, &output);
+    let base = AutonomousOrchestrator::new(
+        CodexCliSupervisor::new_for_job(home.path(), job_id),
+        ClaudeCliExecutor::new(),
+        SystemProcessRunner,
+        StateStore::new(home),
+    )
+    .with_max_iterations(max_iterations)
+    .with_max_jobs(max_jobs)
+    .with_browser(browser)
+    .with_event_sink(sink)
+    .with_control_receiver(control);
+
+    let result = match publish {
+        Some(configuration) => {
+            execute_job_action(
+                base.with_publisher(GitPublisher::new(configuration.clone()))
+                    .with_publish_configuration(configuration),
+                action,
+            )
+            .await
+        }
+        None => execute_job_action(base, action).await,
+    };
+
+    match result {
+        Ok(run) => {
+            let job = run
+                .jobs
+                .last()
+                .expect("a run always contains its first job");
+            match job.status {
+                JobStatus::Accepted
+                | JobStatus::Published
+                | JobStatus::Paused
+                | JobStatus::WaitingHuman
+                | JobStatus::WaitingClaudeQuota
+                | JobStatus::WaitingOpenAiQuota
+                | JobStatus::Stopped => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+        Err(error) => {
+            eprintln!("Job {job_id} failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
     let options = match parse_run_arguments(arguments) {
         Ok(options) => options,
@@ -117,6 +248,13 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let store = match prepare_home(&home) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let private_context = match load_required_private_context(&home) {
         Ok(context) => context,
         Err(error) => {
@@ -124,99 +262,142 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let job_id = new_job_id();
-    let project = Project {
-        name: project_name(&options.project_path),
-        path: options.project_path,
-    };
-
-    let request = NewJob {
-        job_id: job_id.clone(),
-        project,
-        task: options.task,
-        private_context,
-    };
-    let control = start_interactive_control(&options.output);
-    let event_sink = match options.output {
-        RunOutput::Json => CompositeEventSink::new(vec![
-            Box::new(JsonlEventSink::for_job(home.path(), &job_id)),
-            Box::new(JsonEventSink::new(io::stdout())),
-        ]),
-        RunOutput::Human(mode) => CompositeEventSink::new(vec![
-            Box::new(JsonlEventSink::for_job(home.path(), &job_id)),
-            Box::new(HumanEventSink::stdout(mode)),
-        ]),
-    };
-    let result = if options.publish {
-        let configuration = match GitPublishConfig::from_environment() {
-            Ok(configuration) => configuration,
+    let publish = if options.publish {
+        match GitPublishConfig::from_environment() {
+            Ok(configuration) => Some(configuration),
             Err(error) => {
                 eprintln!("Could not configure Git publication: {error}");
                 return ExitCode::FAILURE;
             }
-        };
-        let orchestrator = AutonomousOrchestrator::new(
-            CodexCliSupervisor::new_for_job(home.path(), &job_id),
-            ClaudeCliExecutor::new(),
-            SystemProcessRunner,
-            lya::orchestrator::state::StateStore::new(&home),
-        )
-        .with_max_iterations(options.max_iterations)
-        .with_max_jobs(options.max_jobs)
-        .with_browser(options.browser)
-        .with_publisher(GitPublisher::new(configuration))
-        .with_event_sink(event_sink);
-        match control {
-            Some(control) => {
-                orchestrator
-                    .with_control_receiver(control)
-                    .run_sequential(request)
-                    .await
-            }
-            None => orchestrator.run_sequential(request).await,
         }
     } else {
-        let orchestrator = AutonomousOrchestrator::new(
-            CodexCliSupervisor::new_for_job(home.path(), &job_id),
-            ClaudeCliExecutor::new(),
-            SystemProcessRunner,
-            lya::orchestrator::state::StateStore::new(&home),
-        )
-        .with_max_iterations(options.max_iterations)
-        .with_max_jobs(options.max_jobs)
-        .with_browser(options.browser)
-        .with_event_sink(event_sink);
-        match control {
-            Some(control) => {
-                orchestrator
-                    .with_control_receiver(control)
-                    .run_sequential(request)
-                    .await
-            }
-            None => orchestrator.run_sequential(request).await,
-        }
+        None
+    };
+    let job_id = new_job_id();
+    let request = NewJob {
+        job_id: job_id.clone(),
+        project: Project {
+            name: project_name(&options.project_path),
+            path: options.project_path,
+        },
+        task: options.task,
+        private_context,
     };
 
-    match result {
-        Ok(run) => {
-            let job = run
-                .jobs
-                .last()
-                .expect("a run always contains its first job");
-            match job.status {
-                JobStatus::Accepted
-                | JobStatus::Published
-                | JobStatus::WaitingHuman
-                | JobStatus::WaitingClaudeQuota
-                | JobStatus::WaitingOpenAiQuota
-                | JobStatus::Stopped => ExitCode::SUCCESS,
-                _ => ExitCode::FAILURE,
+    drive_job(
+        &home,
+        &store,
+        &job_id,
+        options.output,
+        publish,
+        options.browser,
+        options.max_iterations,
+        options.max_jobs,
+        JobAction::Start(Box::new(request)),
+    )
+    .await
+}
+
+async fn resume_autonomous_job(arguments: &[String]) -> ExitCode {
+    let options = match parse_resume_arguments(arguments) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{error}\nUsage: lya resume [--job <job-id>] [--verbose | --json]");
+            return ExitCode::FAILURE;
+        }
+    };
+    let home = match LyaHome::resolve() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("Could not resolve Lya home: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = match prepare_home(&home) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let candidates = match resumable_jobs(&store) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("Could not read persisted job state: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let job = match select_job(candidates, options.job_id.as_deref()) {
+        Ok(job) => job,
+        Err(error) => {
+            eprintln!("{}", resume_error_message(&store, error));
+            return ExitCode::FAILURE;
+        }
+    };
+    let private_context = match load_required_private_context(&home) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("Could not prepare the resumed job: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Publication continues with the configuration persisted for the job, not with whatever the
+    // restarted shell happens to export.
+    let publish = if job.run.publish {
+        match job.run.git.clone() {
+            Some(configuration) => Some(configuration),
+            None => {
+                eprintln!(
+                    "Job {} needs to publish but no Git identity, remote and branch were persisted for it. Resolve it manually.",
+                    job.job_id
+                );
+                return ExitCode::FAILURE;
             }
         }
-        Err(error) => {
-            eprintln!("Job {job_id} failed: {error}");
-            ExitCode::FAILURE
+    } else {
+        None
+    };
+    let job_id = job.job_id.clone();
+    let browser = job.run.browser;
+    let max_iterations = job.run.max_iterations;
+    let max_jobs = job.run.max_jobs;
+
+    drive_job(
+        &home,
+        &store,
+        &job_id,
+        options.output,
+        publish,
+        browser,
+        max_iterations,
+        max_jobs,
+        JobAction::Resume(Box::new(job), private_context),
+    )
+    .await
+}
+
+/// Explains why a named job cannot be resumed, and otherwise lists what is available.
+fn resume_error_message(store: &StateStore, error: ResumeRejection) -> String {
+    let ResumeRejection::UnknownJob(job_id) = &error else {
+        return error.to_string();
+    };
+    // A job that exists but is terminal deserves its real reason, not "unknown job".
+    if let Ok(Some(job)) = store.load_job(job_id) {
+        return ResumeRejection::NotResumable {
+            job_id: job.job_id,
+            status: job.status.label().to_owned(),
         }
+        .to_string();
+    }
+    match resumable_jobs(store) {
+        Ok(jobs) if !jobs.is_empty() => format!(
+            "unknown job: {job_id}\nResumable jobs:\n  {}",
+            jobs.iter()
+                .map(lya::orchestrator::resume::describe)
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ),
+        _ => error.to_string(),
     }
 }
 
@@ -390,16 +571,25 @@ fn parse_executor_arguments(
     ))
 }
 
-fn start_interactive_control(output: &RunOutput) -> Option<ControlReceiver> {
-    if !interactive_enabled(
+/// Starts the control channel for a job.
+///
+/// The graceful termination signal is always handled, in every output mode and whether or not a
+/// terminal is attached. Only the line-oriented command reader is restricted to an interactive
+/// human-mode terminal, so `--json` stdout stays valid `JobEvent` JSONL.
+fn start_control(output: &RunOutput) -> ControlReceiver {
+    let (sender, receiver) = ControlReceiver::new();
+    if interactive_enabled(
         output,
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
     ) {
-        return None;
+        spawn_command_reader(sender.clone());
     }
-    let (sender, receiver) = ControlReceiver::new();
-    let command_sender = sender.clone();
+    spawn_interrupt_handler(sender);
+    receiver
+}
+
+fn spawn_command_reader(command_sender: lya::orchestrator::control::ControlSender) {
     tokio::spawn(async move {
         println!("/help for commands | Ctrl+C to stop");
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -437,6 +627,9 @@ fn start_interactive_control(output: &RunOutput) -> Option<ControlReceiver> {
             }
         }
     });
+}
+
+fn spawn_interrupt_handler(sender: lya::orchestrator::control::ControlSender) {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!(
@@ -451,7 +644,6 @@ fn start_interactive_control(output: &RunOutput) -> Option<ControlReceiver> {
             }
         }
     });
-    Some(receiver)
 }
 
 fn interactive_enabled(
@@ -495,6 +687,50 @@ struct RunOptions {
 enum RunOutput {
     Human(HumanRenderMode),
     Json,
+}
+
+#[derive(Debug)]
+struct ResumeOptions {
+    job_id: Option<String>,
+    output: RunOutput,
+}
+
+fn parse_resume_arguments(arguments: &[String]) -> Result<ResumeOptions, String> {
+    let mut job_id = None;
+    let mut verbose = false;
+    let mut json = false;
+    let mut position = 0;
+
+    while position < arguments.len() {
+        match arguments[position].as_str() {
+            "--job" => {
+                position += 1;
+                job_id = Some(
+                    arguments
+                        .get(position)
+                        .cloned()
+                        .ok_or_else(|| "--job requires a job ID".to_owned())?,
+                );
+            }
+            "--verbose" => verbose = true,
+            "--json" => json = true,
+            argument => return Err(format!("unknown resume option: {argument}")),
+        }
+        position += 1;
+    }
+    if verbose && json {
+        return Err("--verbose cannot be combined with --json".to_owned());
+    }
+    Ok(ResumeOptions {
+        job_id,
+        output: if json {
+            RunOutput::Json
+        } else if verbose {
+            RunOutput::Human(HumanRenderMode::Verbose)
+        } else {
+            RunOutput::Human(HumanRenderMode::Normal)
+        },
+    })
 }
 
 fn parse_run_arguments(arguments: &[String]) -> Result<RunOptions, String> {
@@ -609,7 +845,8 @@ fn run_doctor() -> ExitCode {
 mod tests {
     use super::{
         ExecutorSession, InterruptAction, RunOutput, interactive_enabled, interrupt_action,
-        parse_executor_arguments, parse_run_arguments, request_graceful_stop,
+        parse_executor_arguments, parse_resume_arguments, parse_run_arguments,
+        request_graceful_stop, start_control,
     };
     use lya::orchestrator::control::{ControlCommand, ControlReceiver};
 
@@ -711,6 +948,43 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn parses_resume_options() {
+        let options = parse_resume_arguments(&["--job".to_owned(), "job-7".to_owned()])
+            .expect("resume options should parse");
+        assert_eq!(options.job_id.as_deref(), Some("job-7"));
+        assert!(matches!(options.output, RunOutput::Human(_)));
+
+        let options =
+            parse_resume_arguments(&["--json".to_owned()]).expect("JSON resume should parse");
+        assert_eq!(options.job_id, None);
+        assert!(matches!(options.output, RunOutput::Json));
+
+        assert!(parse_resume_arguments(&["--job".to_owned()]).is_err());
+        assert!(parse_resume_arguments(&["--nope".to_owned()]).is_err());
+        assert!(parse_resume_arguments(&["--verbose".to_owned(), "--json".to_owned()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn graceful_interrupt_handling_is_armed_even_without_an_interactive_terminal() {
+        for output in [
+            RunOutput::Json,
+            RunOutput::Human(lya::orchestrator::events::HumanRenderMode::Normal),
+        ] {
+            let receiver = start_control(&output);
+
+            // The interrupt handler owns a live sender in every mode. A closed channel would end
+            // a paused job immediately instead of waiting for the graceful stop.
+            let closed =
+                tokio::time::timeout(std::time::Duration::from_millis(50), receiver.next()).await;
+
+            assert!(
+                closed.is_err(),
+                "the control channel must stay open so Ctrl+C can request a graceful stop"
+            );
+        }
     }
 
     #[tokio::test]

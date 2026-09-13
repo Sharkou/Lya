@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::process::{ProcessError, ProcessRunner, ProcessSpec, SystemProcessRunner};
 
+use super::state::{QuotaSource, message_indicates_quota};
+
 const STDIN_TASK_INSTRUCTION: &str =
     "Complete the task provided through standard input. Follow it exactly.";
 
@@ -174,15 +176,58 @@ impl<R: ProcessRunner> Executor for ClaudeCliExecutor<R> {
                 .await
                 .map_err(ExecutorError::from_process)?;
             if output.exit_code != Some(0) {
-                return Err(ExecutorError::ProcessFailed {
-                    exit_code: output.exit_code,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                });
+                return Err(classify_failure(
+                    output.exit_code,
+                    output.stdout,
+                    output.stderr,
+                ));
             }
             ExecutorResult::from_claude_json(&output.stdout, output.exit_code)
         })
     }
+}
+
+/// Classify a failed Claude Code run at the provider boundary.
+///
+/// Claude Code's documented `--output-format json` envelope carries `is_error` and `subtype`; that
+/// structured signal is preferred. Neither CLI documents a dedicated quota subtype today, so the
+/// message heuristic remains an explicit, recorded fallback rather than a claim of precision.
+fn classify_failure(exit_code: Option<i32>, stdout: String, stderr: String) -> ExecutorError {
+    if let Some(detail) = structured_quota_detail(&stdout) {
+        return ExecutorError::QuotaExceeded {
+            source: QuotaSource::ProviderStructured,
+            detail,
+        };
+    }
+    if message_indicates_quota(&stderr) || message_indicates_quota(&stdout) {
+        return ExecutorError::QuotaExceeded {
+            source: QuotaSource::ProviderMessageHeuristic,
+            detail: quota_detail(&stderr, &stdout),
+        };
+    }
+    ExecutorError::ProcessFailed {
+        exit_code,
+        stdout,
+        stderr,
+    }
+}
+
+fn structured_quota_detail(stdout: &str) -> Option<String> {
+    let output = serde_json::from_str::<ClaudeJsonOutput>(stdout).ok()?;
+    let subtype = output.subtype?;
+    if output.is_error == Some(true) && message_indicates_quota(&subtype) {
+        return Some(format!("Claude reported subtype {subtype}"));
+    }
+    None
+}
+
+fn quota_detail(stderr: &str, stdout: &str) -> String {
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    detail.lines().take(3).collect::<Vec<_>>().join(" ")
 }
 
 impl ExecutorResult {
@@ -217,6 +262,10 @@ impl ExecutorResult {
 struct ClaudeJsonOutput {
     #[serde(default)]
     result: Option<String>,
+    #[serde(default)]
+    subtype: Option<String>,
+    #[serde(default)]
+    is_error: Option<bool>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -262,7 +311,10 @@ pub enum ExecutorError {
     Timeout(Duration),
     InvalidOutput(ExecutorOutputError),
     AuthenticationRequired,
-    QuotaExceeded,
+    QuotaExceeded {
+        source: QuotaSource,
+        detail: String,
+    },
     Process(String),
 }
 
@@ -307,7 +359,11 @@ impl fmt::Display for ExecutorError {
             Self::AuthenticationRequired => {
                 formatter.write_str("Claude authentication is required")
             }
-            Self::QuotaExceeded => formatter.write_str("Claude subscription quota is exhausted"),
+            Self::QuotaExceeded { source, detail } => write!(
+                formatter,
+                "Claude subscription quota is exhausted ({}): {detail}",
+                source.label()
+            ),
             Self::Process(error) => write!(formatter, "Claude process error: {error}"),
         }
     }

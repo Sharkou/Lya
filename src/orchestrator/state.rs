@@ -12,12 +12,21 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     home::LyaHome,
-    publisher::{PublishResult, PublishStage},
+    publisher::{GitPublishConfig, PublishResult, PublishStage},
     repository::RepositoryState,
     supervisor::SupervisorDecision,
 };
 
 static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
+
+pub const DEFAULT_MAX_ITERATIONS: u32 = 10;
+pub const DEFAULT_MAX_JOBS: u32 = 10;
+
+/// Upper bounds for active `/send` instructions. Instructions stay active for the rest of the
+/// current job, so they are bounded explicitly instead of growing without limit. Exceeding either
+/// bound is reported to the user; an instruction is never dropped silently.
+pub const MAX_ACTIVE_USER_INSTRUCTIONS: usize = 16;
+pub const MAX_ACTIVE_USER_INSTRUCTION_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
@@ -43,6 +52,37 @@ pub enum JobStatus {
     Stopped,
 }
 
+impl JobStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Running => "RUNNING",
+            Self::Paused => "PAUSED",
+            Self::WaitingClaudeQuota => "WAITING_CLAUDE_QUOTA",
+            Self::WaitingOpenAiQuota => "WAITING_OPENAI_QUOTA",
+            Self::WaitingHuman => "WAITING_HUMAN",
+            Self::Accepted => "ACCEPTED",
+            Self::Publishing => "PUBLISHING",
+            Self::Published => "PUBLISHED",
+            Self::Failed => "FAILED",
+            Self::Stopped => "STOPPED",
+        }
+    }
+
+    /// A job that a later Lya process may continue. `FAILED`, `STOPPED`, `PUBLISHED`, `ACCEPTED`
+    /// and `WAITING_HUMAN` are deliberately excluded: they are terminal for automatic recovery and
+    /// need an explicit human decision instead.
+    pub fn is_resumable(&self) -> bool {
+        matches!(
+            self,
+            Self::Running
+                | Self::Paused
+                | Self::Publishing
+                | Self::WaitingClaudeQuota
+                | Self::WaitingOpenAiQuota
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobPhase {
     #[serde(rename = "SUPERVISOR")]
@@ -51,6 +91,102 @@ pub enum JobPhase {
     Executor,
     #[serde(rename = "PUBLISHER")]
     Publisher,
+}
+
+impl JobPhase {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Supervisor => "SUPERVISOR",
+            Self::Executor => "EXECUTOR",
+            Self::Publisher => "PUBLISHER",
+        }
+    }
+}
+
+/// The single external action a job still owes. It is persisted before the action starts and
+/// cleared once the action is durably recorded, so a later process knows exactly where to continue
+/// without replaying a completed provider call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingOperation {
+    #[serde(rename = "SUPERVISOR_REVIEW")]
+    SupervisorReview,
+    #[serde(rename = "EXECUTOR_RUN")]
+    ExecutorRun,
+    #[serde(rename = "PUBLICATION")]
+    Publication,
+}
+
+impl PendingOperation {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::SupervisorReview => "SUPERVISOR_REVIEW",
+            Self::ExecutorRun => "EXECUTOR_RUN",
+            Self::Publication => "PUBLICATION",
+        }
+    }
+}
+
+/// How a quota condition was recognised. Structured provider information is preferred; the message
+/// heuristic is an explicit, recorded fallback rather than a silent guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuotaSource {
+    #[serde(rename = "PROVIDER_STRUCTURED")]
+    ProviderStructured,
+    #[serde(rename = "PROVIDER_MESSAGE_HEURISTIC")]
+    ProviderMessageHeuristic,
+}
+
+impl QuotaSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ProviderStructured => "PROVIDER_STRUCTURED",
+            Self::ProviderMessageHeuristic => "PROVIDER_MESSAGE_HEURISTIC",
+        }
+    }
+}
+
+/// Explicit fallback used only where a provider exposes no documented structured signal. It is
+/// always recorded as [`QuotaSource::ProviderMessageHeuristic`] so a quota decision never looks
+/// more precise than it really is.
+pub fn message_indicates_quota(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("quota")
+        || text.contains("rate limit")
+        || text.contains("rate_limit")
+        || text.contains("usage limit")
+        || text.contains("too many requests")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaWait {
+    pub provider: String,
+    pub operation: PendingOperation,
+    pub source: QuotaSource,
+    pub reason: String,
+    pub detected_unix_seconds: u64,
+}
+
+/// Everything needed to continue a run correctly in a new process. It never contains secrets: Git
+/// push authentication stays with the machine's own Git configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunConfiguration {
+    pub max_iterations: u32,
+    pub max_jobs: u32,
+    pub browser: bool,
+    pub publish: bool,
+    pub git: Option<GitPublishConfig>,
+}
+
+impl Default for RunConfiguration {
+    fn default() -> Self {
+        Self {
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_jobs: DEFAULT_MAX_JOBS,
+            browser: false,
+            publish: false,
+            git: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +208,16 @@ pub struct JobState {
     pub pending_user_instructions: Vec<String>,
     #[serde(default)]
     pub applied_user_instructions: Vec<String>,
+    #[serde(default)]
+    pub run: RunConfiguration,
+    #[serde(default)]
+    pub pending_operation: Option<PendingOperation>,
+    #[serde(default)]
+    pub quota_wait: Option<QuotaWait>,
+    #[serde(default)]
+    pub last_repository_state: Option<RepositoryState>,
+    #[serde(default)]
+    pub sequential_index: u32,
     pub created_unix_seconds: u64,
     pub last_updated_unix_seconds: u64,
 }
@@ -100,6 +246,11 @@ impl JobState {
             publish_stage: None,
             pending_user_instructions: Vec::new(),
             applied_user_instructions: Vec::new(),
+            run: RunConfiguration::default(),
+            pending_operation: None,
+            quota_wait: None,
+            last_repository_state: None,
+            sequential_index: 0,
             created_unix_seconds: now,
             last_updated_unix_seconds: now,
         }
@@ -108,8 +259,23 @@ impl JobState {
     pub fn touch(&mut self) {
         self.last_updated_unix_seconds = current_unix_seconds();
     }
+
+    /// Total serialized size of the instructions that are active for the rest of this job.
+    pub fn active_instruction_bytes(&self) -> usize {
+        self.applied_user_instructions
+            .iter()
+            .chain(self.pending_user_instructions.iter())
+            .map(String::len)
+            .sum()
+    }
+
+    pub fn active_instruction_count(&self) -> usize {
+        self.applied_user_instructions.len() + self.pending_user_instructions.len()
+    }
 }
 
+/// Legacy single-file layout. Retained so existing `LYA_HOME/state.json` files can be migrated
+/// into the per-job layout without losing anything.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorState {
     pub jobs: BTreeMap<String, JobState>,
@@ -121,59 +287,170 @@ impl OrchestratorState {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyMigration {
+    pub migrated: Vec<String>,
+    pub kept_existing: Vec<String>,
+    pub archived_legacy_path: Option<PathBuf>,
+}
+
+impl LegacyMigration {
+    pub fn is_empty(&self) -> bool {
+        self.migrated.is_empty() && self.kept_existing.is_empty()
+    }
+}
+
+/// Per-job persistent state under `LYA_HOME/jobs/<job-id>/state.json`.
+///
+/// Every job owns its own file so two Lya processes working on different jobs never rewrite each
+/// other's state. Writes are atomic (unique temporary file, `sync_all`, rename).
 pub struct StateStore {
-    path: PathBuf,
+    root: PathBuf,
 }
 
 impl StateStore {
     pub fn new(home: &LyaHome) -> Self {
-        Self {
-            path: home.state_path(),
-        }
+        Self::at(home.path())
     }
 
-    pub fn load(&self) -> Result<OrchestratorState, StateError> {
-        let content = match fs::read_to_string(&self.path) {
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn jobs_directory(&self) -> PathBuf {
+        self.root.join("jobs")
+    }
+
+    pub fn job_directory(&self, job_id: &str) -> Result<PathBuf, StateError> {
+        validate_job_id(job_id)?;
+        Ok(self.jobs_directory().join(job_id))
+    }
+
+    pub fn job_state_path(&self, job_id: &str) -> Result<PathBuf, StateError> {
+        Ok(self.job_directory(job_id)?.join("state.json"))
+    }
+
+    pub fn legacy_state_path(&self) -> PathBuf {
+        self.root.join("state.json")
+    }
+
+    pub fn save_job(&self, job: &JobState) -> Result<(), StateError> {
+        let path = self.job_state_path(&job.job_id)?;
+        let parent = self
+            .job_directory(&job.job_id)
+            .expect("job ID was validated");
+        fs::create_dir_all(&parent).map_err(|error| StateError::Write(error.to_string()))?;
+        let content = serde_json::to_vec_pretty(job)
+            .map_err(|error| StateError::Serialize(error.to_string()))?;
+        write_atomically(&path, &content)
+    }
+
+    pub fn load_job(&self, job_id: &str) -> Result<Option<JobState>, StateError> {
+        let path = self.job_state_path(job_id)?;
+        read_job(&path)
+    }
+
+    /// Every persisted job, ordered by job ID. Unreadable directories are reported instead of
+    /// being skipped silently.
+    pub fn load_all(&self) -> Result<Vec<JobState>, StateError> {
+        let directory = self.jobs_directory();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StateError::Read(error.to_string())),
+        };
+        let mut jobs = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| StateError::Read(error.to_string()))?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Some(job) = read_job(&entry.path().join("state.json"))? else {
+                continue;
+            };
+            jobs.insert(job.job_id.clone(), job);
+        }
+        Ok(jobs.into_values().collect())
+    }
+
+    /// Move an existing `LYA_HOME/state.json` into the per-job layout. A per-job file that already
+    /// exists always wins; the legacy file is archived rather than deleted.
+    pub fn migrate_legacy(&self) -> Result<LegacyMigration, StateError> {
+        let legacy_path = self.legacy_state_path();
+        let content = match fs::read_to_string(&legacy_path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(OrchestratorState::default());
+                return Ok(LegacyMigration::default());
             }
             Err(error) => return Err(StateError::Read(error.to_string())),
         };
-        serde_json::from_str(&content).map_err(|error| StateError::InvalidJson(error.to_string()))
-    }
-
-    pub fn save(&self, state: &OrchestratorState) -> Result<(), StateError> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| StateError::Write("state path has no parent directory".to_owned()))?;
-        fs::create_dir_all(parent).map_err(|error| StateError::Write(error.to_string()))?;
-        let content = serde_json::to_vec_pretty(state)
-            .map_err(|error| StateError::Serialize(error.to_string()))?;
-        let temporary = temporary_path(&self.path);
-        let write_result = (|| -> Result<(), StateError> {
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)
-                .map_err(|error| StateError::Write(error.to_string()))?;
-            file.write_all(&content)
-                .map_err(|error| StateError::Write(error.to_string()))?;
-            file.sync_all()
-                .map_err(|error| StateError::Write(error.to_string()))?;
-            fs::rename(&temporary, &self.path).map_err(|error| StateError::Write(error.to_string()))
-        })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temporary);
+        let legacy: OrchestratorState = serde_json::from_str(&content)
+            .map_err(|error| StateError::InvalidJson(error.to_string()))?;
+        let mut report = LegacyMigration::default();
+        for (job_id, job) in legacy.jobs {
+            if self.load_job(&job_id)?.is_some() {
+                report.kept_existing.push(job_id);
+                continue;
+            }
+            self.save_job(&job)?;
+            report.migrated.push(job_id);
         }
-        write_result
+        let archived =
+            legacy_path.with_file_name(format!("state.json.migrated-{}", current_unix_seconds()));
+        fs::rename(&legacy_path, &archived)
+            .map_err(|error| StateError::Write(error.to_string()))?;
+        report.archived_legacy_path = Some(archived);
+        Ok(report)
     }
+}
 
-    #[cfg(test)]
-    fn path(&self) -> &Path {
-        &self.path
+fn read_job(path: &Path) -> Result<Option<JobState>, StateError> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StateError::Read(error.to_string())),
+    };
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| StateError::InvalidJson(error.to_string()))
+}
+
+fn write_atomically(path: &Path, content: &[u8]) -> Result<(), StateError> {
+    let temporary = temporary_path(path);
+    let write_result = (|| -> Result<(), StateError> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| StateError::Write(error.to_string()))?;
+        file.write_all(content)
+            .map_err(|error| StateError::Write(error.to_string()))?;
+        file.sync_all()
+            .map_err(|error| StateError::Write(error.to_string()))?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|error| StateError::Write(error.to_string()))
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
+    write_result
+}
+
+/// A job ID becomes a directory name, so it must stay a single, boring path segment.
+pub fn validate_job_id(job_id: &str) -> Result<(), StateError> {
+    if job_id.is_empty() || job_id.len() > 128 {
+        return Err(StateError::InvalidJobId(job_id.to_owned()));
+    }
+    if job_id == "." || job_id == ".." {
+        return Err(StateError::InvalidJobId(job_id.to_owned()));
+    }
+    if !job_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return Err(StateError::InvalidJobId(job_id.to_owned()));
+    }
+    Ok(())
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -181,7 +458,7 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".state-{}-{sequence}.tmp", std::process::id()))
 }
 
-fn current_unix_seconds() -> u64 {
+pub fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -193,6 +470,7 @@ pub enum StateError {
     Read(String),
     Serialize(String),
     InvalidJson(String),
+    InvalidJobId(String),
     Write(String),
 }
 
@@ -202,6 +480,7 @@ impl fmt::Display for StateError {
             Self::Read(error) => write!(formatter, "could not read state: {error}"),
             Self::Serialize(error) => write!(formatter, "could not serialize state: {error}"),
             Self::InvalidJson(error) => write!(formatter, "state contains invalid JSON: {error}"),
+            Self::InvalidJobId(job_id) => write!(formatter, "unsafe job ID: {job_id}"),
             Self::Write(error) => write!(formatter, "could not write state: {error}"),
         }
     }
@@ -216,7 +495,9 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use super::{JobState, JobStatus, OrchestratorState, StateStore};
+    use super::{
+        JobState, JobStatus, OrchestratorState, StateStore, current_unix_seconds, validate_job_id,
+    };
     use crate::orchestrator::home::LyaHome;
 
     static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -227,17 +508,13 @@ mod tests {
             std::process::id(),
             NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&directory).expect("home directory should be created");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("home directory should be created");
         directory
     }
 
     fn job(job_id: &str, status: JobStatus) -> JobState {
-        let mut job = JobState::new(
-            job_id,
-            "Pixel Creator",
-            std::env::temp_dir(),
-            "validate change",
-        );
+        let mut job = JobState::new(job_id, "Sandbox", std::env::temp_dir(), "validate change");
         job.status = status;
         job.iteration = 2;
         job.created_unix_seconds = 120;
@@ -250,52 +527,198 @@ mod tests {
         let directory = home();
         let store = StateStore::new(&LyaHome::from_path(&directory));
 
+        assert_eq!(store.load_all().expect("missing state should load"), vec![]);
+        assert_eq!(store.load_job("absent").expect("missing job"), None);
+        fs::remove_dir_all(directory).expect("home should be removed");
+    }
+
+    #[test]
+    fn saves_and_loads_state_per_job() {
+        let directory = home();
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+        let first = job("job-one", JobStatus::Running);
+        let second = job("job-two", JobStatus::Paused);
+
+        store.save_job(&first).expect("first job should save");
+        store.save_job(&second).expect("second job should save");
+
         assert_eq!(
-            store.load().expect("missing state should load"),
-            OrchestratorState::default()
+            store.load_job("job-one").expect("job should load"),
+            Some(first.clone())
         );
+        assert_eq!(
+            store.load_all().expect("jobs should load"),
+            vec![first, second]
+        );
+        assert!(store.job_state_path("job-one").expect("path").is_file());
         fs::remove_dir_all(directory).expect("home should be removed");
     }
 
     #[test]
-    fn saves_and_loads_state() {
+    fn save_replaces_existing_job_without_touching_other_jobs() {
         let directory = home();
         let store = StateStore::new(&LyaHome::from_path(&directory));
-        let mut state = OrchestratorState::default();
-        state.upsert(job("pixel-creator", JobStatus::Running));
+        let other = job("job-other", JobStatus::Running);
+        store.save_job(&other).expect("other job should save");
+        store
+            .save_job(&job("job-one", JobStatus::Running))
+            .expect("first state should save");
+        let replacement = job("job-one", JobStatus::Stopped);
 
-        store.save(&state).expect("state should save");
+        store
+            .save_job(&replacement)
+            .expect("replacement should save");
 
-        assert_eq!(store.load().expect("state should load"), state);
-        assert!(store.path().is_file());
-        fs::remove_dir_all(directory).expect("home should be removed");
-    }
-
-    #[test]
-    fn save_replaces_existing_state() {
-        let directory = home();
-        let store = StateStore::new(&LyaHome::from_path(&directory));
-        let mut first = OrchestratorState::default();
-        first.upsert(job("pixel-creator", JobStatus::Running));
-        store.save(&first).expect("first state should save");
-        let mut second = OrchestratorState::default();
-        second.upsert(job("pixel-creator", JobStatus::Stopped));
-
-        store.save(&second).expect("replacement state should save");
-
-        assert_eq!(store.load().expect("state should load"), second);
+        assert_eq!(
+            store.load_job("job-one").expect("state should load"),
+            Some(replacement)
+        );
+        assert_eq!(
+            store.load_job("job-other").expect("state should load"),
+            Some(other)
+        );
         fs::remove_dir_all(directory).expect("home should be removed");
     }
 
     #[test]
     fn reports_invalid_json() {
         let directory = home();
-        fs::write(directory.join("state.json"), "not JSON").expect("state should be written");
         let store = StateStore::new(&LyaHome::from_path(&directory));
+        let path = store.job_state_path("broken").expect("path");
+        fs::create_dir_all(path.parent().expect("parent")).expect("directory should be created");
+        fs::write(&path, "not JSON").expect("state should be written");
 
-        let error = store.load().expect_err("invalid JSON should fail");
+        let error = store
+            .load_job("broken")
+            .expect_err("invalid JSON should fail");
 
         assert!(error.to_string().contains("invalid JSON"));
         fs::remove_dir_all(directory).expect("home should be removed");
+    }
+
+    #[test]
+    fn rejects_unsafe_job_identifiers() {
+        assert!(validate_job_id("job-1").is_ok());
+        assert!(validate_job_id("..").is_err());
+        assert!(validate_job_id("a/b").is_err());
+        assert!(validate_job_id("a\\b").is_err());
+        assert!(validate_job_id("").is_err());
+    }
+
+    #[test]
+    fn migrates_legacy_state_file_without_losing_jobs() {
+        let directory = home();
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+        let mut legacy = OrchestratorState::default();
+        legacy.upsert(job("legacy-one", JobStatus::Paused));
+        legacy.upsert(job("legacy-two", JobStatus::WaitingClaudeQuota));
+        fs::write(
+            store.legacy_state_path(),
+            serde_json::to_vec_pretty(&legacy).expect("legacy state should serialize"),
+        )
+        .expect("legacy state should be written");
+
+        let report = store.migrate_legacy().expect("migration should succeed");
+
+        assert_eq!(report.migrated, vec!["legacy-one", "legacy-two"]);
+        assert!(report.kept_existing.is_empty());
+        assert_eq!(
+            store
+                .load_job("legacy-one")
+                .expect("job should load")
+                .map(|job| job.status),
+            Some(JobStatus::Paused)
+        );
+        assert!(!store.legacy_state_path().exists());
+        assert!(
+            report
+                .archived_legacy_path
+                .as_ref()
+                .expect("legacy file should be archived")
+                .is_file()
+        );
+        fs::remove_dir_all(directory).expect("home should be removed");
+    }
+
+    #[test]
+    fn migration_never_overwrites_an_existing_per_job_state() {
+        let directory = home();
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+        let current = job("shared", JobStatus::Paused);
+        store.save_job(&current).expect("current job should save");
+        let mut legacy = OrchestratorState::default();
+        legacy.upsert(job("shared", JobStatus::Failed));
+        fs::write(
+            store.legacy_state_path(),
+            serde_json::to_vec_pretty(&legacy).expect("legacy state should serialize"),
+        )
+        .expect("legacy state should be written");
+
+        let report = store.migrate_legacy().expect("migration should succeed");
+
+        assert_eq!(report.kept_existing, vec!["shared"]);
+        assert!(report.migrated.is_empty());
+        assert_eq!(
+            store.load_job("shared").expect("job should load"),
+            Some(current)
+        );
+        fs::remove_dir_all(directory).expect("home should be removed");
+    }
+
+    #[test]
+    fn legacy_job_state_without_milestone_eight_fields_still_loads() {
+        let directory = home();
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+        let path = store.job_state_path("old-job").expect("path");
+        fs::create_dir_all(path.parent().expect("parent")).expect("directory should be created");
+        let legacy_json = serde_json::json!({
+            "job_id": "old-job",
+            "project_name": "Sandbox",
+            "project_path": std::env::temp_dir(),
+            "task": "older task",
+            "status": "PAUSED",
+            "iteration": 3,
+            "phase": "SUPERVISOR",
+            "claude_session_id": "session-9",
+            "last_executor_report": null,
+            "last_supervisor_decision": null,
+            "accepted_repository_state": null,
+            "publish_result": null,
+            "publish_stage": null,
+            "created_unix_seconds": 10,
+            "last_updated_unix_seconds": 20
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy_json).expect("legacy job should serialize"),
+        )
+        .expect("legacy job should be written");
+
+        let loaded = store
+            .load_job("old-job")
+            .expect("legacy job should load")
+            .expect("legacy job should exist");
+
+        assert_eq!(loaded.status, JobStatus::Paused);
+        assert_eq!(loaded.run, super::RunConfiguration::default());
+        assert_eq!(loaded.pending_operation, None);
+        assert!(loaded.applied_user_instructions.is_empty());
+        assert!(loaded.last_repository_state.is_none());
+        fs::remove_dir_all(directory).expect("home should be removed");
+    }
+
+    #[test]
+    fn tracks_active_instruction_budget() {
+        let mut state = job("budget", JobStatus::Running);
+        state.applied_user_instructions.push("abc".to_owned());
+        state.pending_user_instructions.push("de".to_owned());
+
+        assert_eq!(state.active_instruction_count(), 2);
+        assert_eq!(state.active_instruction_bytes(), 5);
+    }
+
+    #[test]
+    fn current_time_is_monotonic_enough_for_state_timestamps() {
+        assert!(current_unix_seconds() > 1_600_000_000);
     }
 }

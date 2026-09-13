@@ -137,6 +137,16 @@ impl fmt::Display for LlmError {
     }
 }
 
+impl Error for LlmError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Network(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::Http { .. } | Self::NoChoices | Self::MissingContent => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ChatMessage, ToolDefinition};
@@ -169,15 +179,5 @@ mod tests {
         assert_eq!(message.role, "tool");
         assert_eq!(message.tool_call_id.as_deref(), Some("call_123"));
         assert_eq!(message.content.as_deref(), Some(r#"{"directory":"/tmp"}"#));
-    }
-}
-
-impl Error for LlmError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Network(error) => Some(error),
-            Self::Json(error) => Some(error),
-            Self::Http { .. } | Self::NoChoices | Self::MissingContent => None,
-        }
     }
 }

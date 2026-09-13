@@ -75,8 +75,32 @@ pub struct PublishRequest {
     pub commit_title: String,
 }
 
+/// Everything a later process needs to decide whether an interrupted publication may continue.
+/// `recorded_stage` and `recorded_result` come from authoritative job state, never from events.
+#[derive(Debug, Clone)]
+pub struct PublishRecoveryRequest {
+    pub project_path: PathBuf,
+    pub accepted_repository_state: RepositoryState,
+    pub commit_title: String,
+    pub recorded_stage: Option<PublishStage>,
+    pub recorded_result: Option<PublishResult>,
+}
+
+impl PublishRecoveryRequest {
+    fn into_publish_request(self) -> PublishRequest {
+        PublishRequest {
+            project_path: self.project_path,
+            accepted_repository_state: self.accepted_repository_state,
+            commit_title: self.commit_title,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PushStatus {
+    /// The commit exists locally and has not been pushed yet.
+    #[serde(rename = "PENDING")]
+    Pending,
     #[serde(rename = "PUSHED")]
     Pushed,
     #[serde(rename = "REJECTED")]
@@ -120,10 +144,28 @@ pub trait Publisher: Send + Sync {
         request: PublishRequest,
         progress: &'a mut dyn PublishProgress,
     ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>>;
+
+    /// Continue a publication that a previous process left unfinished.
+    ///
+    /// Every invariant is proven against the live repository before any Git write. Anything that
+    /// cannot be proven is reported as [`PublishError::RecoveryAmbiguous`] so the caller can park
+    /// the job for a human instead of guessing.
+    fn recover<'a>(
+        &'a self,
+        request: PublishRecoveryRequest,
+        progress: &'a mut dyn PublishProgress,
+    ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>>;
 }
 
 pub trait PublishProgress: Send {
     fn record(&mut self, stage: PublishStage) -> Result<(), PublishError>;
+
+    /// Durably record a commit that now exists locally.
+    ///
+    /// The publisher calls this immediately after `git commit` succeeds and before any further
+    /// step, so a real commit can never exist without authoritative state describing its SHA,
+    /// remote, branch and push state.
+    fn record_commit(&mut self, result: &PublishResult) -> Result<(), PublishError>;
 
     fn stop_requested(&self) -> bool {
         false
@@ -135,6 +177,10 @@ pub struct NoopPublishProgress;
 
 impl PublishProgress for NoopPublishProgress {
     fn record(&mut self, _stage: PublishStage) -> Result<(), PublishError> {
+        Ok(())
+    }
+
+    fn record_commit(&mut self, _result: &PublishResult) -> Result<(), PublishError> {
         Ok(())
     }
 }
@@ -186,35 +232,7 @@ impl<R: ProcessRunner> GitPublisher<R> {
         {
             return Err(PublishError::RepositorySnapshotIncomplete);
         }
-        let current_branch = self
-            .run_git(
-                &request.project_path,
-                vec!["branch".to_owned(), "--show-current".to_owned()],
-                "read current branch",
-            )
-            .await?;
-        if current_branch.trim() != self.config.branch {
-            return Err(PublishError::WrongBranch {
-                expected: self.config.branch.clone(),
-                actual: current_branch.trim().to_owned(),
-            });
-        }
-        self.run_git(
-            &request.project_path,
-            vec![
-                "remote".to_owned(),
-                "get-url".to_owned(),
-                self.config.remote.clone(),
-            ],
-            "read configured remote",
-        )
-        .await
-        .map_err(|error| match error {
-            PublishError::GitCommandFailed { .. } => {
-                PublishError::MissingRemote(self.config.remote.clone())
-            }
-            error => error,
-        })?;
+        self.verify_branch_and_remote(&request.project_path).await?;
         let current_state = RepositoryState::collect(&self.runner, &request.project_path)
             .await
             .map_err(PublishError::Repository)?;
@@ -258,19 +276,7 @@ impl<R: ProcessRunner> GitPublisher<R> {
                 "read staged names",
             )
             .await?;
-        let expected_names = request
-            .accepted_repository_state
-            .changed_files
-            .iter()
-            .chain(
-                request
-                    .accepted_repository_state
-                    .untracked_files
-                    .iter()
-                    .map(|file| &file.path),
-            )
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let expected_names = self.expected_published_paths(&request.accepted_repository_state);
         let staged_names = cached_names
             .lines()
             .map(str::to_owned)
@@ -318,6 +324,229 @@ impl<R: ProcessRunner> GitPublisher<R> {
         }
         Ok(())
     }
+
+    fn expected_published_paths(&self, state: &RepositoryState) -> BTreeSet<String> {
+        state
+            .changed_files
+            .iter()
+            .chain(state.untracked_files.iter().map(|file| &file.path))
+            .cloned()
+            .collect()
+    }
+
+    async fn verify_branch_and_remote(&self, project_path: &Path) -> Result<(), PublishError> {
+        let current_branch = self
+            .run_git(
+                project_path,
+                vec!["branch".to_owned(), "--show-current".to_owned()],
+                "read current branch",
+            )
+            .await?;
+        if current_branch.trim() != self.config.branch {
+            return Err(PublishError::WrongBranch {
+                expected: self.config.branch.clone(),
+                actual: current_branch.trim().to_owned(),
+            });
+        }
+        self.run_git(
+            project_path,
+            vec![
+                "remote".to_owned(),
+                "get-url".to_owned(),
+                self.config.remote.clone(),
+            ],
+            "read configured remote",
+        )
+        .await
+        .map_err(|error| match error {
+            PublishError::GitCommandFailed { .. } => {
+                PublishError::MissingRemote(self.config.remote.clone())
+            }
+            error => error,
+        })?;
+        Ok(())
+    }
+
+    /// Create the commit and record it durably before doing anything else.
+    async fn commit_accepted_state(
+        &self,
+        request: &PublishRequest,
+        progress: &mut dyn PublishProgress,
+    ) -> Result<PublishResult, PublishError> {
+        progress.record(PublishStage::Committing)?;
+        self.run_git(
+            &request.project_path,
+            vec![
+                "-c".to_owned(),
+                format!("user.name={}", self.config.identity.name),
+                "-c".to_owned(),
+                format!("user.email={}", self.config.identity.email),
+                "commit".to_owned(),
+                "-m".to_owned(),
+                request.commit_title.clone(),
+            ],
+            "commit staged changes",
+        )
+        .await?;
+        let commit_sha = self
+            .run_git(
+                &request.project_path,
+                vec!["rev-parse".to_owned(), "HEAD".to_owned()],
+                "read committed SHA",
+            )
+            .await?
+            .trim()
+            .to_owned();
+        let result = PublishResult {
+            commit_sha,
+            commit_title: request.commit_title.clone(),
+            remote: self.config.remote.clone(),
+            branch: self.config.branch.clone(),
+            push_status: PushStatus::Pending,
+        };
+        progress.record_commit(&result)?;
+        progress.record(PublishStage::Committed)?;
+        Ok(result)
+    }
+
+    async fn push_commit(
+        &self,
+        project_path: &Path,
+        result: PublishResult,
+        progress: &mut dyn PublishProgress,
+    ) -> Result<PublishResult, PublishError> {
+        progress.record(PublishStage::Pushing)?;
+        match self
+            .run_git(
+                project_path,
+                vec![
+                    "push".to_owned(),
+                    result.remote.clone(),
+                    result.branch.clone(),
+                ],
+                "push committed changes",
+            )
+            .await
+        {
+            Ok(_) => {
+                let pushed = PublishResult {
+                    push_status: PushStatus::Pushed,
+                    ..result
+                };
+                progress.record_commit(&pushed)?;
+                progress.record(PublishStage::Pushed)?;
+                Ok(pushed)
+            }
+            Err(PublishError::GitCommandFailed { .. }) => {
+                let rejected = PublishResult {
+                    push_status: PushStatus::Rejected,
+                    ..result
+                };
+                progress.record_commit(&rejected)?;
+                Err(PublishError::PushRejected(rejected))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Prove that the commit recorded in job state is exactly the commit Lya created from the
+    /// accepted snapshot, without mutating Git in any way.
+    async fn verify_recorded_commit(
+        &self,
+        request: &PublishRecoveryRequest,
+        result: &PublishResult,
+    ) -> Result<(), PublishError> {
+        if result.remote != self.config.remote || result.branch != self.config.branch {
+            return Err(PublishError::RecoveryAmbiguous(format!(
+                "recorded publication targets {}/{} but the current configuration targets {}/{}",
+                result.remote, result.branch, self.config.remote, self.config.branch
+            )));
+        }
+        if result.commit_title != request.commit_title {
+            return Err(PublishError::RecoveryAmbiguous(
+                "recorded commit title does not match the accepted commit title".to_owned(),
+            ));
+        }
+        self.verify_branch_and_remote(&request.project_path).await?;
+        let head = self
+            .run_git(
+                &request.project_path,
+                vec!["rev-parse".to_owned(), "HEAD".to_owned()],
+                "read current HEAD",
+            )
+            .await?;
+        if head.trim() != result.commit_sha {
+            return Err(PublishError::RecoveryAmbiguous(format!(
+                "HEAD is {} but the recorded commit is {}",
+                head.trim(),
+                result.commit_sha
+            )));
+        }
+        let parents = self
+            .run_git(
+                &request.project_path,
+                vec![
+                    "rev-list".to_owned(),
+                    "--parents".to_owned(),
+                    "-n".to_owned(),
+                    "1".to_owned(),
+                    "HEAD".to_owned(),
+                ],
+                "read commit parents",
+            )
+            .await?;
+        let mut parts = parents.split_whitespace();
+        let _commit = parts.next();
+        let parents = parts.collect::<Vec<_>>();
+        if parents.len() != 1 || parents[0] != request.accepted_repository_state.head {
+            return Err(PublishError::RecoveryAmbiguous(format!(
+                "recorded commit does not have the accepted snapshot {} as its only parent",
+                request.accepted_repository_state.head
+            )));
+        }
+        let subject = self
+            .run_git(
+                &request.project_path,
+                vec!["log".to_owned(), "-1".to_owned(), "--format=%s".to_owned()],
+                "read commit subject",
+            )
+            .await?;
+        if subject.trim() != request.commit_title.trim() {
+            return Err(PublishError::RecoveryAmbiguous(
+                "the commit at HEAD does not carry the accepted commit title".to_owned(),
+            ));
+        }
+        let committed_names = self
+            .run_git(
+                &request.project_path,
+                vec![
+                    "diff".to_owned(),
+                    "--name-only".to_owned(),
+                    "HEAD~1".to_owned(),
+                    "HEAD".to_owned(),
+                ],
+                "read committed paths",
+            )
+            .await?
+            .lines()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let expected_names = self.expected_published_paths(&request.accepted_repository_state);
+        if committed_names != expected_names {
+            return Err(PublishError::RecoveryAmbiguous(
+                "the commit at HEAD does not contain exactly the accepted paths".to_owned(),
+            ));
+        }
+        let current_state = RepositoryState::collect(&self.runner, &request.project_path)
+            .await
+            .map_err(PublishError::Repository)?;
+        if !current_state.is_clean() {
+            return Err(PublishError::RecoveryAmbiguous(
+                "the working tree is not clean, so the recorded commit cannot be confirmed as the only change".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<R: ProcessRunner> Publisher for GitPublisher<R> {
@@ -360,67 +589,136 @@ impl<R: ProcessRunner> Publisher for GitPublisher<R> {
             if progress.stop_requested() {
                 return Err(PublishError::Stopped);
             }
-            progress.record(PublishStage::Committing)?;
-            self.run_git(
-                &request.project_path,
-                vec![
-                    "-c".to_owned(),
-                    format!("user.name={}", self.config.identity.name),
-                    "-c".to_owned(),
-                    format!("user.email={}", self.config.identity.email),
-                    "commit".to_owned(),
-                    "-m".to_owned(),
-                    request.commit_title.clone(),
-                ],
-                "commit staged changes",
-            )
-            .await?;
-            let commit_sha = self
-                .run_git(
-                    &request.project_path,
-                    vec!["rev-parse".to_owned(), "HEAD".to_owned()],
-                    "read committed SHA",
-                )
-                .await?
-                .trim()
-                .to_owned();
-            progress.record(PublishStage::Committed)?;
-            let result = PublishResult {
-                commit_sha,
-                commit_title: request.commit_title,
-                remote: self.config.remote.clone(),
-                branch: self.config.branch.clone(),
-                push_status: PushStatus::Pushed,
-            };
+            let result = self.commit_accepted_state(&request, progress).await?;
             if progress.stop_requested() {
                 return Err(PublishError::Stopped);
             }
-            progress.record(PublishStage::Pushing)?;
-            match self
+            self.push_commit(&request.project_path, result, progress)
+                .await
+        })
+    }
+
+    fn recover<'a>(
+        &'a self,
+        request: PublishRecoveryRequest,
+        progress: &'a mut dyn PublishProgress,
+    ) -> Pin<Box<dyn Future<Output = Result<PublishResult, PublishError>> + Send + 'a>> {
+        Box::pin(async move {
+            if progress.stop_requested() {
+                return Err(PublishError::Stopped);
+            }
+            if !request
+                .accepted_repository_state
+                .is_complete_for_publication()
+            {
+                return Err(PublishError::RepositorySnapshotIncomplete);
+            }
+            if let Some(result) = request.recorded_result.clone() {
+                if result.push_status == PushStatus::Pushed {
+                    return Ok(result);
+                }
+                progress.record(PublishStage::Verifying)?;
+                self.verify_recorded_commit(&request, &result).await?;
+                if progress.stop_requested() {
+                    return Err(PublishError::Stopped);
+                }
+                let project_path = request.project_path.clone();
+                return self.push_commit(&project_path, result, progress).await;
+            }
+
+            // No commit was recorded, so no commit may exist. Prove HEAD never moved before
+            // considering any continuation.
+            self.verify_branch_and_remote(&request.project_path).await?;
+            let head = self
                 .run_git(
                     &request.project_path,
-                    vec![
-                        "push".to_owned(),
-                        result.remote.clone(),
-                        result.branch.clone(),
-                    ],
-                    "push committed changes",
+                    vec!["rev-parse".to_owned(), "HEAD".to_owned()],
+                    "read current HEAD",
                 )
-                .await
-            {
-                Ok(_) => {
-                    progress.record(PublishStage::Pushed)?;
-                    Ok(result)
+                .await?;
+            if head.trim() != request.accepted_repository_state.head {
+                return Err(PublishError::RecoveryAmbiguous(format!(
+                    "HEAD is {} but no commit was recorded for the accepted snapshot {}",
+                    head.trim(),
+                    request.accepted_repository_state.head
+                )));
+            }
+            match request.recorded_stage {
+                Some(PublishStage::Committed | PublishStage::Pushing | PublishStage::Pushed) => {
+                    Err(PublishError::RecoveryAmbiguous(
+                        "a commit stage was recorded without an authoritative commit".to_owned(),
+                    ))
                 }
-                Err(PublishError::GitCommandFailed { .. }) => {
-                    Err(PublishError::PushRejected(PublishResult {
-                        push_status: PushStatus::Rejected,
-                        ..result
-                    }))
+                Some(PublishStage::Staging | PublishStage::Staged | PublishStage::Committing) => {
+                    let publish_request = request.into_publish_request();
+                    match self.verify_before_staging(&publish_request).await {
+                        // Nothing was staged yet: the ordinary guarded sequence applies.
+                        Ok(()) => {
+                            self.publish_staged_sequence(publish_request, progress)
+                                .await
+                        }
+                        Err(PublishError::RepositoryChangedAfterReview) => {
+                            // The index may already hold exactly the accepted change.
+                            self.verify_staged_state(&publish_request)
+                                .await
+                                .map_err(|_| {
+                                    PublishError::RecoveryAmbiguous(
+                                        "the working tree and the index both differ from the accepted snapshot".to_owned(),
+                                    )
+                                })?;
+                            if progress.stop_requested() {
+                                return Err(PublishError::Stopped);
+                            }
+                            progress.record(PublishStage::Staged)?;
+                            let result = self
+                                .commit_accepted_state(&publish_request, progress)
+                                .await?;
+                            if progress.stop_requested() {
+                                return Err(PublishError::Stopped);
+                            }
+                            self.push_commit(&publish_request.project_path, result, progress)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
-                Err(error) => Err(error),
+                None | Some(PublishStage::Verifying) => {
+                    self.publish(request.into_publish_request(), progress).await
+                }
             }
         })
+    }
+}
+
+impl<R: ProcessRunner> GitPublisher<R> {
+    /// The guarded sequence from staging onwards, shared by a fresh publication and a recovery
+    /// that proved the repository still matches the accepted snapshot.
+    async fn publish_staged_sequence(
+        &self,
+        request: PublishRequest,
+        progress: &mut dyn PublishProgress,
+    ) -> Result<PublishResult, PublishError> {
+        if progress.stop_requested() {
+            return Err(PublishError::Stopped);
+        }
+        progress.record(PublishStage::Staging)?;
+        self.run_git(
+            &request.project_path,
+            vec!["add".to_owned(), "--all".to_owned()],
+            "stage accepted changes",
+        )
+        .await?;
+        self.verify_staged_state(&request).await?;
+        if progress.stop_requested() {
+            return Err(PublishError::Stopped);
+        }
+        progress.record(PublishStage::Staged)?;
+        let result = self.commit_accepted_state(&request, progress).await?;
+        if progress.stop_requested() {
+            return Err(PublishError::Stopped);
+        }
+        self.push_commit(&request.project_path, result, progress)
+            .await
     }
 }
 
@@ -441,6 +739,7 @@ pub enum PublishError {
     MissingRemote(String),
     StagedStateMismatch,
     Stopped,
+    RecoveryAmbiguous(String),
     PushRejected(PublishResult),
     Repository(RepositoryError),
     Process(ProcessError),
@@ -473,6 +772,10 @@ impl fmt::Display for PublishError {
             Self::MissingRemote(remote) => write!(formatter, "configured Git remote does not exist: {remote}"),
             Self::StagedStateMismatch => formatter.write_str("staged state does not match the accepted repository snapshot"),
             Self::Stopped => formatter.write_str("publication stopped by user request"),
+            Self::RecoveryAmbiguous(reason) => write!(
+                formatter,
+                "interrupted publication cannot be recovered safely: {reason}"
+            ),
             Self::PushRejected(result) => write!(
                 formatter,
                 "push rejected after local commit {} to {}/{}",
@@ -511,8 +814,8 @@ mod tests {
     };
 
     use super::{
-        GitPublishConfig, GitPublisher, NoopPublishProgress, PublishError, PublishRequest,
-        Publisher, PushStatus,
+        GitPublishConfig, GitPublisher, NoopPublishProgress, PublishError, PublishProgress,
+        PublishRecoveryRequest, PublishRequest, PublishResult, PublishStage, Publisher, PushStatus,
     };
     use crate::{
         orchestrator::repository::RepositoryState,
@@ -848,6 +1151,387 @@ mod tests {
             GitPublishConfig::new("Test", "", "origin", "main"),
             Err(PublishError::MissingIdentity("LYA_GIT_EMAIL"))
         ));
+        clean_up(&work);
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingProgress {
+        stages: Vec<PublishStage>,
+        commits: Vec<PublishResult>,
+        stop_after: Option<PublishStage>,
+        stopped: bool,
+    }
+
+    impl RecordingProgress {
+        fn stopping_after(stage: PublishStage) -> Self {
+            Self {
+                stop_after: Some(stage),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl PublishProgress for RecordingProgress {
+        fn record(&mut self, stage: PublishStage) -> Result<(), PublishError> {
+            if self.stop_after.as_ref() == Some(&stage) {
+                self.stopped = true;
+            }
+            self.stages.push(stage);
+            Ok(())
+        }
+
+        fn record_commit(&mut self, result: &PublishResult) -> Result<(), PublishError> {
+            self.commits.push(result.clone());
+            Ok(())
+        }
+
+        fn stop_requested(&self) -> bool {
+            self.stopped
+        }
+    }
+
+    fn remote_head(remote: &Path) -> String {
+        git(
+            remote.parent().expect("remote parent should exist"),
+            &[
+                "--git-dir",
+                remote.to_str().expect("remote path should be UTF-8"),
+                "rev-parse",
+                "main",
+            ],
+        )
+        .trim()
+        .to_owned()
+    }
+
+    fn commit_count(work: &Path) -> usize {
+        git(work, &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse()
+            .expect("commit count should parse")
+    }
+
+    async fn recovery(
+        work: &Path,
+        accepted: &PublishRequest,
+        stage: Option<PublishStage>,
+        result: Option<PublishResult>,
+    ) -> PublishRecoveryRequest {
+        PublishRecoveryRequest {
+            project_path: work.to_owned(),
+            accepted_repository_state: accepted.accepted_repository_state.clone(),
+            commit_title: accepted.commit_title.clone(),
+            recorded_stage: stage,
+            recorded_result: result,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_is_recorded_before_any_later_publication_step() {
+        let (work, _) = directories("record-commit");
+        fs::write(work.join("hello.txt"), "recorded commit\n").expect("change should be written");
+        let publisher = GitPublisher::new(config());
+        let mut progress = RecordingProgress::default();
+
+        publisher
+            .publish(request(&work, "Recorded commit").await, &mut progress)
+            .await
+            .expect("publication should succeed");
+
+        let first_commit = progress
+            .commits
+            .first()
+            .expect("a commit must be recorded")
+            .clone();
+        assert_eq!(first_commit.push_status, PushStatus::Pending);
+        assert_eq!(
+            first_commit.commit_sha,
+            git(&work, &["rev-parse", "HEAD"]).trim()
+        );
+        assert_eq!(first_commit.remote, "origin");
+        assert_eq!(first_commit.branch, "main");
+        let committed_index = progress
+            .stages
+            .iter()
+            .position(|stage| stage == &PublishStage::Committed)
+            .expect("the committed stage should be recorded");
+        assert!(
+            progress.stages[..committed_index]
+                .iter()
+                .all(|stage| stage != &PublishStage::Pushing),
+            "no push stage may precede the recorded commit"
+        );
+        assert_eq!(
+            progress.commits.last().expect("final state").push_status,
+            PushStatus::Pushed
+        );
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn a_stop_between_committing_and_pushing_still_records_the_existing_commit() {
+        let (work, remote) = directories("stop-after-commit");
+        let remote_before = remote_head(&remote);
+        fs::write(work.join("hello.txt"), "committed not pushed\n")
+            .expect("change should be written");
+        let publisher = GitPublisher::new(config());
+        let mut progress = RecordingProgress::stopping_after(PublishStage::Committed);
+
+        let error = publisher
+            .publish(
+                request(&work, "Committed but not pushed").await,
+                &mut progress,
+            )
+            .await
+            .expect_err("a stop must interrupt publication");
+
+        assert!(matches!(error, PublishError::Stopped));
+        let recorded = progress
+            .commits
+            .last()
+            .expect("the commit must be recorded even though the push never happened");
+        assert_eq!(recorded.push_status, PushStatus::Pending);
+        assert_eq!(
+            recorded.commit_sha,
+            git(&work, &["rev-parse", "HEAD"]).trim()
+        );
+        assert_eq!(recorded.remote, "origin");
+        assert_eq!(recorded.branch, "main");
+        assert_eq!(remote_head(&remote), remote_before);
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn recovery_pushes_a_recorded_commit_without_creating_a_second_one() {
+        let (work, remote) = directories("recover-push");
+        fs::write(work.join("hello.txt"), "recover me\n").expect("change should be written");
+        let accepted = request(&work, "Recover this commit").await;
+        let publisher = GitPublisher::new(config());
+        let mut interrupted = RecordingProgress::stopping_after(PublishStage::Committed);
+        publisher
+            .publish(accepted.clone(), &mut interrupted)
+            .await
+            .expect_err("publication is interrupted on purpose");
+        let recorded = interrupted
+            .commits
+            .last()
+            .expect("commit should be recorded")
+            .clone();
+        let commits_before = commit_count(&work);
+
+        let mut progress = RecordingProgress::default();
+        let result = publisher
+            .recover(
+                recovery(
+                    &work,
+                    &accepted,
+                    Some(PublishStage::Committed),
+                    Some(recorded.clone()),
+                )
+                .await,
+                &mut progress,
+            )
+            .await
+            .expect("a proven commit should continue at push");
+
+        assert_eq!(result.push_status, PushStatus::Pushed);
+        assert_eq!(result.commit_sha, recorded.commit_sha);
+        assert_eq!(commit_count(&work), commits_before);
+        assert_eq!(remote_head(&remote), recorded.commit_sha);
+        assert!(
+            !progress.stages.contains(&PublishStage::Committing),
+            "recovery must not commit again"
+        );
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_a_commit_that_does_not_match_the_recorded_state() {
+        let (work, remote) = directories("recover-ambiguous");
+        fs::write(work.join("hello.txt"), "ambiguous\n").expect("change should be written");
+        let accepted = request(&work, "Ambiguous recovery").await;
+        let publisher = GitPublisher::new(config());
+        let mut interrupted = RecordingProgress::stopping_after(PublishStage::Committed);
+        publisher
+            .publish(accepted.clone(), &mut interrupted)
+            .await
+            .expect_err("publication is interrupted on purpose");
+        let mut recorded = interrupted
+            .commits
+            .last()
+            .expect("commit should be recorded")
+            .clone();
+        recorded.commit_sha = "0000000000000000000000000000000000000000".to_owned();
+        let head_before = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+        let remote_before = remote_head(&remote);
+
+        let mut progress = RecordingProgress::default();
+        let error = publisher
+            .recover(
+                recovery(
+                    &work,
+                    &accepted,
+                    Some(PublishStage::Committed),
+                    Some(recorded),
+                )
+                .await,
+                &mut progress,
+            )
+            .await
+            .expect_err("an unproven commit must be refused");
+
+        assert!(matches!(error, PublishError::RecoveryAmbiguous(_)));
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]).trim(), head_before);
+        assert_eq!(remote_head(&remote), remote_before);
+        assert!(
+            !progress.stages.contains(&PublishStage::Pushing),
+            "no Git write may happen before recovery is proven"
+        );
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_an_unrecorded_commit_that_moved_head() {
+        let (work, remote) = directories("recover-unrecorded");
+        fs::write(work.join("hello.txt"), "unrecorded\n").expect("change should be written");
+        let accepted = request(&work, "Unrecorded commit").await;
+        git(&work, &["add", "--all"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=Someone",
+                "-c",
+                "user.email=someone@example.com",
+                "commit",
+                "-m",
+                "Unrecorded commit",
+            ],
+        );
+        let head_before = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+        let remote_before = remote_head(&remote);
+        let publisher = GitPublisher::new(config());
+
+        let mut progress = RecordingProgress::default();
+        let error = publisher
+            .recover(
+                recovery(&work, &accepted, Some(PublishStage::Committing), None).await,
+                &mut progress,
+            )
+            .await
+            .expect_err("a commit without authoritative state must be refused");
+
+        assert!(matches!(error, PublishError::RecoveryAmbiguous(_)));
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]).trim(), head_before);
+        assert_eq!(remote_head(&remote), remote_before);
+        assert!(progress.commits.is_empty());
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn recovery_before_any_commit_runs_the_whole_guarded_sequence() {
+        let (work, remote) = directories("recover-verifying");
+        fs::write(work.join("hello.txt"), "restart cleanly\n").expect("change should be written");
+        let accepted = request(&work, "Restart cleanly").await;
+        let publisher = GitPublisher::new(config());
+
+        let mut progress = RecordingProgress::default();
+        let result = publisher
+            .recover(
+                recovery(&work, &accepted, Some(PublishStage::Verifying), None).await,
+                &mut progress,
+            )
+            .await
+            .expect("an untouched repository restarts the guarded sequence");
+
+        assert_eq!(result.push_status, PushStatus::Pushed);
+        assert_eq!(remote_head(&remote), result.commit_sha);
+        assert!(progress.stages.contains(&PublishStage::Staging));
+        assert!(progress.stages.contains(&PublishStage::Committing));
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn recovery_continues_from_an_index_that_matches_the_accepted_snapshot() {
+        let (work, remote) = directories("recover-staged");
+        fs::write(work.join("hello.txt"), "already staged\n").expect("change should be written");
+        let accepted = request(&work, "Already staged").await;
+        git(&work, &["add", "--all"]);
+        let publisher = GitPublisher::new(config());
+
+        let mut progress = RecordingProgress::default();
+        let result = publisher
+            .recover(
+                recovery(&work, &accepted, Some(PublishStage::Staging), None).await,
+                &mut progress,
+            )
+            .await
+            .expect("a matching index should continue at commit");
+
+        assert_eq!(result.push_status, PushStatus::Pushed);
+        assert_eq!(remote_head(&remote), result.commit_sha);
+        assert_eq!(git(&work, &["show", "HEAD:hello.txt"]), "already staged\n");
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_an_index_that_no_longer_matches_the_accepted_snapshot() {
+        let (work, remote) = directories("recover-staged-mismatch");
+        fs::write(work.join("hello.txt"), "accepted content\n").expect("change should be written");
+        let accepted = request(&work, "Accepted content").await;
+        fs::write(work.join("hello.txt"), "something else entirely\n")
+            .expect("change should be rewritten");
+        git(&work, &["add", "--all"]);
+        let head_before = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+        let remote_before = remote_head(&remote);
+        let publisher = GitPublisher::new(config());
+
+        let mut progress = RecordingProgress::default();
+        let error = publisher
+            .recover(
+                recovery(&work, &accepted, Some(PublishStage::Staged), None).await,
+                &mut progress,
+            )
+            .await
+            .expect_err("a divergent index must be refused");
+
+        assert!(matches!(error, PublishError::RecoveryAmbiguous(_)));
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]).trim(), head_before);
+        assert_eq!(remote_head(&remote), remote_before);
+        assert!(progress.commits.is_empty());
+        clean_up(&work);
+    }
+
+    #[tokio::test]
+    async fn recovery_of_an_already_pushed_commit_changes_nothing() {
+        let (work, remote) = directories("recover-published");
+        fs::write(work.join("hello.txt"), "already pushed\n").expect("change should be written");
+        let accepted = request(&work, "Already pushed").await;
+        let publisher = GitPublisher::new(config());
+        let published = publish(&publisher, accepted.clone())
+            .await
+            .expect("publication should succeed");
+        let commits_before = commit_count(&work);
+
+        let mut progress = RecordingProgress::default();
+        let result = publisher
+            .recover(
+                recovery(
+                    &work,
+                    &accepted,
+                    Some(PublishStage::Pushed),
+                    Some(published.clone()),
+                )
+                .await,
+                &mut progress,
+            )
+            .await
+            .expect("an already pushed commit is already complete");
+
+        assert_eq!(result, published);
+        assert_eq!(commit_count(&work), commits_before);
+        assert_eq!(remote_head(&remote), published.commit_sha);
+        assert!(progress.stages.is_empty());
         clean_up(&work);
     }
 }
