@@ -1,0 +1,10 @@
+# Normalize line endings on commit; check out with the platform's native endings.
+* text=auto
+
+# Files a POSIX shell or a Linux runner reads must stay LF everywhere, so a CRLF
+# checkout on Windows cannot be committed back and break a workflow step.
+*.sh text eol=lf
+.github/workflows/*.yml text eol=lf
+
+# Keep generated diffs out of review noise.
+Cargo.lock linguist-generated=true

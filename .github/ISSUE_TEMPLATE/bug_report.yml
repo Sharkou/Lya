@@ -1,0 +1,129 @@
+name: Bug report
+description: Something does not work the way the documentation says it does
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting.
+
+        **Do not use this form for a security vulnerability.** Report those privately through
+        [SECURITY.md](https://github.com/Sharkou/Lya/blob/main/SECURITY.md).
+
+        Please redact credentials, private paths and private repository content from anything you
+        paste. `context.md` and `events.jsonl` can contain sensitive material.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before reporting
+      options:
+        - label: I checked [Troubleshooting](https://github.com/Sharkou/Lya/blob/main/docs/troubleshooting.md)
+          required: true
+        - label: I ran `lya doctor` and every line reads `OK`, or the failing line is the bug
+          required: true
+        - label: This is not a security vulnerability
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, in order.
+      placeholder: |
+        1. cd /path/to/a/clean/git/repository
+        2. lya run --max-iterations 3 "..."
+        3. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Exact error output
+      description: Copy the message verbatim, redacted as needed.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`lya doctor` output"
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which command
+      options:
+        - "lya <prompt> (local agent mode)"
+        - lya doctor
+        - lya supervisor
+        - lya executor
+        - lya run
+        - lya resume
+        - lya jobs
+        - lya scheduler
+        - lya daemon (start / run / status / stop)
+        - lya submit
+        - lya attach
+        - lya control
+        - Something else / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS (Apple silicon)
+        - macOS (Intel)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Lya version
+      description: The release tag, or the commit SHA for a source build.
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it
+      options:
+        - Prebuilt release archive
+        - Built from source
+    validations:
+      required: true
+
+  - type: textarea
+    id: state
+    attributes:
+      label: Job state, if a job is involved
+      description: "Output of `lya jobs --json` for the affected job, plus the relevant slice of `events.jsonl`. Redact as needed."
+      render: json
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Provider versions, whether a daemon was running, unusual `LYA_HOME`, anything you already tried.

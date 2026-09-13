@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/Sharkou/Lya/blob/main/docs/README.md
+    about: Installation, CLI reference, configuration, architecture and security — the source of truth.
+  - name: Troubleshooting
+    url: https://github.com/Sharkou/Lya/blob/main/docs/troubleshooting.md
+    about: Concrete failures, their real error messages, and what to do. Start here.
+  - name: Report a security vulnerability
+    url: https://github.com/Sharkou/Lya/security/advisories/new
+    about: Please report vulnerabilities privately, never as a public issue.

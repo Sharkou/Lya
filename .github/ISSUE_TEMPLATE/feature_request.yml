@@ -1,0 +1,72 @@
+name: Feature request
+description: Propose a capability or a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Lya deliberately avoids abstractions before they are needed and prefers small,
+        understandable components over a framework. A proposal that fits that grain has a much
+        better chance.
+
+        Please check the roadmap in the [README](https://github.com/Sharkou/Lya/blob/main/README.md)
+        and the "not implemented" lists in the docs first — some of this is already planned, and some
+        is deliberately out of scope.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that Lya makes hard or impossible today? Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should happen instead? If it affects the CLI, show the exact commands and output you would expect.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI surface
+        - Autonomous job loop
+        - Supervisor or Executor providers
+        - Scheduler
+        - Daemon
+        - Git publication
+        - Persistence, resume or recovery
+        - Local agent runtime and tools
+        - Security
+        - Documentation
+        - Packaging, CI or releases
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including what you do today as a workaround.
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Effect on safety guarantees
+      description: |
+        Does this touch guarded publication, the locks, resume validation, or the daemon boundary?
+        Lya's rule is that ambiguous state parks a job rather than being guessed at, and that logs
+        are never authority. Say how the proposal preserves that, or why it does not need to.
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to implement this
