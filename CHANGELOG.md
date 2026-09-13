@@ -8,6 +8,21 @@ every release as potentially breaking: the CLI and the public API are still movi
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-09-13
+
+### Fixed
+
+* Windows provider subprocesses launched by Lya are now kept headless with `CREATE_NO_WINDOW`,
+  preventing visible console windows under the daemon and preventing provider processes from being
+  exposed to unrelated console control events such as those that caused Codex to exit with
+  `STATUS_CONTROL_C_EXIT` / `0xC000013A`.
+
+## [0.1.0] — 2026-09-13
+
+The first tagged release. It brought together the autonomous runtime that had accumulated in the
+repository and the packaging, documentation and release infrastructure that made it installable; the
+runtime entries below are listed for completeness so the initial release has a full record.
+
 ### Added
 
 * Documentation set under [`docs/`](docs/README.md), the source of truth: installation, quick start,
@@ -26,24 +41,6 @@ every release as potentially breaking: the CLI and the public API are still movi
 * `lya --help` / `-h` and `lya --version` / `-V`. Help is one screen naming every command; the
   version derives from the crate version at compile time. Both are recognised only as the first
   argument, so `lya run --help` still reports `run`'s own usage.
-
-### Changed
-
-* The published executable is now named `lya` on every platform, via an explicit `[[bin]]` target.
-  Cargo previously derived `Lya.exe` / `Lya` from the package name, which did not match the
-  documented command. The package and library names are unchanged.
-* `README.md` is now a landing page; its reference material moved into `docs/` rather than being
-  deleted.
-* The Supervisor system prompt escalates to "the project owner" instead of naming an individual, and
-  test fixtures use generic project names.
-
-## [0.1.0] — unreleased
-
-The first tagged release. Everything below already existed in the repository before this milestone;
-it is listed here so the initial release has a complete record.
-
-### Added
-
 * **Agent runtime** — a bounded tool-calling loop against an OpenAI-compatible endpoint (Ollama),
   with `get_current_directory`, `read_file`, `write_file`, `create_directory`, `list_directory` and
   `run_command`, confined to `LYA_WORKSPACE`.
@@ -82,5 +79,16 @@ it is listed here so the initial release has a complete record.
   `0700` home), plus `lya submit`, `lya attach` and per-job `lya control`.
 * **Environment diagnostics** — `lya doctor`.
 
-[Unreleased]: https://github.com/Sharkou/Lya/compare/v0.1.0...HEAD
+### Changed
+
+* The published executable is now named `lya` on every platform, via an explicit `[[bin]]` target.
+  Cargo previously derived `Lya.exe` / `Lya` from the package name, which did not match the
+  documented command. The package and library names are unchanged.
+* `README.md` is now a landing page; its reference material moved into `docs/` rather than being
+  deleted.
+* The Supervisor system prompt escalates to "the project owner" instead of naming an individual, and
+  test fixtures use generic project names.
+
+[Unreleased]: https://github.com/Sharkou/Lya/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Sharkou/Lya/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Sharkou/Lya/releases/tag/v0.1.0

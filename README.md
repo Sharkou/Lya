@@ -15,7 +15,7 @@ there. The project favours small, understandable components over a large agent f
 
 ## Status
 
-**Experimental — v0.1.0, under active development.** Commands, APIs and internal architecture may
+**Experimental — v0.1.1, under active development.** Commands, APIs and internal architecture may
 change without a deprecation path while the autonomous runtime is being stabilized.
 
 Lya drives AI tools that modify real repositories, and it is **not a sandbox** for them. Run

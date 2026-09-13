@@ -50,7 +50,7 @@ No Rust toolchain is needed for this path.
 ### Windows (PowerShell)
 
 ```powershell
-$version = "v0.1.0"
+$version = "v0.1.1"
 $archive = "lya-$version-windows-x86_64.zip"
 Invoke-WebRequest -Uri "https://github.com/Sharkou/Lya/releases/download/$version/$archive" -OutFile $archive
 Invoke-WebRequest -Uri "https://github.com/Sharkou/Lya/releases/download/$version/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
@@ -81,7 +81,7 @@ Windows binaries are unsigned, so SmartScreen may warn the first time you run `l
 ### Linux and macOS (bash / zsh)
 
 ```bash
-version=v0.1.0
+version=v0.1.1
 archive=lya-$version-linux-x86_64.tar.gz
 curl -LO "https://github.com/Sharkou/Lya/releases/download/$version/$archive"
 curl -LO "https://github.com/Sharkou/Lya/releases/download/$version/SHA256SUMS.txt"

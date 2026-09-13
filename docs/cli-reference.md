@@ -48,7 +48,7 @@ from `Cargo.toml`:
 
 ```text
 $ lya --version
-lya 0.1.0
+lya 0.1.1
 ```
 
 Both exit `0`, read no environment and contact nothing, so they work on a machine where nothing is
