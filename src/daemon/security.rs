@@ -477,6 +477,217 @@ pub unsafe fn object_dacl_sddl(handle: HANDLE) -> Result<String, SecurityError> 
     sddl
 }
 
+/// One access control entry of a discretionary access control list.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct DaclEntry {
+    /// The rights the entry grants, already mapped from generic to object-specific by Windows.
+    pub mask: u32,
+    pub sid: Sid,
+}
+
+/// The discretionary access control list an object really carries, decoded into principals.
+///
+/// The textual SDDL form is *not* a reliable thing to assert against: Windows renders well-known
+/// security identifiers using their two-letter aliases rather than the literal `S-1-…` string it
+/// was given. A descriptor built from the current user's own SID therefore comes back as `LA` on a
+/// machine where that user happens to be the built-in local `Administrator` account (relative
+/// identifier 500) — which is exactly what a GitHub-hosted Windows runner is. The SID bytes are
+/// unchanged; only their spelling is. So the list is compared by SID, with [`EqualSid`], the same
+/// way peer identity is.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct Dacl {
+    /// Whether `SE_DACL_PROTECTED` is set, which is what `D:P` asks for.
+    pub protected: bool,
+    pub entries: Vec<DaclEntry>,
+}
+
+/// Read back the access control list an already-created kernel object actually carries, decoded.
+///
+/// Exists for tests: a list that was *asked for* is not evidence, and this asks the object itself.
+/// A missing or `NULL` list is an error rather than an empty result — a `NULL` DACL grants every
+/// principal full access, so reporting it as "no entries" would turn the worst case into a pass.
+///
+/// # Safety
+///
+/// `handle` must be an open kernel object handle carrying `READ_CONTROL`.
+#[cfg(test)]
+pub unsafe fn object_dacl(handle: HANDLE) -> Result<Dacl, SecurityError> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_SUCCESS,
+        Security::{
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+            Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT},
+            DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
+            GetSecurityDescriptorDacl, SE_DACL_PROTECTED,
+        },
+    };
+
+    /// `ACCESS_ALLOWED_ACE_TYPE`. Not exported by `windows-sys`; it is zero by definition.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(SecurityError::new(format!(
+            "GetSecurityInfo failed with {status}"
+        )));
+    }
+    // Decoded in one closure so the descriptor is released on every path, including the failing
+    // ones.
+    let decoded = (|| {
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(SecurityError::last("GetSecurityDescriptorControl"));
+        }
+        let mut present = 0;
+        let mut acl: *mut ACL = ptr::null_mut();
+        let mut defaulted = 0;
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }
+            == 0
+        {
+            return Err(SecurityError::last("GetSecurityDescriptorDacl"));
+        }
+        if present == 0 || acl.is_null() {
+            return Err(SecurityError::new(
+                "the object carries no discretionary access control list, which grants every principal full access",
+            ));
+        }
+        let count = unsafe { (*acl).AceCount };
+        let mut entries = Vec::with_capacity(count as usize);
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = ptr::null_mut();
+            if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+                return Err(SecurityError::last("GetAce"));
+            }
+            // SAFETY: `GetAce` handed back a pointer to an entry inside the list it owns, which
+            // begins with an `ACE_HEADER` whatever its type.
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                return Err(SecurityError::new(format!(
+                    "entry {index} is of access control entry type {}, and only allow entries are expected",
+                    header.AceType
+                )));
+            }
+            // SAFETY: the type check above establishes the layout, and the security identifier of
+            // an allow entry begins at its `SidStart` field.
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = unsafe { Sid::from_raw(ptr::from_ref(&allowed.SidStart) as PSID) }?;
+            entries.push(DaclEntry {
+                mask: allowed.Mask,
+                sid,
+            });
+        }
+        Ok(Dacl {
+            protected: control & SE_DACL_PROTECTED != 0,
+            entries,
+        })
+    })();
+    unsafe { LocalFree(descriptor as HLOCAL) };
+    decoded
+}
+
+/// A security identifier parsed from its literal `S-1-…` form.
+///
+/// Literal forms only, deliberately: comparing against `S-1-5-18` rather than the `SY` alias is
+/// what makes these checks independent of how Windows chooses to *spell* a principal.
+#[cfg(test)]
+pub fn sid_from_sddl(text: &str) -> Result<Sid, SecurityError> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+    let wide = to_wide(text);
+    let mut raw: PSID = ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw) } == 0 {
+        return Err(SecurityError::last("ConvertStringSidToSidW"));
+    }
+    // SAFETY: the call succeeded, so `raw` points at a valid SID this scope now owns.
+    let sid = unsafe { Sid::from_raw(raw) };
+    unsafe { LocalFree(raw as HLOCAL) };
+    sid
+}
+
+/// The one definition of what the daemon endpoint's access control list has to be.
+///
+/// Shared by the descriptor test and the live-listener test so the two can never disagree about the
+/// invariant, and expressed as principals rather than as text. Returns the reason on failure so a
+/// caller can report which part of the invariant broke.
+#[cfg(test)]
+pub fn check_endpoint_dacl(dacl: &Dacl, owner: &Sid) -> Result<(), String> {
+    /// `FILE_ALL_ACCESS`: what `GENERIC_ALL` maps to once a descriptor is attached to a pipe.
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+
+    let named = |literal: &str| {
+        sid_from_sddl(literal).map_err(|error| format!("could not parse {literal}: {error}"))
+    };
+    let system = named("S-1-5-18")?;
+    let everyone = named("S-1-1-0")?;
+    let anonymous = named("S-1-5-7")?;
+    let administrators = named("S-1-5-32-544")?;
+
+    if !dacl.protected {
+        return Err("the list must be protected from inheritance".to_owned());
+    }
+    let granted = |who: &Sid| {
+        dacl.entries
+            .iter()
+            .find(|entry| &entry.sid == who)
+            .map(|entry| entry.mask)
+    };
+    match granted(owner) {
+        Some(FILE_ALL_ACCESS) => {}
+        Some(mask) => {
+            return Err(format!(
+                "the owning user is granted {mask:#010x}, not full access ({FILE_ALL_ACCESS:#010x})"
+            ));
+        }
+        None => return Err(format!("the owning user {owner:?} is not granted access")),
+    }
+    match granted(&system) {
+        Some(FILE_ALL_ACCESS) => {}
+        Some(mask) => {
+            return Err(format!(
+                "SYSTEM is granted {mask:#010x}, not full access ({FILE_ALL_ACCESS:#010x})"
+            ));
+        }
+        None => return Err("SYSTEM is not granted access".to_owned()),
+    }
+    for (label, who) in [
+        ("Everyone", &everyone),
+        ("ANONYMOUS LOGON", &anonymous),
+        ("BUILTIN\\Administrators", &administrators),
+    ] {
+        if granted(who).is_some() {
+            return Err(format!("{label} must never be granted access"));
+        }
+    }
+    // Anything beyond those two principals would be an unrelated account gaining control, so the
+    // count is part of the invariant rather than a detail.
+    if dacl.entries.len() != 2 {
+        return Err(format!(
+            "the list must name exactly this user and SYSTEM, but it has {} entries: {:?}",
+            dacl.entries.len(),
+            dacl.entries
+                .iter()
+                .map(|entry| format!("{:?}", entry.sid))
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PipeSecurity, Sid, current_user_sid};
@@ -539,7 +750,10 @@ mod tests {
 
         use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
-        use super::{object_dacl_sddl, verify_pipe_client, verify_pipe_server};
+        use super::{
+            check_endpoint_dacl, object_dacl, object_dacl_sddl, verify_pipe_client,
+            verify_pipe_server,
+        };
 
         let address = format!(
             "\\\\.\\pipe\\lya-security-probe-{}-{:?}",
@@ -556,21 +770,21 @@ mod tests {
         }
         .expect("the pipe should be created");
 
-        // What the object actually ended up with, asked of the object.
-        let live = unsafe { object_dacl_sddl(server.as_raw_handle() as _) }
-            .expect("the DACL should be read");
-        assert!(
-            live.contains(&user.to_sddl().expect("a SID renders as SDDL")),
-            "the owning user must be on the live pipe: {live}"
-        );
-        assert!(
-            !live.contains(";WD)"),
-            "the live pipe must not grant Everyone: {live}"
-        );
-        assert!(
-            !live.contains(";AN)"),
-            "the live pipe must not grant ANONYMOUS LOGON: {live}"
-        );
+        // What the object actually ended up with, asked of the object, and compared by security
+        // identifier rather than by the text Windows chooses to render one as.
+        let live =
+            unsafe { object_dacl(server.as_raw_handle() as _) }.expect("the DACL should be read");
+        let sddl = unsafe { object_dacl_sddl(server.as_raw_handle() as _) }
+            .expect("the DACL should render");
+        // Printed so a CI log shows which principal each rendered alias actually is.
+        println!("live DACL: {sddl}");
+        println!("owning user: {user:?}");
+        for entry in &live.entries {
+            println!("  entry {:?} mask {:#010x}", entry.sid, entry.mask);
+        }
+        check_endpoint_dacl(&live, &user).unwrap_or_else(|reason| {
+            panic!("the live pipe's list is wrong: {reason}\nSDDL: {sddl}")
+        });
 
         let client = ClientOptions::new()
             .open(&address)
@@ -581,7 +795,6 @@ mod tests {
             .expect("a client of the same user is accepted");
         let server_proof = unsafe { verify_pipe_server(client.as_raw_handle() as _, &user) }
             .expect("a server of the same user is accepted");
-        println!("live DACL: {live}");
         println!("client proof: {client_proof:?}, server proof: {server_proof:?}");
     }
 

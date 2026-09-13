@@ -824,6 +824,59 @@ mod tests {
 
     static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
+    /// Install a Git hook that always rejects.
+    ///
+    /// Two details decide whether Git runs a hook at all, and getting either wrong makes it skip
+    /// the hook *silently* — which then looks like a publisher that ignores hooks rather than a
+    /// fixture that never installed one:
+    ///
+    /// * **the executable bit.** Git on Linux and macOS runs a hook only when the file is
+    ///   executable, and says nothing when it is not. Windows Git ignores the mode entirely, which
+    ///   is why a fixture missing this passes there and fails on both Unix platforms.
+    /// * **the line endings.** The `\n` escapes are written literally and never translated, because
+    ///   `#!/bin/sh\r` names an interpreter no Unix kernel can execute.
+    ///
+    /// `#!/bin/sh` is the one interpreter both Unix platforms are guaranteed to have, and `exit 1`
+    /// is the whole script, so nothing here depends on a particular shell's features.
+    ///
+    /// `.git/hooks` is created rather than assumed: `git init` does make it, but a template
+    /// directory or a `core.hooksPath` setting can mean it is not the directory in use.
+    fn write_rejecting_hook(work: &Path, name: &str) {
+        let hooks = work.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).expect("hook directory should be created");
+        let hook = hooks.join(name);
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("hook should be written");
+        arm_hook(&hook);
+    }
+
+    /// Make a hook runnable by Git on Unix, and prove it took.
+    #[cfg(unix)]
+    fn arm_hook(hook: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(hook)
+            .expect("the hook should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(hook, permissions).expect("the hook should become executable");
+
+        let mode = fs::metadata(hook)
+            .expect("the hook should exist")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o100 != 0,
+            "Git silently skips a hook the owner cannot execute, and the commit would succeed: {mode:o}"
+        );
+    }
+
+    /// Windows Git runs a hook through its own bundled shell and ignores the file mode, so there is
+    /// nothing to set — only the file's presence to confirm.
+    #[cfg(not(unix))]
+    fn arm_hook(hook: &Path) {
+        assert!(hook.is_file(), "the hook should exist: {}", hook.display());
+    }
+
     fn directories(name: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "lya-publisher-test-{}-{name}-{}",
@@ -1040,8 +1093,7 @@ mod tests {
     async fn reports_hook_failure_without_pushing() {
         let (work, remote) = directories("hook");
         fs::write(work.join("hello.txt"), "hook change\n").expect("change should be written");
-        fs::write(work.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 1\n")
-            .expect("hook should be written");
+        write_rejecting_hook(&work, "pre-commit");
 
         let publisher = GitPublisher::new(config());
         let error = publish(&publisher, request(&work, "Hook failure").await)
@@ -1055,6 +1107,13 @@ mod tests {
                 ..
             }
         ));
+        // No commit locally, so the failure really was the hook refusing this commit rather than
+        // something later in the sequence.
+        assert_eq!(
+            git(&work, &["log", "--format=%s", "-1", "main"]).trim(),
+            "Initial",
+            "a rejected hook must leave no commit behind"
+        );
         assert_eq!(
             git(
                 remote.parent().expect("remote parent should exist"),
@@ -1067,7 +1126,8 @@ mod tests {
                 ],
             )
             .trim(),
-            "Initial"
+            "Initial",
+            "nothing may be pushed when the commit was rejected"
         );
         clean_up(&work);
     }

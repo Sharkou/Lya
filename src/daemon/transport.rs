@@ -249,11 +249,20 @@ impl DaemonListener {
         &self.endpoint
     }
 
-    /// The access control list the live endpoint carries, where the platform has one.
+    /// The access control list the live endpoint carries, where the platform has one, decoded into
+    /// principals.
     #[cfg(all(test, windows))]
-    pub fn live_dacl(&self) -> Option<String> {
+    pub fn live_dacl(&self) -> Option<crate::daemon::security::Dacl> {
         match &self.inner {
             ListenerKind::Pipe(listener) => listener.live_dacl(),
+        }
+    }
+
+    /// The same list in its textual form, for a failure message only.
+    #[cfg(all(test, windows))]
+    pub fn live_dacl_sddl(&self) -> Option<String> {
+        match &self.inner {
+            ListenerKind::Pipe(listener) => listener.live_dacl_sddl(),
         }
     }
 
@@ -396,12 +405,24 @@ mod platform {
                 .map_err(|error| TransportError::Io(error.to_string()))
         }
 
-        /// The access control list the listening pipe actually carries, asked of the pipe itself.
+        /// The access control list the listening pipe actually carries, asked of the pipe itself
+        /// and decoded into principals.
         ///
         /// A list that was asked for is not evidence that the kernel object got it, and this is the
         /// only claim in the transport that a test cannot make any other way.
         #[cfg(test)]
-        pub(super) fn live_dacl(&self) -> Option<String> {
+        pub(super) fn live_dacl(&self) -> Option<crate::daemon::security::Dacl> {
+            use std::os::windows::io::AsRawHandle;
+
+            let idle = self.idle.as_ref()?;
+            // SAFETY: `idle` is an open pipe handle owned by this listener.
+            unsafe { crate::daemon::security::object_dacl(idle.as_raw_handle() as _) }.ok()
+        }
+
+        /// The same list in its textual form, for a failure message. Never asserted against: the
+        /// rendering substitutes two-letter aliases for well-known security identifiers.
+        #[cfg(test)]
+        pub(super) fn live_dacl_sddl(&self) -> Option<String> {
             use std::os::windows::io::AsRawHandle;
 
             let idle = self.idle.as_ref()?;
@@ -756,7 +777,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn the_listening_pipe_grants_only_this_user_and_system() {
-        use crate::daemon::security::current_user_sid;
+        use crate::daemon::security::{check_endpoint_dacl, current_user_sid};
 
         let home = home();
         let endpoint = DaemonEndpoint::for_home(&home);
@@ -767,23 +788,18 @@ mod tests {
         let dacl = listener
             .live_dacl()
             .expect("a listening pipe has an access control list");
+        let sddl = listener.live_dacl_sddl().unwrap_or_default();
+        let user = current_user_sid().expect("this process has a user SID");
 
-        let user = current_user_sid()
-            .expect("this process has a user SID")
-            .to_sddl()
-            .expect("a SID renders as SDDL");
-        assert!(
-            dacl.contains(&user),
-            "the owning user must be granted access: {dacl}"
-        );
-        assert!(
-            !dacl.contains(";WD)"),
-            "Everyone must never be granted access to the endpoint: {dacl}"
-        );
-        assert!(
-            !dacl.contains(";AN)"),
-            "ANONYMOUS LOGON must never be granted access to the endpoint: {dacl}"
-        );
+        // Compared by security identifier, not by the rendered SDDL: Windows spells a well-known
+        // principal with its two-letter alias, so the current user comes back as `LA` on a machine
+        // where that user is the built-in local Administrator account.
+        println!("endpoint DACL: {sddl}");
+        println!("owning user: {user:?}");
+        check_endpoint_dacl(&dacl, &user).unwrap_or_else(|reason| {
+            panic!("the endpoint's list is wrong: {reason}\nSDDL: {sddl}")
+        });
+
         drop(listener);
         let _ = std::fs::remove_dir_all(home.path());
     }
