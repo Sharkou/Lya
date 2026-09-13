@@ -1,8 +1,10 @@
 use std::{
     env,
     io::{self, IsTerminal, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    pin::Pin,
     process::ExitCode,
+    sync::Arc,
 };
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -11,10 +13,12 @@ use lya::{
     agent::Agent,
     llm::ollama::OllamaClient,
     orchestrator::{
+        batch::parse_job_file,
         control::{ControlCommand, ControlReceiver, parse_control_command},
         doctor::DoctorReport,
         events::{
-            CompositeEventSink, HumanEventSink, HumanRenderMode, JsonEventSink, JsonlEventSink,
+            CompositeEventSink, EventSink, HumanEventSink, HumanRenderMode, JsonEventSink,
+            JsonlEventSink,
         },
         executor::{ClaudeCliExecutor, Executor, ExecutorRequest, ExecutorSession},
         home::LyaHome,
@@ -22,8 +26,13 @@ use lya::{
         job::{AutonomousOrchestrator, NewJob, OrchestrationError, RunResult, new_job_id},
         lock::JobLock,
         publisher::{GitPublishConfig, GitPublisher, Publisher},
+        repository_lock::{RepositoryIdentity, RepositoryLock},
         resume::{ResumeRejection, resumable_jobs, select_job},
-        state::{JobState, JobStatus, StateStore, current_unix_seconds},
+        scheduler::{
+            DEFAULT_MAX_CONCURRENT, HumanSchedulerSink, JobAssignment, JobDriver, JobOutcome,
+            JsonSchedulerSink, ScheduledRequest, Scheduler, SchedulerEventSink, queued_jobs,
+        },
+        state::{JobState, JobStatus, RunConfiguration, StateStore, current_unix_seconds},
         supervisor::{
             CodexCliSupervisor, Project, Supervisor, SupervisorRequest,
             load_required_private_context,
@@ -69,6 +78,12 @@ async fn main() -> ExitCode {
     }
     if arguments.first().is_some_and(|argument| argument == "jobs") {
         return list_jobs(&arguments[1..]);
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "scheduler")
+    {
+        return run_scheduler(&arguments[1..]).await;
     }
 
     let model = match env::var("OLLAMA_MODEL") {
@@ -166,11 +181,26 @@ fn prepare_home(home: &LyaHome) -> Result<StateStore, String> {
     Ok(store)
 }
 
+/// Whether a terminal job status counts as a successful outcome for the process exit code.
+fn job_status_succeeded(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Accepted
+            | JobStatus::Published
+            | JobStatus::Paused
+            | JobStatus::WaitingHuman
+            | JobStatus::WaitingClaudeQuota
+            | JobStatus::WaitingOpenAiQuota
+            | JobStatus::Stopped
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_job(
     home: &LyaHome,
     store: &StateStore,
     job_id: &str,
+    project_path: &Path,
     output: RunOutput,
     publish: Option<GitPublishConfig>,
     browser: bool,
@@ -178,6 +208,18 @@ async fn drive_job(
     max_jobs: u32,
     action: JobAction,
 ) -> ExitCode {
+    // Repository first, job second — the same claim order the scheduler uses, so the two layers can
+    // never deadlock against each other. A single `lya run` takes the repository claim too: without
+    // it a scheduled job and a manual run could drive one working tree at the same time.
+    let _repository_lock = match RepositoryIdentity::resolve(project_path)
+        .and_then(|identity| RepositoryLock::acquire(store, &identity))
+    {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let _lock = match JobLock::acquire(store, job_id) {
         Ok(lock) => lock,
         Err(error) => {
@@ -217,15 +259,10 @@ async fn drive_job(
                 .jobs
                 .last()
                 .expect("a run always contains its first job");
-            match job.status {
-                JobStatus::Accepted
-                | JobStatus::Published
-                | JobStatus::Paused
-                | JobStatus::WaitingHuman
-                | JobStatus::WaitingClaudeQuota
-                | JobStatus::WaitingOpenAiQuota
-                | JobStatus::Stopped => ExitCode::SUCCESS,
-                _ => ExitCode::FAILURE,
+            if job_status_succeeded(&job.status) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
         }
         Err(error) => {
@@ -278,6 +315,7 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
         None
     };
     let job_id = new_job_id();
+    let project_path = options.project_path.clone();
     let request = NewJob::new(
         job_id.clone(),
         Project {
@@ -292,6 +330,7 @@ async fn run_autonomous_job(arguments: &[String]) -> ExitCode {
         &home,
         &store,
         &job_id,
+        &project_path,
         options.output,
         publish,
         options.browser,
@@ -362,6 +401,7 @@ async fn resume_autonomous_job(arguments: &[String]) -> ExitCode {
         None
     };
     let job_id = job.job_id.clone();
+    let project_path = job.project_path.clone();
     let browser = job.run.browser;
     let max_iterations = job.run.max_iterations;
     let max_jobs = job.run.max_jobs;
@@ -370,6 +410,7 @@ async fn resume_autonomous_job(arguments: &[String]) -> ExitCode {
         &home,
         &store,
         &job_id,
+        &project_path,
         options.output,
         publish,
         browser,
@@ -378,6 +419,236 @@ async fn resume_autonomous_job(arguments: &[String]) -> ExitCode {
         JobAction::Resume(Box::new(job), private_context),
     )
     .await
+}
+
+/// Drives one scheduled job with the normal autonomous orchestrator.
+///
+/// The scheduler already holds this job's repository claim and job lock, so nothing here claims
+/// them again; sequential children still take their own job locks inside the orchestrator.
+struct SchedulerJobDriver {
+    home: LyaHome,
+    private_context: String,
+    publish: Option<GitPublishConfig>,
+    browser: bool,
+    max_iterations: u32,
+    max_jobs: u32,
+    stdout: SharedJobSink,
+}
+
+/// One stdout writer shared by every concurrently driven job, so interleaved output stays
+/// well-formed. Each job keeps its own `events.jsonl` in addition.
+#[derive(Clone)]
+enum SharedJobSink {
+    Human(Arc<HumanEventSink<io::Stdout>>),
+    Json(Arc<JsonEventSink<io::Stdout>>),
+}
+
+impl SharedJobSink {
+    fn boxed(&self) -> Box<dyn EventSink> {
+        match self {
+            Self::Human(sink) => Box::new(Arc::clone(sink)),
+            Self::Json(sink) => Box::new(Arc::clone(sink)),
+        }
+    }
+}
+
+impl JobDriver for SchedulerJobDriver {
+    fn drive<'a>(
+        &'a self,
+        assignment: JobAssignment,
+    ) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let sink = CompositeEventSink::new(vec![
+                Box::new(JsonlEventSink::for_job(
+                    self.home.path(),
+                    &assignment.job_id,
+                )),
+                self.stdout.boxed(),
+            ]);
+            let base = AutonomousOrchestrator::new(
+                CodexCliSupervisor::new_for_job(self.home.path(), &assignment.job_id),
+                ClaudeCliExecutor::new(),
+                SystemProcessRunner,
+                StateStore::new(&self.home),
+            )
+            .with_max_iterations(self.max_iterations)
+            .with_max_jobs(self.max_jobs)
+            .with_browser(self.browser)
+            .with_event_sink(sink)
+            .with_control_receiver(assignment.control);
+            let request = NewJob::new(
+                assignment.job_id,
+                assignment.project,
+                assignment.task,
+                self.private_context.clone(),
+            );
+
+            let result = match &self.publish {
+                Some(configuration) => {
+                    base.with_publisher(GitPublisher::new(configuration.clone()))
+                        .with_publish_configuration(configuration.clone())
+                        .run_sequential(request)
+                        .await
+                }
+                None => base.run_sequential(request).await,
+            };
+
+            match result {
+                Ok(run) => {
+                    let job = run
+                        .jobs
+                        .last()
+                        .expect("a run always contains its first job");
+                    JobOutcome::Finished {
+                        status: job.status.label().to_owned(),
+                        jobs: run.jobs.len(),
+                        succeeded: job_status_succeeded(&job.status),
+                    }
+                }
+                Err(error) => JobOutcome::Failed {
+                    error: error.to_string(),
+                },
+            }
+        })
+    }
+}
+
+/// Runs several project/task requests through the bounded scheduler.
+///
+/// This mode is deliberately non-interactive: `/pause`, `/send` and the other line commands act on
+/// one unambiguous job, and multiplexing them across concurrent jobs needs an interaction model
+/// that M9 does not invent. `lya run` keeps the full interactive control it has today. Graceful
+/// termination still works here: the first Ctrl+C stops the scheduler and every active job.
+async fn run_scheduler(arguments: &[String]) -> ExitCode {
+    let options = match parse_scheduler_arguments(arguments) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!(
+                "{error}\nUsage: lya scheduler [<job-file>] [--resume-queued] [--max-concurrent <n>] [--browser] [--max-iterations <count>] [--max-jobs <count>] [--publish] [--verbose | --json]"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let home = match LyaHome::resolve() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("Could not resolve Lya home: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = match prepare_home(&home) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let private_context = match load_required_private_context(&home) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("Could not prepare scheduled jobs: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let publish = if options.publish {
+        match GitPublishConfig::from_environment() {
+            Ok(configuration) => Some(configuration),
+            Err(error) => {
+                eprintln!("Could not configure Git publication: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut requests = Vec::new();
+    if options.resume_queued {
+        match queued_jobs(&store) {
+            // Work a previous scheduler accepted and never started keeps its own job identity; it
+            // adopts the options of the invocation that picks it up.
+            Ok(jobs) => requests.extend(jobs.iter().map(ScheduledRequest::for_persisted_job)),
+            Err(error) => {
+                eprintln!("Could not read queued jobs: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Some(path) = &options.job_file {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                eprintln!("Could not read the job file {}: {error}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let base = path.parent().unwrap_or(Path::new(".")).to_owned();
+        match parse_job_file(&content, &base) {
+            Ok(parsed) => requests.extend(parsed),
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if requests.is_empty() {
+        eprintln!("Nothing to schedule.");
+        return ExitCode::SUCCESS;
+    }
+
+    let (stdout, scheduler_sink): (SharedJobSink, Arc<dyn SchedulerEventSink>) =
+        match options.output {
+            RunOutput::Json => (
+                SharedJobSink::Json(Arc::new(JsonEventSink::new(io::stdout()))),
+                Arc::new(JsonSchedulerSink::new(io::stdout())),
+            ),
+            RunOutput::Human(mode) => (
+                SharedJobSink::Human(Arc::new(
+                    HumanEventSink::stdout(mode).with_job_context(true),
+                )),
+                Arc::new(HumanSchedulerSink::stdout()),
+            ),
+        };
+    let driver = SchedulerJobDriver {
+        home: LyaHome::from_path(home.path()),
+        private_context,
+        publish: publish.clone(),
+        browser: options.browser,
+        max_iterations: options.max_iterations,
+        max_jobs: options.max_jobs,
+        stdout,
+    };
+    let scheduler = Scheduler::new(driver, StateStore::new(&home))
+        .with_max_concurrent(options.max_concurrent)
+        .with_event_sink(scheduler_sink)
+        .with_run_configuration(RunConfiguration {
+            max_iterations: options.max_iterations,
+            max_jobs: options.max_jobs,
+            browser: options.browser,
+            publish: publish.is_some(),
+            git: publish,
+        });
+    let control = scheduler.control();
+    spawn_interrupt_handler_with(move || control.request_stop());
+
+    match scheduler.run(requests).await {
+        Ok(report) => {
+            // JSON mode already carries the summary as a `SCHEDULER_FINISHED` event, so stdout
+            // stays free of prose.
+            if matches!(options.output, RunOutput::Human(_)) {
+                println!("{}", report.render());
+            }
+            if report.is_success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("Scheduler failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Lists persisted jobs.
@@ -703,12 +974,21 @@ fn spawn_command_reader(command_sender: lya::orchestrator::control::ControlSende
 }
 
 fn spawn_interrupt_handler(sender: lya::orchestrator::control::ControlSender) {
+    spawn_interrupt_handler_with(move || request_graceful_stop(&sender));
+}
+
+/// Arms graceful termination for whatever owns the active work.
+///
+/// A single `lya run` routes it into that job's control channel; the scheduler routes it into every
+/// active job at once and stops launching new ones. The second interrupt keeps its existing
+/// force-exit meaning in both cases.
+fn spawn_interrupt_handler_with(request_stop: impl Fn() + Send + 'static) {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!(
                 "Stop requested. Finishing the current safe shutdown...\nPress Ctrl+C again to force termination."
             );
-            request_graceful_stop(&sender);
+            request_stop();
             if tokio::signal::ctrl_c().await.is_ok() {
                 match interrupt_action(2) {
                     InterruptAction::ForceTerminate => std::process::exit(130),
@@ -766,6 +1046,103 @@ enum RunOutput {
 struct JobsOptions {
     resumable_only: bool,
     json: bool,
+}
+
+#[derive(Debug)]
+struct SchedulerOptions {
+    job_file: Option<PathBuf>,
+    resume_queued: bool,
+    max_concurrent: usize,
+    browser: bool,
+    max_iterations: u32,
+    max_jobs: u32,
+    publish: bool,
+    output: RunOutput,
+}
+
+fn parse_scheduler_arguments(arguments: &[String]) -> Result<SchedulerOptions, String> {
+    let mut job_file = None;
+    let mut resume_queued = false;
+    let mut max_concurrent = DEFAULT_MAX_CONCURRENT;
+    let mut browser = false;
+    let mut max_iterations = lya::orchestrator::job::DEFAULT_MAX_ITERATIONS;
+    let mut max_jobs = lya::orchestrator::job::DEFAULT_MAX_JOBS;
+    let mut publish = false;
+    let mut verbose = false;
+    let mut json = false;
+    let mut position = 0;
+
+    while position < arguments.len() {
+        match arguments[position].as_str() {
+            "--resume-queued" => resume_queued = true,
+            "--browser" => browser = true,
+            "--publish" => publish = true,
+            "--verbose" => verbose = true,
+            "--json" => json = true,
+            "--max-concurrent" => {
+                position += 1;
+                max_concurrent = arguments
+                    .get(position)
+                    .ok_or_else(|| "--max-concurrent requires a number".to_owned())?
+                    .parse::<usize>()
+                    .map_err(|_| "--max-concurrent must be an unsigned integer".to_owned())?;
+                if max_concurrent == 0 {
+                    return Err("--max-concurrent must be greater than zero".to_owned());
+                }
+            }
+            "--max-iterations" => {
+                position += 1;
+                max_iterations = arguments
+                    .get(position)
+                    .ok_or_else(|| "--max-iterations requires a number".to_owned())?
+                    .parse::<u32>()
+                    .map_err(|_| "--max-iterations must be an unsigned integer".to_owned())?;
+                if max_iterations == 0 {
+                    return Err("--max-iterations must be greater than zero".to_owned());
+                }
+            }
+            "--max-jobs" => {
+                position += 1;
+                max_jobs = arguments
+                    .get(position)
+                    .ok_or_else(|| "--max-jobs requires a number".to_owned())?
+                    .parse::<u32>()
+                    .map_err(|_| "--max-jobs must be an unsigned integer".to_owned())?;
+                if max_jobs == 0 {
+                    return Err("--max-jobs must be greater than zero".to_owned());
+                }
+            }
+            argument if argument.starts_with("--") => {
+                return Err(format!("unknown scheduler option: {argument}"));
+            }
+            argument if job_file.is_none() => job_file = Some(PathBuf::from(argument)),
+            argument => return Err(format!("only one job file is accepted: {argument}")),
+        }
+        position += 1;
+    }
+
+    if verbose && json {
+        return Err("--verbose cannot be combined with --json".to_owned());
+    }
+    if job_file.is_none() && !resume_queued {
+        return Err("a job file or --resume-queued is required".to_owned());
+    }
+    Ok(SchedulerOptions {
+        job_file,
+        resume_queued,
+        max_concurrent,
+        browser,
+        max_iterations,
+        max_jobs,
+        publish,
+        output: if json {
+            RunOutput::Json
+        } else if verbose {
+            RunOutput::Human(HumanRenderMode::Verbose)
+        } else {
+            RunOutput::Human(HumanRenderMode::Normal)
+        },
+    })
 }
 
 #[derive(Debug)]
@@ -924,10 +1301,14 @@ fn run_doctor() -> ExitCode {
 mod tests {
     use super::{
         ExecutorSession, InterruptAction, RunOutput, interactive_enabled, interrupt_action,
-        parse_executor_arguments, parse_jobs_arguments, parse_resume_arguments,
-        parse_run_arguments, request_graceful_stop, start_control,
+        job_status_succeeded, parse_executor_arguments, parse_jobs_arguments,
+        parse_resume_arguments, parse_run_arguments, parse_scheduler_arguments,
+        request_graceful_stop, start_control,
     };
-    use lya::orchestrator::control::{ControlCommand, ControlReceiver};
+    use lya::orchestrator::{
+        control::{ControlCommand, ControlReceiver},
+        state::JobStatus,
+    };
 
     #[test]
     fn parses_executor_options_and_preserves_prompt_words() {
@@ -1059,6 +1440,103 @@ mod tests {
 
         assert!(parse_jobs_arguments(&["--delete".to_owned()]).is_err());
         assert!(parse_jobs_arguments(&["job-1".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_scheduler_options_with_a_job_file_and_a_bounded_concurrency() {
+        let options = parse_scheduler_arguments(&[
+            "jobs.jsonl".to_owned(),
+            "--max-concurrent".to_owned(),
+            "3".to_owned(),
+            "--publish".to_owned(),
+            "--max-jobs".to_owned(),
+            "2".to_owned(),
+        ])
+        .expect("scheduler options should parse");
+
+        assert_eq!(
+            options.job_file.as_deref(),
+            Some(std::path::Path::new("jobs.jsonl"))
+        );
+        assert_eq!(options.max_concurrent, 3);
+        assert_eq!(options.max_jobs, 2);
+        assert!(options.publish);
+        assert!(!options.resume_queued);
+        assert!(matches!(options.output, RunOutput::Human(_)));
+    }
+
+    #[test]
+    fn scheduler_concurrency_defaults_to_two_and_rejects_zero() {
+        let options = parse_scheduler_arguments(&["jobs.jsonl".to_owned()])
+            .expect("a bare job file should parse");
+        assert_eq!(
+            options.max_concurrent,
+            lya::orchestrator::scheduler::DEFAULT_MAX_CONCURRENT
+        );
+        assert_eq!(options.max_concurrent, 2);
+
+        let error = parse_scheduler_arguments(&[
+            "jobs.jsonl".to_owned(),
+            "--max-concurrent".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect_err("zero concurrency should be refused");
+        assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    fn scheduler_requires_work_and_refuses_ambiguous_or_unknown_input() {
+        assert!(
+            parse_scheduler_arguments(&[]).is_err(),
+            "a scheduler run needs a job file or queued work"
+        );
+        assert!(
+            parse_scheduler_arguments(&["--resume-queued".to_owned()])
+                .expect("queued work alone is enough")
+                .job_file
+                .is_none()
+        );
+        assert!(
+            parse_scheduler_arguments(&["one.jsonl".to_owned(), "two.jsonl".to_owned()]).is_err()
+        );
+        assert!(parse_scheduler_arguments(&["--nope".to_owned()]).is_err());
+        assert!(
+            parse_scheduler_arguments(&[
+                "jobs.jsonl".to_owned(),
+                "--verbose".to_owned(),
+                "--json".to_owned()
+            ])
+            .is_err()
+        );
+        assert!(parse_scheduler_arguments(&["--max-concurrent".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn scheduler_json_mode_parses_and_stays_machine_readable() {
+        let options = parse_scheduler_arguments(&["jobs.jsonl".to_owned(), "--json".to_owned()])
+            .expect("JSON mode should parse");
+
+        assert!(matches!(options.output, RunOutput::Json));
+    }
+
+    /// The scheduler reuses the exit-code semantics of a single `lya run`, so a queued job never
+    /// looks successful and a stopped one never looks failed.
+    #[test]
+    fn terminal_statuses_map_to_the_same_success_verdict_everywhere() {
+        for status in [
+            JobStatus::Accepted,
+            JobStatus::Published,
+            JobStatus::Paused,
+            JobStatus::WaitingHuman,
+            JobStatus::WaitingClaudeQuota,
+            JobStatus::WaitingOpenAiQuota,
+            JobStatus::Stopped,
+        ] {
+            assert!(job_status_succeeded(&status), "{status:?} should succeed");
+        }
+        for status in [JobStatus::Failed, JobStatus::Running, JobStatus::Queued] {
+            assert!(!job_status_succeeded(&status), "{status:?} should not");
+        }
     }
 
     #[tokio::test]

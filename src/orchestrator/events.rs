@@ -197,6 +197,16 @@ pub trait EventSink: Send + Sync {
     fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError>;
 }
 
+/// A sink can be shared by several concurrently driven jobs.
+///
+/// The scheduler gives every job its own `events.jsonl` but a single shared terminal or JSON sink,
+/// so one writer owns stdout and concurrent jobs cannot interleave inside a rendered block.
+impl<T: EventSink + ?Sized> EventSink for std::sync::Arc<T> {
+    fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError> {
+        (**self).emit(event)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NoopEventSink;
 
@@ -309,6 +319,7 @@ pub struct HumanEventSink<W: Write + Send> {
     writer: Mutex<W>,
     mode: HumanRenderMode,
     color: bool,
+    job_context: bool,
 }
 
 impl<W: Write + Send> HumanEventSink<W> {
@@ -317,7 +328,18 @@ impl<W: Write + Send> HumanEventSink<W> {
             writer: Mutex::new(writer),
             mode,
             color,
+            job_context: false,
         }
+    }
+
+    /// Prefix every rendered line with the originating project and job.
+    ///
+    /// Single-job runs leave this off: there is nothing to disambiguate. Concurrently scheduled
+    /// jobs turn it on, so an interleaved terminal stream still says which project and which job
+    /// each line belongs to.
+    pub fn with_job_context(mut self, job_context: bool) -> Self {
+        self.job_context = job_context;
+        self
     }
 }
 
@@ -329,12 +351,23 @@ impl HumanEventSink<io::Stdout> {
 
 impl<W: Write + Send> EventSink for HumanEventSink<W> {
     fn emit(&self, event: &JobEvent) -> Result<(), EventSinkError> {
+        let rendered = render_human(event, self.mode, self.color);
+        let rendered = if self.job_context {
+            prefix_lines(
+                &rendered,
+                &format!("[{} {}] ", event.project_name, event.job_id),
+            )
+        } else {
+            rendered
+        };
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| EventSinkError::Write("terminal output lock was poisoned".to_owned()))?;
+        // One `write_all` per event: a rendered block reaches the terminal as a unit, so events
+        // from concurrent jobs interleave between blocks and never inside one.
         writer
-            .write_all(render_human(event, self.mode, self.color).as_bytes())
+            .write_all(rendered.as_bytes())
             .and_then(|_| writer.flush())
             .map_err(|error| EventSinkError::Write(error.to_string()))
     }
@@ -722,7 +755,21 @@ pub fn render_human(event: &JobEvent, mode: HumanRenderMode, color: bool) -> Str
     output
 }
 
-fn format_timestamp(timestamp_unix_millis: u128) -> String {
+/// Prefix every non-empty line of an already rendered block, keeping its line structure intact.
+fn prefix_lines(rendered: &str, prefix: &str) -> String {
+    let mut output = String::with_capacity(rendered.len());
+    for line in rendered.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).is_empty() {
+            output.push_str(line);
+            continue;
+        }
+        output.push_str(prefix);
+        output.push_str(line);
+    }
+    output
+}
+
+pub(crate) fn format_timestamp(timestamp_unix_millis: u128) -> String {
     let seconds = (timestamp_unix_millis / 1_000) % 86_400;
     format!(
         "{:02}:{:02}:{:02}",
@@ -732,7 +779,7 @@ fn format_timestamp(timestamp_unix_millis: u128) -> String {
     )
 }
 
-fn style(value: &str, code: &str, color: bool) -> String {
+pub(crate) fn style(value: &str, code: &str, color: bool) -> String {
     if color {
         format!("\x1b[{code}m{value}\x1b[0m")
     } else {
@@ -943,6 +990,70 @@ mod tests {
         assert!(output.contains("untracked: app.js, app.test.js"));
         assert!(output.contains("tracked diff:"));
         assert!(!output.contains("diff --git"));
+    }
+
+    /// Concurrent jobs share one terminal. Every line has to say which project and job it came
+    /// from, or an interleaved stream becomes unreadable.
+    #[test]
+    fn job_context_prefixes_every_line_of_a_concurrent_stream() {
+        let event = event(JobEventKind::JobStarted {
+            task: "Fix the flaky test".to_owned(),
+        });
+        let mut plain = Vec::new();
+        HumanEventSink::new(&mut plain, HumanRenderMode::Normal, false)
+            .emit(&event)
+            .expect("renderer should write");
+        let mut prefixed = Vec::new();
+        HumanEventSink::new(&mut prefixed, HumanRenderMode::Normal, false)
+            .with_job_context(true)
+            .emit(&event)
+            .expect("renderer should write");
+
+        let plain = String::from_utf8(plain).expect("output should be UTF-8");
+        let prefixed = String::from_utf8(prefixed).expect("output should be UTF-8");
+        assert!(
+            !plain.contains("[demo job-1]"),
+            "a single job run keeps its unprefixed output"
+        );
+        assert!(prefixed.lines().count() > 1);
+        for line in prefixed.lines() {
+            assert!(
+                line.starts_with("[demo job-1] "),
+                "every line must name its origin: {line}"
+            );
+        }
+        assert!(prefixed.contains("Fix the flaky test"));
+    }
+
+    /// One sink object, shared by every concurrently driven job.
+    #[test]
+    fn a_shared_sink_can_be_used_through_an_arc() {
+        #[derive(Default)]
+        struct Counting {
+            seen: Mutex<Vec<String>>,
+        }
+
+        impl EventSink for Counting {
+            fn emit(&self, event: &JobEvent) -> Result<(), super::EventSinkError> {
+                self.seen
+                    .lock()
+                    .expect("sink lock")
+                    .push(event.job_id.clone());
+                Ok(())
+            }
+        }
+
+        let shared = Arc::new(Counting::default());
+        let composite = CompositeEventSink::new(vec![
+            Box::new(Arc::clone(&shared)),
+            Box::new(Arc::clone(&shared)),
+        ]);
+
+        composite
+            .emit(&event(JobEventKind::Resumed))
+            .expect("a shared sink should accept events");
+
+        assert_eq!(shared.seen.lock().expect("sink lock").len(), 2);
     }
 
     #[test]

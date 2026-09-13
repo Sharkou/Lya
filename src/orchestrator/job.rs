@@ -4124,4 +4124,85 @@ mod tests {
         assert_eq!(persisted.quota_wait, None);
         fs::remove_dir_all(directory).expect("test home should be removed");
     }
+
+    /// A scheduled chain keeps one repository claim from start to finish.
+    ///
+    /// The scheduler takes the repository claim before the chain and holds it until the chain ends,
+    /// so the orchestrator must neither take it again nor release it between chained jobs. The
+    /// per-job lock keeps working exactly as before: each child takes its own.
+    #[tokio::test]
+    async fn a_sequential_chain_runs_under_one_repository_claim_held_by_its_scheduler() {
+        use crate::orchestrator::repository_lock::{RepositoryIdentity, RepositoryLock};
+
+        let supervisor = FakeSupervisor::new(vec![
+            Ok(SupervisorDecision::Accept {
+                commit_title: "First".to_owned(),
+                next_prompt: Some("second task".to_owned()),
+                reason: None,
+            }),
+            Ok(SupervisorDecision::Accept {
+                commit_title: "Second".to_owned(),
+                next_prompt: None,
+                reason: None,
+            }),
+        ]);
+        let executor = FakeExecutor::new(Vec::new());
+        let publisher = FakePublisher::new(vec![
+            Ok(published_result("First")),
+            Ok(published_result("Second")),
+        ]);
+        let directory = home("chain-repository-claim");
+        let project_path = directory.join("project");
+        fs::create_dir_all(project_path.join(".git")).expect("repository should be created");
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+        let identity = RepositoryIdentity::resolve(&project_path).expect("identity should resolve");
+        let claim = RepositoryLock::acquire(&store, &identity).expect("claim should be taken");
+        let request = NewJob::new(
+            "chain-root",
+            Project {
+                name: "chained".to_owned(),
+                path: project_path.canonicalize().expect("project should resolve"),
+            },
+            "first task",
+            "Private project context.",
+        );
+
+        let result = AutonomousOrchestrator::new(
+            supervisor,
+            executor,
+            FakeGitRunner { dirty: false },
+            StateStore::new(&LyaHome::from_path(&directory)),
+        )
+        .with_publisher(publisher)
+        .run_sequential(request)
+        .await
+        .expect("the chain should finish while its repository claim is held");
+
+        assert_eq!(result.jobs.len(), 2);
+        assert!(
+            result
+                .jobs
+                .iter()
+                .all(|job| job.status == JobStatus::Published)
+        );
+        assert_eq!(result.jobs[1].sequential_index, 1);
+        // Held throughout: the chain never released and reacquired the repository between jobs.
+        assert!(
+            RepositoryLock::acquire(&store, &identity).is_err(),
+            "the scheduler's claim must still be the only one"
+        );
+        drop(claim);
+        assert!(
+            RepositoryLock::acquire(&store, &identity).is_ok(),
+            "releasing the scheduler's claim frees the repository"
+        );
+        // Every child still owns its own job lock, so a second process cannot drive it.
+        for job in &result.jobs {
+            assert!(
+                JobLock::acquire(&store, &job.job_id).is_ok(),
+                "a finished child releases its own job lock"
+            );
+        }
+        fs::remove_dir_all(directory).expect("test home should be removed");
+    }
 }

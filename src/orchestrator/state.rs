@@ -30,6 +30,14 @@ pub const MAX_ACTIVE_USER_INSTRUCTION_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
+    /// Accepted by the scheduler and durably recorded, but never started.
+    ///
+    /// A queued job owns a real job ID, directory and `state.json` before any work begins, so a
+    /// scheduler that dies never silently loses accepted work. It is deliberately *not* resumable:
+    /// only the scheduler starts queued work, so `lya resume` cannot pick one up and bypass
+    /// repository exclusion or the concurrency bound.
+    #[serde(rename = "QUEUED")]
+    Queued,
     #[serde(rename = "RUNNING")]
     Running,
     #[serde(rename = "PAUSED")]
@@ -55,6 +63,7 @@ pub enum JobStatus {
 impl JobStatus {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Queued => "QUEUED",
             Self::Running => "RUNNING",
             Self::Paused => "PAUSED",
             Self::WaitingClaudeQuota => "WAITING_CLAUDE_QUOTA",
@@ -70,7 +79,9 @@ impl JobStatus {
 
     /// A job that a later Lya process may continue. `FAILED`, `STOPPED`, `PUBLISHED`, `ACCEPTED`
     /// and `WAITING_HUMAN` are deliberately excluded: they are terminal for automatic recovery and
-    /// need an explicit human decision instead.
+    /// need an explicit human decision instead. `QUEUED` is excluded too: it was never started, so
+    /// there is nothing to continue, and starting it belongs to the scheduler that owns the
+    /// repository claim and the concurrency bound.
     pub fn is_resumable(&self) -> bool {
         matches!(
             self,
@@ -329,6 +340,12 @@ impl StateStore {
 
     pub fn jobs_directory(&self) -> PathBuf {
         self.root.join("jobs")
+    }
+
+    /// Where repository-level claims live. One file per canonical repository, shared by every Lya
+    /// process using this home.
+    pub fn repositories_directory(&self) -> PathBuf {
+        self.root.join("repositories")
     }
 
     pub fn job_directory(&self, job_id: &str) -> Result<PathBuf, StateError> {
@@ -789,6 +806,43 @@ mod tests {
 
         assert_eq!(state.active_instruction_count(), 2);
         assert_eq!(state.active_instruction_bytes(), 5);
+    }
+
+    /// Queued work is durable, distinguishable and deliberately outside `lya resume`.
+    #[test]
+    fn queued_jobs_round_trip_and_are_never_resumable() {
+        let directory = home();
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+        let queued = job("job-queued", JobStatus::Queued);
+
+        store.save_job(&queued).expect("queued job should save");
+
+        let loaded = store
+            .load_job("job-queued")
+            .expect("queued job should load")
+            .expect("queued job should exist");
+        assert_eq!(loaded.status, JobStatus::Queued);
+        assert_eq!(loaded.status.label(), "QUEUED");
+        assert!(
+            !loaded.status.is_resumable(),
+            "lya resume must never start scheduler-owned queued work"
+        );
+        let rendered = serde_json::to_string(&queued).expect("queued job should serialize");
+        assert!(rendered.contains("\"QUEUED\""));
+        fs::remove_dir_all(directory).expect("home should be removed");
+    }
+
+    #[test]
+    fn repository_claims_live_beside_jobs_in_the_home() {
+        let directory = home();
+        let store = StateStore::new(&LyaHome::from_path(&directory));
+
+        assert_eq!(
+            store.repositories_directory(),
+            directory.join("repositories")
+        );
+        assert_ne!(store.repositories_directory(), store.jobs_directory());
+        fs::remove_dir_all(directory).expect("home should be removed");
     }
 
     #[test]

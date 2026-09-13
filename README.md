@@ -31,6 +31,8 @@ Lya
 │   └── Tools
 │
 └── Development Orchestration
+    ├── Scheduler
+    │   └── Repository claims and concurrency slots
     ├── Supervisor
     │   └── Codex CLI
     ├── Executor
@@ -41,6 +43,8 @@ Lya
     │   └── Git
     └── Local State
         ├── context.md
+        ├── repositories/
+        │   └── <repository-fingerprint>.lock
         └── jobs/
             └── <job-id>/
                 ├── state.json
@@ -51,11 +55,31 @@ Lya
 
 The components are intentionally separated:
 
+* the **Scheduler** decides which jobs may start, how many run at once, and which repository each one owns;
 * the **Supervisor** decides what should happen next;
 * the **Executor** performs development work;
 * Lya independently inspects the repository instead of trusting executor reports;
 * the **Publisher** can commit and push only changes that match the reviewed repository state;
 * persistent state is stored locally per job, so an interrupted run can be continued by a later process.
+
+The scheduler is a boundary above the orchestrator, not a replacement for it. The orchestrator still
+owns exactly one autonomous job and its sequential chain:
+
+```text
+CLI / future daemon
+        |
+        v
+    Scheduler
+   /    |    \
+  v     v     v
+Job A  Job B  Job C
+  |      |      |
+  +------|------+
+         |
+  AutonomousOrchestrator
+```
+
+Supervisor and Executor implementations know nothing about scheduling.
 
 The current development workflow uses Codex as the Supervisor and Claude Code as the Executor, but the architecture is designed so implementations can be replaced without rewriting the orchestration core.
 
@@ -125,6 +149,8 @@ The directory currently contains data such as:
 ```text
 ~/.lya/
 ├── context.md
+├── repositories/
+│   └── <repository-fingerprint>.lock
 └── jobs/
     └── <job-id>/
         ├── state.json
@@ -161,6 +187,39 @@ reuse cannot grant a claim.
 
 A released lock keeps its file on purpose. Deleting a locked path would let another process lock a
 fresh file under the same name and believe it owns the same job.
+
+### Repository Claims
+
+A job lock answers "is anyone else driving *this job*". It cannot answer "is anyone else driving
+*this repository*", which is what concurrent scheduling has to answer: two different jobs pointed at
+one working tree would interleave Git writes and destroy every snapshot guarantee.
+
+While Lya drives work in a repository it therefore also holds an exclusive claim on:
+
+```text
+LYA_HOME/repositories/<repository-fingerprint>.lock
+```
+
+Repository claims are an additional layer, never a replacement for job locks. A job holds both, and
+claims are taken repository-first, job-second everywhere, so the two layers cannot deadlock.
+
+Identity comes from the repository's real location, not from a project display name:
+
+* the project path is canonicalized, so symlinks, `.`/`..` segments and Windows letter case resolve
+  to one real path;
+* the nearest ancestor holding a `.git` entry becomes the repository root, so a job started from a
+  subdirectory claims the same repository as a job started from its top level.
+
+The claim file is named after a fingerprint of that root because a path is not a portable file name.
+
+The claim uses exactly the same operating-system locking philosophy as a job lock: the kernel's own
+advisory lock on an open handle, never the presence of the file and never a recorded process ID.
+The kernel releases it when the process exits, including a crash or a kill, so an abandoned claim
+recovers by itself. The file body is diagnostics only, and a released claim keeps its file for the
+same reason a job lock does.
+
+`lya run`, `lya resume` and `lya scheduler` all take the claim, so a manual run and a scheduled job
+can never drive one working tree at the same time — not even across two Lya processes.
 
 **Important:** "private" means that this file is kept outside the project repository. Its relevant content is sent to the configured Supervisor when a request is made. Do not store credentials, API keys, passwords, or other secrets in it.
 
@@ -412,7 +471,8 @@ job-1789250000-4242-0   PixelCreator  WAITING_OPENAI_QUOTA  SUPERVISOR  3     4m
 job-1789240000-4242-0   Lya           ACCEPTED              PUBLISHER   1     2h ago   no
 ```
 
-Jobs are listed most recently updated first, then by job ID.
+Jobs are listed most recently updated first, then by job ID. Work the scheduler accepted but never
+started appears as `QUEUED` and is listed as not resumable, because only the scheduler starts it.
 
 `lya jobs` is strictly read-only. It reads authoritative per-job state and changes nothing: no job
 state is written, no legacy `state.json` is migrated, no job lock is taken, no Supervisor or
@@ -466,6 +526,9 @@ them.
 
 A job that was paused, parked on a provider quota, or interrupted by a process exit can be
 continued by a later Lya process:
+
+Resuming takes the repository claim as well as the job lock, and `QUEUED` work is never resumable,
+so a resume can never bypass scheduler safety.
 
 ```bash
 cargo run -- resume
@@ -775,6 +838,133 @@ A new job starts only after:
 
 Without `--publish`, `next_prompt` is retained and displayed but does not automatically start another job.
 
+## Multi-Project Scheduling
+
+`lya scheduler` drives several autonomous jobs at once, under two rules:
+
+* different repositories may run concurrently;
+* the same repository is never driven concurrently.
+
+Work is described by a small job file, one JSON object per line:
+
+```jsonl
+# comments and blank lines are ignored
+{"project": "/path/to/service", "task": "Fix the flaky integration test"}
+{"project": "../website", "task": "Update the changelog", "name": "Website"}
+```
+
+| field | required | meaning |
+| --- | --- | --- |
+| `project` | yes | path to the Git working tree; a relative path resolves against the job file's own directory |
+| `task` | yes | the task text, exactly as `lya run` would take it |
+| `name` | no | display name; defaults to the directory name |
+
+Unknown fields are refused rather than ignored, so a typo is reported instead of silently dropping
+an instruction. A job file holds at most 256 jobs.
+
+```bash
+cargo run -- scheduler jobs.jsonl --max-concurrent 3
+```
+
+Each request becomes a normal Lya job with its own job ID, `state.json`, `lock.json` and
+`events.jsonl`. `--browser`, `--max-iterations`, `--max-jobs`, `--publish`, `--verbose` and `--json`
+mean exactly what they mean for `lya run` and apply to every scheduled job.
+
+### Concurrency And Fairness
+
+```text
+--max-concurrent <n>
+```
+
+defaults to **2** and must be greater than zero.
+
+Exactly `n` execution slots exist; Lya does not spawn a task per job and gate provider calls
+afterwards. Ordering is FIFO and deterministic: a worker takes the first queued job whose repository
+is free. A job whose repository is busy is skipped rather than allowed to hold a slot, so one
+contended repository never stalls unrelated work.
+
+One job failing never cancels an unrelated job. Every job keeps its own outcome.
+
+### Queued Work Survives A Crash
+
+Accepted work is durable before it starts. Every request is persisted as a real job with status:
+
+```text
+QUEUED
+```
+
+so four situations stay distinguishable after an interruption:
+
+| situation | how it looks |
+| --- | --- |
+| never started | `QUEUED` |
+| currently being driven | `RUNNING`/`PUBLISHING`/… with a live job lock |
+| resumable interrupted work | the same statuses with no live lock |
+| terminal | `ACCEPTED`, `PUBLISHED`, `FAILED`, `STOPPED`, `WAITING_HUMAN` |
+
+`QUEUED` is deliberately **not** resumable. `lya resume` refuses it, so ordinary resume can never
+bypass the repository claim or the concurrency bound. Only the scheduler starts queued work:
+
+```bash
+cargo run -- scheduler --resume-queued
+```
+
+Re-queued jobs keep their original job identity and adopt the options of the invocation that picks
+them up. A job that fails before the orchestrator's first write is recorded as `FAILED` rather than
+left advertised as queued, so the durable record and the scheduler report always agree.
+
+### Sequential Jobs Under The Scheduler
+
+A `next_prompt` chain stays owned by one scheduled root. The worker holds that repository's claim
+for the whole chain instead of releasing and reacquiring it between chained jobs, so a chain never
+loses its repository to another job halfway through, and a chain does not consume one global slot
+per child.
+
+Every sequential child still takes its own job lock, still counts against `--max-jobs`, and still
+records its own `sequential_index`.
+
+### Output
+
+Scheduler-wide observation is a separate structured stream from job events, so job events stay
+exactly what they were. Scheduler events cover queued, waiting for repository, started, completed,
+failed, not started, stopping and finished.
+
+Human output prefixes every job line with its project and job, so an interleaved terminal stream
+stays readable:
+
+```text
+01:29:10  SCHEDULER  2 job(s) queued; at most 2 repositories at a time
+01:29:10  SCHEDULER  started service job-1789262950-23120-0
+[service job-1789262950-23120-0] 01:29:11  SUPERVISOR  CLAUDE
+[website job-1789262950-23120-1] 01:29:11  CLAUDE
+```
+
+`--json` keeps stdout machine-readable: one JSON object per line and nothing else. Job events carry
+an `event` field and scheduler events a `scheduler_event` field, so the two never have to be told
+apart by guessing.
+
+```json
+{"timestamp_unix_millis":1789262921937,"scheduler_event":"SCHEDULER_STARTED","max_concurrent":2,"queued":2}
+```
+
+Event logs remain non-authoritative, and each job keeps its own `events.jsonl`.
+
+### Stopping
+
+The first `Ctrl+C` stops the scheduler launching new work and requests the same graceful stop every
+active job would receive from a single `lya run`, including provider process-tree cancellation. The
+scheduler then waits for those jobs to shut down in a controlled way. Jobs that never started stay
+`QUEUED`. A second `Ctrl+C` keeps its existing force-exit meaning.
+
+### Interactive Control Is Not Multiplexed Yet
+
+Scheduler mode is **non-interactive**. `/pause`, `/resume`, `/status`, `/diff`, `/send` and `/stop`
+act on one unambiguous job, and multiplexing them across several simultaneous jobs needs an
+interaction model Lya does not have yet. Rather than redesign that casually, `lya scheduler` accepts
+no typed commands.
+
+`lya run` keeps the full interactive control it has always had. Graceful termination works in both.
+
 ## Safety Model
 
 Lya deliberately separates reasoning from repository publication.
@@ -795,23 +985,29 @@ authoritative commit record, refuses to continue automatically, and parks the jo
 recover. An interrupted publication is only continued when every invariant can be proven against
 the live repository.
 
+Scheduler concurrency changes none of this. The scheduler starts jobs; it never inspects a
+repository, never commits and never pushes. Every scheduled job goes through the same Git
+verification, the same snapshot comparison and the same guarded publication as a single `lya run`,
+and repository claims mean two jobs can never reach one working tree at the same time.
+
 Lya also avoids giving provider processes unnecessary billing credentials by removing environment-provided API keys from their child-process environments.
 
 These protections reduce accidental autonomous changes, but Lya is experimental software. Run autonomous workflows only in repositories where you understand and accept the risks.
 
 ## Current Limitations
 
-Lya currently runs jobs sequentially.
+`lya run` drives one job at a time. Concurrent work goes through `lya scheduler`, which is
+non-interactive: it accepts no typed commands while jobs run.
 
-A second `Ctrl+C` force-terminates Lya immediately. That is intentional and safe for job locks,
-which the operating system releases on process exit, but it skips Lya's own cleanup.
+A second `Ctrl+C` force-terminates Lya immediately. That is intentional and safe for job locks and
+repository claims, which the operating system releases on process exit, but it skips Lya's own
+cleanup.
 
 The following are not implemented yet:
 
 * persistent daemon/service mode;
-* background scheduling;
-* parallel jobs;
-* multi-project scheduling;
+* background scheduling and attach/detach;
+* interactive control across several simultaneous jobs;
 * remote administration UI;
 * automatic conflict resolution;
 * GitHub API integration.
@@ -838,9 +1034,11 @@ The following are not implemented yet:
 * [x] Quota-aware pause and resume
 * [x] Read-only job listing
 * [x] Provider process-tree cancellation
+* [x] Bounded multi-project scheduling
+* [x] Repository-level coordination
 * [ ] Daemon/service mode
 * [ ] Remote administration interface
-* [ ] Scheduling and parallel execution
+* [ ] Interactive control across concurrent jobs
 * [ ] Additional Supervisor and Executor providers
 * [ ] Stable public API
 

@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod context;
 pub mod control;
 pub mod doctor;
@@ -9,6 +10,8 @@ pub mod job;
 pub mod lock;
 pub mod publisher;
 pub mod repository;
+pub mod repository_lock;
 pub mod resume;
+pub mod scheduler;
 pub mod state;
 pub mod supervisor;
